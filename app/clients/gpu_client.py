@@ -12,22 +12,25 @@ class GPUClientError(Exception):
     pass
 
 
-def run_sd35_text2img(payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """
-    Call the SD3.5/SDXL text2img endpoint on GPU worker (8001).
+    Dispatch an SD3.5 text2img job to the GPU worker (port 8001).
 
-    payload should include:
-      - prompt
-      - negative_prompt
-      - width, height
-      - num_inference_steps
-      - guidance_scale
-      - seed
-      - output_path  (where GPU should save output.png)
-      - job_folder   (optional)
+    The GPU API expects:
+      {
+        "job_folder": ".../outputs/YYYY-MM-DD/<job-id>",
+        "meta": { ... full meta.json content ... }
+      }
+
+    In skeleton mode, the GPU may just update meta + create a dummy PNG.
+    In real mode, it will run SD3.5 and write a real output.png.
     """
 
-    url = f"{GPU_BASE_URL}/api/sd35/render"
+    url = f"{GPU_BASE_URL}/api/gpu/dispatch"
+    payload = {
+        "job_folder": job_folder,
+        "meta": meta,
+    }
 
     try:
         resp = requests.post(url, json=payload, timeout=600)
