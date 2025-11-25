@@ -9,15 +9,16 @@ Responsibilities:
 - Update job meta.json files.
 - In "skeleton" mode:
     * Only updates statuses and (optionally) creates dummy PNGs.
-- In "real" mode (SD35_RUNTIME_MODE=real):
+- In "real" mode (SD35_RUNTIME_MODE=real and RUN_REAL_SD35=1):
     * Loads SD3.5 Large via SD35Runtime.
     * Actually runs txt2img for text2img jobs.
     * Saves real output.png in the job folder.
 
-IMPORTANT:
-- Default is skeleton (no heavy model load).
-- Enable real SD3.5 only on GPU by setting:
-    SD35_RUNTIME_MODE=real
+Env flags:
+- SD35_RUNTIME_MODE = "skeleton" (default) or "real"
+- RUN_REAL_SD35 = "1"/"true"/"yes"/"on" to allow real mode.
+
+If anything goes wrong in real mode, the app gracefully falls back to skeleton.
 """
 
 import os
@@ -50,6 +51,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 # If this is True AND SD35_RUNTIME_MODE=real, we will attempt real SD3.5 txt2img.
 ENABLE_REAL_SD35 = _env_flag("RUN_REAL_SD35", False)
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -88,7 +90,6 @@ class GPUDispatchPayload(BaseModel):
 async def on_startup():
     global sd35_runtime
 
-    # Decide if we're in real SD3.5 mode or skeleton
     runtime_mode = os.getenv("SD35_RUNTIME_MODE", "skeleton").lower()
     logger.info(
         "GPU entry startup: SD35_RUNTIME_MODE=%s, RUN_REAL_SD35=%s",
@@ -97,10 +98,14 @@ async def on_startup():
     )
 
     if runtime_mode == "real" and ENABLE_REAL_SD35:
-        # Initialize real SD35 runtime
         logger.info("Initializing SD35Runtime in REAL mode (GPU).")
         sd35_runtime = SD35Runtime(mode="real", device="cuda")
         sd35_runtime.load()
+        if sd35_runtime.mode != "real" or sd35_runtime.pipe is None:  # type: ignore[attr-defined]
+            logger.warning(
+                "SD35Runtime failed to initialize in real mode; falling back to skeleton."
+            )
+            sd35_runtime = None
     else:
         logger.info(
             "Running in SKELETON mode (no SD3.5 load). "
@@ -156,7 +161,7 @@ def _create_dummy_png(job_folder: str, filename: str = "output.png") -> str:
     Create a simple 512x512 gray PNG for skeleton testing.
     """
     try:
-        from PIL import Image
+        from PIL import Image  # type: ignore
     except Exception as e:  # noqa: BLE001
         logger.warning("PIL not available for dummy PNG: %s", e)
         return filename
@@ -178,6 +183,7 @@ async def root():
         "message": "GPU Runtime for RENDEREXPO AI STUDIO.",
         "mode": os.getenv("SD35_RUNTIME_MODE", "skeleton"),
         "run_real_sd35": ENABLE_REAL_SD35,
+        "real_runtime_loaded": sd35_runtime is not None,
     }
 
 
@@ -187,174 +193,60 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
     Called by the local API (port 8000):
 
     - Ensures job_folder exists
-    - Reads meta.json (and/or uses provided meta)
+    - Uses provided meta (from CPU planner)
     - If REAL SD3.5 is enabled and job type is 'text2img':
         * runs txt2img
         * writes real output.png
         * updates meta status to 'completed'
     - Else:
-        * skeleton behavior: update status to 'dispatched_skeleton'
+        * skeleton behavior: update status to 'dispatched_skeleton', create dummy PNG.
     """
     global sd35_runtime
 
     job_folder = payload.job_folder
-    incoming_meta = payload.meta
+    meta = payload.meta
 
     _ensure_job_folder(job_folder)
 
-    # Prefer the meta from disk, but merge with incoming.
-    try:
-        meta = _read_meta(job_folder)
-    except HTTPException:
-        meta = {}
-
-    meta.update(incoming_meta)
-    meta.setdefault("job_id", os.path.basename(job_folder))
-    meta.setdefault("type", "text2img")
-    meta.setdefault("model_name", "sd3.5-large")
-    meta.setdefault("mode", "skeleton-no-inference")
-
-    job_type = meta.get("type", "text2img")
-    now_iso = datetime.utcnow().isoformat()
-
-    # Decide if we will attempt real SD3.5 or skeleton
-    runtime_mode = os.getenv("SD35_RUNTIME_MODE", "skeleton").lower()
-    real_mode = (
-        runtime_mode == "real"
-        and ENABLE_REAL_SD35
-        and sd35_runtime is not None
-        and sd35_runtime.is_real
-    )
-
-    if real_mode and job_type == "text2img":
-        # ---------------------------------------------------------------
-        # REAL SD3.5 txt2img path
-        # ---------------------------------------------------------------
-        logger.info("GPU dispatch: running REAL SD3.5 txt2img for job %s", meta["job_id"])
-
-        # Extract generation params
-        prompt = meta.get("prompt", "")
-        negative_prompt = meta.get("negative_prompt")
-        width = int(meta.get("width", 1024))
-        height = int(meta.get("height", 1024))
-        steps = int(meta.get("num_inference_steps", 25))
-        guidance_scale = float(meta.get("guidance_scale", 6.0))
-        seed_raw = meta.get("seed", None)
-        seed: Optional[int]
-        if seed_raw is None:
-            seed = None
-        else:
-            try:
-                seed = int(seed_raw)
-            except Exception:  # noqa: BLE001
-                seed = None
-
-        planned_output_rel = meta.get("planned_output_image", "output.png")
-        output_filename = os.path.basename(planned_output_rel)
-        output_path = os.path.join(job_folder, output_filename)
-
-        # Run generation
+    # REAL MODE: use SD35Runtime to generate a real image if available
+    if sd35_runtime is not None and meta.get("type") == "text2img":
         try:
-            image = sd35_runtime.generate_text2img(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                seed=seed,
-            )
-            os.makedirs(job_folder, exist_ok=True)
-            image.save(output_path, format="PNG")
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Error during SD3.5 txt2img generation: %s", e)
-            # Mark meta as failed
-            meta["status"] = "failed"
-            meta["mode"] = "real-sd35-error"
-            meta["error"] = str(e)
-            meta["failed_at"] = now_iso
-            _write_meta(job_folder, meta)
-            raise HTTPException(
-                status_code=500,
-                detail=f"SD3.5 txt2img generation failed: {e}",
+            updated_meta = sd35_runtime.generate_text2img(job_folder, meta)
+            _write_meta(job_folder, updated_meta)
+            return {
+                "status": "ok",
+                "message": "GPU dispatch completed in REAL SD3.5 mode.",
+                "job_folder": job_folder,
+                "meta": updated_meta,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "SD35Runtime.generate_text2img() failed; falling back to skeleton: %s",
+                exc,
             )
 
-        # Update meta for completed job
-        meta["status"] = "completed"
-        meta["mode"] = "real-sd35"
-        meta["dispatched_at"] = meta.get("dispatched_at", now_iso)
-        meta["completed_at"] = now_iso
-        meta["output_image"] = output_filename
-
-        _write_meta(job_folder, meta)
-
-        return {
-            "status": "ok",
-            "message": "Real SD3.5 txt2img completed on GPU.",
-            "job_folder": job_folder,
-            "output_image": output_path,
-            "meta": meta,
-        }
-
-    else:
-        # ---------------------------------------------------------------
-        # SKELETON path (no real generation)
-        # ---------------------------------------------------------------
-        logger.info(
-            "GPU dispatch in SKELETON mode for job %s (type=%s).",
-            meta["job_id"],
-            job_type,
-        )
-
-        meta["status"] = "dispatched_skeleton"
-        meta["mode"] = "skeleton-no-inference"
-        meta["dispatched_at"] = now_iso
-
-        _write_meta(job_folder, meta)
-
-        return {
-            "status": "ok",
-            "message": "GPU dispatch received and meta status updated (skeleton, no inference).",
-            "job_folder": job_folder,
-            "meta": meta,
-        }
-
-
-@app.post("/api/gpu/complete-simulated")
-async def gpu_complete_simulated(payload: GPUDispatchPayload):
-    """
-    Old helper endpoint for your earlier tests.
-
-    Still available if you ever want to fake-complete jobs and create dummy PNGs
-    without touching real SD3.5.
-    """
-    job_folder = payload.job_folder
-    _ensure_job_folder(job_folder)
-
+    # SKELETON MODE: no real SD3.5, just update meta + optional dummy PNG
     try:
-        meta = _read_meta(job_folder)
+        # If meta.json already exists, merge/override basic fields
+        existing_meta = _read_meta(job_folder)
+        existing_meta.update(meta)
+        meta = existing_meta
     except HTTPException:
-        meta = {}
+        # If meta.json isn't there yet, just use payload meta
+        pass
 
-    now_iso = datetime.utcnow().isoformat()
-
-    # Create a dummy output if none exists
-    planned_output_rel = meta.get("planned_output_image", "output.png")
-    output_filename = os.path.basename(planned_output_rel)
-    output_path = os.path.join(job_folder, output_filename)
-    if not os.path.isfile(output_path):
-        _create_dummy_png(job_folder, output_filename)
-
-    meta["status"] = "completed_skeleton"
+    meta["status"] = "dispatched_skeleton"
     meta["mode"] = "skeleton-no-inference"
-    meta["completed_at"] = now_iso
-    meta["output_image"] = output_filename
+    meta["dispatched_at"] = datetime.utcnow().isoformat()
+
+    # Create dummy PNG for easier debugging / UI previews
+    _create_dummy_png(job_folder, filename="output.png")
 
     _write_meta(job_folder, meta)
 
     return {
         "status": "ok",
-        "message": "GPU completion simulated; meta status set to 'completed_skeleton'.",
+        "message": "GPU dispatch received and meta status updated (skeleton, no inference).",
         "job_folder": job_folder,
         "meta": meta,
     }
