@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.clients.gpu_client import run_sd35_text2img  # NEW: GPU bridge
+from app.clients.gpu_client import dispatch_sd35_text2img  # NEW: GPU dispatcher
 
 router = APIRouter(prefix="/api/sd35", tags=["SD3.5 Text2Img"])
 
@@ -67,7 +67,6 @@ def _ensure_job_folder(base_outputs_dir: str = "outputs") -> str:
 class SD35Text2ImgRequest(BaseModel):
     """
     Skeleton schema for SD3.5 text-to-image.
-    This is still NON-INFERENCE on local CPU.
     """
     prompt: str = Field(..., description="Main text prompt for SD3.5.")
     negative_prompt: Optional[str] = Field(
@@ -165,15 +164,12 @@ def _validate_refiner_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
 @router.post("/render")
 async def sd35_render(request: SD35Text2ImgRequest):
     """
-    SD3.5 Text2Img endpoint.
+    SD3.5 Text2Img endpoint (CPU-side).
 
-    On LOCAL (CPU) app:
-    - Previously: only planning, no inference.
-    - Now: still creates job + meta.json, but also calls the GPU worker (8001)
-      to actually render and save output.png into the job folder.
-
-    On GPU (RunPod):
-    - GPU app (port 8001) runs the real model and writes the PNG.
+    Steps:
+    - Validate LoRA + refiner profile names.
+    - Create outputs/{date}/{job_id}/ and meta.json.
+    - Dispatch the job to the GPU worker (port 8001) via /api/gpu/dispatch.
     """
     # 1) Validate LoRA + refiner if provided
     lora_cfg = _validate_lora_profile(request.lora_profile)
@@ -203,39 +199,22 @@ async def sd35_render(request: SD35Text2ImgRequest):
         "seed": request.seed,
         "planned_output_image": "output.png",
         "status": "planned",
-        "mode": "skeleton-no-inference",
-        # Store profiles + resolved config
+        "mode": "cpu-planner",
         "lora_profile": request.lora_profile,
         "lora_config": lora_cfg,
         "refiner_profile": request.refiner_profile,
         "refiner_config": refiner_cfg,
     }
 
-    # 4) Write meta.json (planning info)
+    # 4) Write meta.json
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    # 5) NEW: Call GPU worker on port 8001 to actually run the job
-    gpu_payload: Dict[str, Any] = {
-        "prompt": request.prompt,
-        "negative_prompt": request.negative_prompt,
-        "width": request.width,
-        "height": request.height,
-        "num_inference_steps": request.num_inference_steps,
-        "guidance_scale": request.guidance_scale,
-        "seed": request.seed,
-        # Tell GPU where to save the PNG
-        "output_path": planned_output_image,
-        "job_folder": job_folder,
-        # Pass profiles through so GPU can decide what to do
-        "lora_profile": request.lora_profile,
-        "refiner_profile": request.refiner_profile,
-    }
-
-    gpu_ok, gpu_data = run_sd35_text2img(gpu_payload)
+    # 5) Dispatch to GPU worker (8001) via /api/gpu/dispatch
+    gpu_ok, gpu_data = dispatch_sd35_text2img(job_folder, meta)
 
     if not gpu_ok:
-        # GPU failed – we still have meta.json, but no guaranteed PNG.
+        # GPU failed – we still have meta.json, but no guarantee of output.png
         return {
             "status": "gpu_error",
             "message": "Job planned but GPU worker failed.",
@@ -245,14 +224,14 @@ async def sd35_render(request: SD35Text2ImgRequest):
             "gpu_error": gpu_data,
         }
 
-    # 6) If GPU succeeded, return completed status + output image path
+    # 6) If GPU succeeded, just return its info along with paths
     return {
-        "status": "completed",
-        "message": "Text2Img job completed via GPU worker.",
+        "status": "dispatched",
+        "message": "Text2Img job dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "output_image": planned_output_image,
-        "gpu_info": gpu_data,
+        "gpu_response": gpu_data,
     }
 
 
