@@ -1,4 +1,3 @@
-cat << 'EOF' > app/clients/gpu_client.py
 import json
 from typing import Any, Dict, Tuple
 
@@ -54,4 +53,3 @@ def run_sd35_text2img(payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         }
 
     return True, data
-EOF
