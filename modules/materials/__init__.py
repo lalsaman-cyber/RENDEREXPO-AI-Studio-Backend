@@ -1,0 +1,1 @@
+"""Material vocabulary, prompts, and mappings (placeholder)."""

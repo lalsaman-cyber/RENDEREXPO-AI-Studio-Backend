@@ -1,0 +1,1 @@
+"""MiDaS depth estimation helpers (placeholder)."""

@@ -1,0 +1,1 @@
+"""Mesh / geometry reconstruction from imagery (placeholder)."""

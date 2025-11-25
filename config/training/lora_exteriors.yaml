@@ -1,0 +1,57 @@
+# config/training/lora_exteriors.yaml
+# Plan for RENDEREXPO Exteriors LoRA on top of SD3.5.
+# Focus: facades, streetscapes, towers, villas, urban context.
+
+experiment_name: "RENDEREXPO_LoRA_Exteriors"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+output:
+  lora_dir: "training_runs/loras/exteriors"
+  checkpoints_dir: "training_runs/loras/exteriors/checkpoints"
+  logs_dir: "training_runs/loras/exteriors/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 5.0e-5
+  max_steps: 8000
+  warmup_steps: 500
+  save_every_steps: 1000
+  seed: 124
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules:
+    - "transformer"
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  exteriors:
+    images: "exteriors/images"
+    captions: "exteriors/captions"
+    weight: 1.0
+
+  context_cityscapes:
+    images: "context_cityscapes/images"
+    captions: "context_cityscapes/captions"
+    weight: 0.7
+
+filters:
+  min_resolution: 768
+  max_resolution: 3072
+  allowed_aspect_ratios:
+    - "16:9"
+    - "21:9"
+    - "4:3"
+    - "3:2"
+
+notes:
+  - "Teaches the model RENDEREXPO-style exterior architecture and context."
+  - "Still a PLAN only; real training will happen later on GPU."

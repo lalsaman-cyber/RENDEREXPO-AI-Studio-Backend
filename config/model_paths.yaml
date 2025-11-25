@@ -1,0 +1,17 @@
+# ======================================================
+# RENDEREXPO AI STUDIO - Model Paths
+# This config is used ONLY for local dev (CPU mode).
+# The GPU container uses environment variables instead.
+# ======================================================
+
+# SD3.5 Large model folder (local only)
+sd35_large_dir: "models/sd35-large"
+
+# Future custom finetunes will live here
+renderexpo_ultra_dir: "models/renderexpo-ultra"   # future
+
+# Future LoRA directory (assets)
+lora_dir: "models/lora"                            # future
+
+# ControlNet directory (if you want copies locally)
+controlnet_dir: "models/controlnet"                # future

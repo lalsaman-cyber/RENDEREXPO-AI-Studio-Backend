@@ -1,0 +1,10 @@
+# Files/directories to include when building the RunPod GPU image
+
+Dockerfile.gpu
+requirements.txt
+app/
+runtime/
+config/
+models/
+Licenses/
+docs/

@@ -1,0 +1,50 @@
+{
+  "detail_refiner_v1": {
+    "description": "Enhances micro-textures, edges, fabrics, and fine architectural details.",
+    "path": "models/refiners/detail_refiner_v1.safetensors",
+    "strength": 0.35,
+    "applies_to": ["text2img", "img2img"]
+  },
+
+  "lighting_refiner_daylight_v1": {
+    "description": "Improves daylight diffusion, window glow, soft shadow accuracy.",
+    "path": "models/refiners/lighting_daylight_v1.safetensors",
+    "strength": 0.30,
+    "applies_to": ["text2img", "img2img"]
+  },
+
+  "lighting_refiner_warm_v1": {
+    "description": "Boosts warm interior mood, golden-hour tones, bounce light realism.",
+    "path": "models/refiners/lighting_warm_v1.safetensors",
+    "strength": 0.32,
+    "applies_to": ["text2img", "img2img"]
+  },
+
+  "material_refiner_luxury_v1": {
+    "description": "Enhances marble, wood grains, metals, glass, fabrics.",
+    "path": "models/refiners/material_luxury_v1.safetensors",
+    "strength": 0.4,
+    "applies_to": ["text2img", "img2img"]
+  },
+
+  "contrast_refiner_v1": {
+    "description": "Improves clarity, contrast, and depth — prevents flat-looking interiors.",
+    "path": "models/refiners/contrast_v1.safetensors",
+    "strength": 0.25,
+    "applies_to": ["text2img", "img2img"]
+  },
+
+  "geometry_refiner_arch_v1": {
+    "description": "Improves orthogonality, straight lines, vanishing point accuracy.",
+    "path": "models/refiners/geom_arch_v1.safetensors",
+    "strength": 0.20,
+    "applies_to": ["text2img", "img2img"]
+  },
+
+  "aerial_refiner_v1": {
+    "description": "Sharpens trees, roofs, cars, streets, and aerial context elements.",
+    "path": "models/refiners/aerial_refiner_v1.safetensors",
+    "strength": 0.30,
+    "applies_to": ["text2img"]
+  }
+}

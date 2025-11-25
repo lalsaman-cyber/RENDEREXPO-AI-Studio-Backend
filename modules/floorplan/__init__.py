@@ -1,0 +1,1 @@
+"""Floor plan understanding, cameras, and layout tools (placeholder)."""

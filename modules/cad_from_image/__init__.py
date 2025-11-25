@@ -1,0 +1,1 @@
+"""Reverse CAD / line extraction from images (placeholder)."""

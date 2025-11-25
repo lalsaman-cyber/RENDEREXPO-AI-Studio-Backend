@@ -1,0 +1,56 @@
+# config/training/lora_interiors.yaml
+# Plan for RENDEREXPO Interiors LoRA on top of SD3.5.
+# Focus: interior rooms, furniture layouts, materials, lighting.
+
+experiment_name: "RENDEREXPO_LoRA_Interiors"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+# Where LoRA weights will be saved (future)
+output:
+  lora_dir: "training_runs/loras/interiors"
+  checkpoints_dir: "training_runs/loras/interiors/checkpoints"
+  logs_dir: "training_runs/loras/interiors/logs"
+
+training:
+  precision: "bf16"          # future decision
+  batch_size: 4              # placeholder
+  gradient_accumulation: 4   # placeholder
+  learning_rate: 5.0e-5      # LoRA often uses a slightly higher LR
+  max_steps: 8000            # placeholder
+  warmup_steps: 500          # placeholder
+  save_every_steps: 1000
+  seed: 123
+
+lora:
+  rank: 16                   # 8 / 16 / 32 typical
+  alpha: 16
+  target_modules:
+    - "transformer"          # conceptual – real code will define exact layer names
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  interiors:
+    images: "interiors/images"
+    captions: "interiors/captions"
+    weight: 1.0
+    # You can later add tags like:
+    # room_types: [kitchen, living_room, bedroom, bathroom, office]
+
+filters:
+  min_resolution: 512
+  max_resolution: 2048
+  allowed_aspect_ratios:
+    - "1:1"
+    - "4:3"
+    - "3:2"
+    - "16:9"
+
+notes:
+  - "LoRA is ideal for focusing on RENDEREXPO's interior style without touching full SD3.5."
+  - "This config is a PLAN only – no GPU training on your laptop."
+  - "Real training data paths will be set when we move to RunPod."

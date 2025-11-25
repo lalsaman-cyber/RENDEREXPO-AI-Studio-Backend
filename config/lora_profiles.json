@@ -1,0 +1,47 @@
+{
+  "interior_v1": {
+    "name": "RENDEREXPO Interior LoRA v1",
+    "description": "RENDEREXPO interior LoRA v1 (soft luxury, contemporary interiors).",
+    "path": "models/lora/interior_v1.safetensors",
+    "scale": 0.8,
+    "strength": 0.8,
+    "applies_to": ["text2img", "img2img"],
+    "tags": ["interior", "rooms", "living_room", "bedroom"]
+  },
+  "exterior_v1": {
+    "name": "RENDEREXPO Exterior LoRA v1",
+    "description": "RENDEREXPO exterior LoRA v1 (facades, streetscapes, towers).",
+    "path": "models/lora/exterior_v1.safetensors",
+    "scale": 0.8,
+    "strength": 0.8,
+    "applies_to": ["text2img", "img2img"],
+    "tags": ["exterior", "facade", "architecture", "streetscape"]
+  },
+  "aerial_v1": {
+    "name": "RENDEREXPO Aerial LoRA v1",
+    "description": "RENDEREXPO aerial LoRA v1 (bird’s-eye urban + site views).",
+    "path": "models/lora/aerial_v1.safetensors",
+    "scale": 0.8,
+    "strength": 0.8,
+    "applies_to": ["text2img"],
+    "tags": ["aerial", "birdseye", "masterplan", "site"]
+  },
+  "furniture_v1": {
+    "name": "RENDEREXPO Furniture & Materials LoRA v1",
+    "description": "RENDEREXPO furniture & materials LoRA v1 (sofas, tables, finishes).",
+    "path": "models/lora/furniture_v1.safetensors",
+    "scale": 0.75,
+    "strength": 0.75,
+    "applies_to": ["text2img", "img2img"],
+    "tags": ["furniture", "materials", "sofa", "table", "chair"]
+  },
+  "roomtypes_v1": {
+    "name": "RENDEREXPO Room Types LoRA v1",
+    "description": "RENDEREXPO room-type LoRA v1 (kitchen, bedroom, living room bias).",
+    "path": "models/lora/roomtypes_v1.safetensors",
+    "scale": 0.7,
+    "strength": 0.7,
+    "applies_to": ["text2img", "img2img"],
+    "tags": ["kitchen", "bedroom", "living_room", "bathroom"]
+  }
+}

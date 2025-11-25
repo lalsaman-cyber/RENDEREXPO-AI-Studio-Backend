@@ -1,0 +1,42 @@
+# --- General Python cruft ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.env
+.venv/
+venv/
+.env.*
+
+# --- IDE / OS files ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Git ---
+.git
+.gitignore
+
+# --- Local data/output ---
+outputs/
+logs/
+tmp/
+.cache/
+.checkpoints/
+
+# --- Not needed in image ---
+# Any local notes, docs exports, etc.
+*.doc
+*.docx
+*.pdf
+*.xlsx
+*.pptx
+
+# Old SDXL-only stuff (if you decide to ignore them in the image)
+sdxl_*/
+old_sdxl*/
+legacy_sdxl*/

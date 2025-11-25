@@ -1,0 +1,56 @@
+# config/training/lora_aerials.yaml
+# Plan for RENDEREXPO Aerials LoRA on top of SD3.5.
+# Focus: drone-like views, masterplans, urban fabric from above.
+
+experiment_name: "RENDEREXPO_LoRA_Aerials"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+output:
+  lora_dir: "training_runs/loras/aerials"
+  checkpoints_dir: "training_runs/loras/aerials/checkpoints"
+  logs_dir: "training_runs/loras/aerials/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 5.0e-5
+  max_steps: 7000
+  warmup_steps: 500
+  save_every_steps: 1000
+  seed: 125
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules:
+    - "transformer"
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  aerials:
+    images: "aerials/images"
+    captions: "aerials/captions"
+    weight: 1.0
+
+  masterplans:
+    images: "masterplans/images"
+    captions: "masterplans/captions"
+    weight: 0.8
+
+filters:
+  min_resolution: 768
+  max_resolution: 4096
+  allowed_aspect_ratios:
+    - "16:9"
+    - "3:2"
+    - "1:1"
+
+notes:
+  - "Specializes SD3.5 in aerial views and masterplan visualizations."
+  - "Useful for developers and urban presentations."

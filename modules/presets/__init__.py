@@ -1,0 +1,1 @@
+"""Style / lighting / scene presets (placeholder)."""

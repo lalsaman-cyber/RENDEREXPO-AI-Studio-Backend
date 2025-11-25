@@ -1,0 +1,52 @@
+# RENDEREXPO AI STUDIO - gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# IDE / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local environment / secrets
+.env
+.env.*
+
+# Outputs & uploads (runtime artifacts)
+outputs/
+uploads/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+
+# Checkpoints / models / weights
+models/
+*.ckpt
+*.safetensors
+*.pt
+*.bin
+
+# Zips & archives (like backend.zip)
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# RunPod / local temp
+*.pid
+*.tmp

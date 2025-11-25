@@ -1,0 +1,56 @@
+# config/training/lora_furniture_materials.yaml
+# Plan for RENDEREXPO Furniture & Materials LoRA.
+# Focus: chairs, sofas, tables, wood, stone, metal, fabrics.
+
+experiment_name: "RENDEREXPO_LoRA_Furniture_Materials"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+output:
+  lora_dir: "training_runs/loras/furniture_materials"
+  checkpoints_dir: "training_runs/loras/furniture_materials/checkpoints"
+  logs_dir: "training_runs/loras/furniture_materials/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 5.0e-5
+  max_steps: 7000
+  warmup_steps: 500
+  save_every_steps: 1000
+  seed: 131
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules:
+    - "transformer"
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  furniture:
+    images: "furniture/images"
+    captions: "furniture/captions"
+    weight: 1.0
+
+  materials:
+    images: "materials/images"
+    captions: "materials/captions"
+    weight: 0.8
+
+filters:
+  min_resolution: 512
+  max_resolution: 4096
+  allowed_aspect_ratios:
+    - "1:1"
+    - "4:3"
+    - "3:2"
+
+notes:
+  - "Helps SD3.5 know how RENDEREXPO handles furniture and materials."
+  - "Important for: product insertion, moodboard → space, and refiners."

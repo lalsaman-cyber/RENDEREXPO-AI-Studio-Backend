@@ -1,0 +1,1 @@
+"""Architectural scene setup and prompt helpers (placeholder)."""

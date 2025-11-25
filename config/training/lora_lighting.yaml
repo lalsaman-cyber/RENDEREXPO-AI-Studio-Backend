@@ -1,0 +1,57 @@
+# config/training/lora_lighting.yaml
+# Plan for RENDEREXPO Lighting LoRA.
+# Focus: daylight, evening, moody, high contrast, studio, etc.
+
+experiment_name: "RENDEREXPO_LoRA_Lighting"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+output:
+  lora_dir: "training_runs/loras/lighting"
+  checkpoints_dir: "training_runs/loras/lighting/checkpoints"
+  logs_dir: "training_runs/loras/lighting/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 4.0e-5
+  max_steps: 5000
+  warmup_steps: 500
+  save_every_steps: 1000
+  seed: 133
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules:
+    - "transformer"
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  daylight_soft:
+    images: "lighting/daylight_soft/images"
+    captions: "lighting/daylight_soft/captions"
+    weight: 1.0
+
+  evening_warm:
+    images: "lighting/evening_warm/images"
+    captions: "lighting/evening_warm/captions"
+    weight: 0.9
+
+  moody_contrast:
+    images: "lighting/moody_contrast/images"
+    captions: "lighting/moody_contrast/captions"
+    weight: 0.7
+
+filters:
+  min_resolution: 512
+  max_resolution: 4096
+
+notes:
+  - "Controls mood and lighting realism, like Krea / Nano Banana."
+  - "Works together with material + room-type LoRAs."

@@ -1,0 +1,67 @@
+# config/training/lora_room_types.yaml
+# Plan for RENDEREXPO Room Types LoRA.
+# Focus: kitchens, living rooms, bedrooms, bathrooms, offices, etc.
+
+experiment_name: "RENDEREXPO_LoRA_Room_Types"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+output:
+  lora_dir: "training_runs/loras/room_types"
+  checkpoints_dir: "training_runs/loras/room_types/checkpoints"
+  logs_dir: "training_runs/loras/room_types/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 4.5e-5
+  max_steps: 6000
+  warmup_steps: 500
+  save_every_steps: 1000
+  seed: 132
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules:
+    - "transformer"
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  kitchens:
+    images: "room_types/kitchens/images"
+    captions: "room_types/kitchens/captions"
+    weight: 1.0
+
+  living_rooms:
+    images: "room_types/living_rooms/images"
+    captions: "room_types/living_rooms/captions"
+    weight: 1.0
+
+  bedrooms:
+    images: "room_types/bedrooms/images"
+    captions: "room_types/bedrooms/captions"
+    weight: 1.0
+
+  bathrooms:
+    images: "room_types/bathrooms/images"
+    captions: "room_types/bathrooms/captions"
+    weight: 0.8
+
+  offices:
+    images: "room_types/offices/images"
+    captions: "room_types/offices/captions"
+    weight: 0.6
+
+filters:
+  min_resolution: 512
+  max_resolution: 3072
+
+notes:
+  - "Makes prompts like '3-bedroom apartment with open kitchen' more reliable."
+  - "Works together with Interiors + Floorplans LoRAs."

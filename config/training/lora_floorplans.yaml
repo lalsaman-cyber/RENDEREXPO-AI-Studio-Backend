@@ -1,0 +1,56 @@
+# config/training/lora_floorplans.yaml
+# Plan for RENDEREXPO Floorplans LoRA on top of SD3.5.
+# Focus: 2D plans, wall thicknesses, room labels, circulation logic.
+
+experiment_name: "RENDEREXPO_LoRA_Floorplans"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+output:
+  lora_dir: "training_runs/loras/floorplans"
+  checkpoints_dir: "training_runs/loras/floorplans/checkpoints"
+  logs_dir: "training_runs/loras/floorplans/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 4.0e-5
+  max_steps: 9000
+  warmup_steps: 800
+  save_every_steps: 1000
+  seed: 130
+
+lora:
+  rank: 16
+  alpha: 16
+  target_modules:
+    - "transformer"
+  dropout: 0.0
+
+datasets:
+  root: "DATASET_ROOT"
+
+  floorplans_clean:
+    images: "floorplans/clean/images"
+    captions: "floorplans/clean/captions"
+    weight: 1.0
+
+  floorplans_handdrawn:
+    images: "floorplans/handdrawn/images"
+    captions: "floorplans/handdrawn/captions"
+    weight: 0.7
+
+filters:
+  min_resolution: 512
+  max_resolution: 2048
+  allowed_aspect_ratios:
+    - "1:1"
+    - "4:3"
+    - "3:2"
+
+notes:
+  - "Teaches SD3.5 to understand floorplan conventions and layouts."
+  - "Important for: plan drawing, auto camera placement, and plan → 3D."

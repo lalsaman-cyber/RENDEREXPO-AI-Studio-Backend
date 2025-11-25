@@ -1,0 +1,54 @@
+# config/training/refiner_detail.yaml
+# Plan for RENDEREXPO Detail Refiner.
+# Goal: operate at low denoise (0.1–0.3) to sharpen geometry & materials.
+
+experiment_name: "RENDEREXPO_Refiner_Detail"
+
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+# Where refiner weights will be saved (future)
+output:
+  refiner_dir: "training_runs/refiners/detail"
+  checkpoints_dir: "training_runs/refiners/detail/checkpoints"
+  logs_dir: "training_runs/refiners/detail/logs"
+
+training:
+  precision: "bf16"
+  batch_size: 2               # refiner can be heavier; small batch is okay
+  gradient_accumulation: 8
+  learning_rate: 3.0e-5
+  max_steps: 6000
+  warmup_steps: 500
+  save_every_steps: 1000
+  seed: 999
+
+refiner:
+  target_stage: "detail"
+  denoise_min: 0.1
+  denoise_max: 0.3
+  input_type: "image"        # conceptually, can also be "latent" in future
+
+datasets:
+  root: "DATASET_ROOT"
+
+  high_detail_archviz:
+    images: "high_detail_archviz/images"
+    captions: "high_detail_archviz/captions"
+    weight: 1.0
+
+  materials_closeups:
+    images: "materials_closeups/images"
+    captions: "materials_closeups/captions"
+    weight: 0.7
+
+filters:
+  min_resolution: 1024
+  max_resolution: 4096
+  sharpness_threshold: 0.5    # conceptual (future metric)
+
+notes:
+  - "Refiner is meant to run AFTER main SD3.5 generation at low denoise."
+  - "Used to add crisp edges, accurate materials, and clean geometry."
+  - "No training will run here yet; this is a blueprint."

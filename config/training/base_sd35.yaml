@@ -1,0 +1,81 @@
+# config/training/base_sd35.yaml
+# High-level config for full SD3.5 finetune → RENDEREXPO ULTRA.
+# No training happens yet – this is just the plan.
+
+experiment_name: "RENDEREXPO_ULTRA_base_sd35"
+
+# Where the original SD3.5 base lives
+base_model:
+  name: "sd3.5-large"
+  path: "models/sd35-large"
+
+# Where the finetuned model will be saved (future)
+output:
+  model_dir: "training_runs/full_models/renderexpo_ultra"
+  checkpoints_dir: "training_runs/full_models/renderexpo_ultra/checkpoints"
+  logs_dir: "training_runs/full_models/renderexpo_ultra/logs"
+
+# Global training settings (PLANNED, not executed yet)
+training:
+  precision: "bf16"         # bf16 / fp16 / fp32 (future decision)
+  batch_size: 4             # placeholder
+  gradient_accumulation: 4  # placeholder
+  learning_rate: 1.0e-5     # placeholder
+  max_steps: 10000          # placeholder
+  warmup_steps: 500         # placeholder
+  save_every_steps: 1000    # placeholder
+  seed: 42
+
+# What to finetune (concept – real code will decide how)
+# You can later choose to freeze or unfreeze parts of the model.
+modules:
+  train_text_encoders: true
+  train_transformer: true
+  train_vae: false          # often kept frozen to save cost
+  use_gradient_checkpointing: true
+
+# Datasets are conceptual. You will map DATASET_ROOT later to real paths.
+datasets:
+  root: "DATASET_ROOT"   # you will replace this with a real path on RunPod/cloud
+
+  # Each dataset is a conceptual bucket. Real paths will be configured later.
+  interiors:
+    images: "interiors/images"
+    captions: "interiors/captions"   # optional, can be empty
+    weight: 1.0
+
+  exteriors:
+    images: "exteriors/images"
+    captions: "exteriors/captions"
+    weight: 1.0
+
+  aerials:
+    images: "aerials/images"
+    captions: "aerials/captions"
+    weight: 0.8
+
+  furniture_materials:
+    images: "furniture_materials/images"
+    captions: "furniture_materials/captions"
+    weight: 0.7
+
+  room_types:
+    images: "room_types/images"
+    captions: "room_types/captions"
+    weight: 0.8
+
+  lighting:
+    images: "lighting/images"
+    captions: "lighting/captions"
+    weight: 0.5
+
+# Loss / objective knobs (conceptual)
+objectives:
+  use_caption_loss: true
+  use_prior_preservation: false     # future option
+  clip_guidance_weight: 0.0         # future option
+
+notes:
+  - "This config is a PLANNED blueprint. No training runs on your laptop."
+  - "Real training will happen on GPU (RunPod or similar) in a future phase."
+  - "All dataset paths are abstract and will be mapped to your private data."
