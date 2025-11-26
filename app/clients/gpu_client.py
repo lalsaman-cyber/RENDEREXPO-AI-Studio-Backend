@@ -16,16 +16,16 @@ def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool,
     """
     Dispatch an SD3.5 text2img job to the GPU worker (port 8001).
 
-    The GPU API expects:
-      {
-        "job_folder": ".../outputs/YYYY-MM-DD/<job-id>",
-        "meta": { ... full meta.json content ... }
-      }
+    This sends a POST to /api/gpu/dispatch with:
+      - job_folder: outputs/.../<job_id>
+      - meta: the meta.json contents
 
-    In skeleton mode, the GPU may just update meta + create a dummy PNG.
-    In real mode, it will run SD3.5 and write a real output.png.
+    Returns:
+        (ok, data) where:
+          ok = True  -> HTTP 200 and JSON decoded successfully
+               False -> request failed or non-200 or bad JSON
+          data = response JSON or error info
     """
-
     url = f"{GPU_BASE_URL}/api/gpu/dispatch"
     payload = {
         "job_folder": job_folder,

@@ -9,7 +9,7 @@ Design:
     * SD35Runtime.load() does nothing.
     * SD35Runtime.generate_text2img() MUST NOT be called.
 - In real mode:
-    * SD35Runtime.load() loads the SD3.5 Large model from disk.
+    * SD35Runtime.load() loads the SD3.5 Large model from disk via diffusers.
     * SD35Runtime.generate_text2img() runs the model and writes output.png.
 
 Safety:
@@ -22,10 +22,23 @@ from __future__ import annotations
 
 import os
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GenerationResult:
+    """
+    Backwards-compatible result container for SD3.5 generation.
+
+    Some older parts of the codebase import GenerationResult from this module.
+    """
+    ok: bool
+    meta: Dict[str, Any]
+    error: Optional[str] = None
 
 
 class SD35Runtime:
@@ -83,7 +96,7 @@ class SD35Runtime:
 
         if not os.path.isdir(self.model_path):
             logger.error(
-                "SD35 model path does not exist: %s. "
+                "SD3.5 model path does not exist: %s. "
                 "SD35Runtime will remain in skeleton mode.",
                 self.model_path,
             )
@@ -206,7 +219,6 @@ class SD35Runtime:
         meta["status"] = "completed"
         meta["completed_at"] = datetime.utcnow().isoformat()
         meta["mode"] = "real-sd35"
-        # Keep 'planned_output_image' as 'output.png', but we can also record actual path:
         meta["output_image"] = "output.png"
 
         logger.info("SD3.5 text2img completed. Saved to %s", out_path)

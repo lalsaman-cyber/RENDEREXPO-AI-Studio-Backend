@@ -5,20 +5,14 @@ GPU Entry FastAPI app for RENDEREXPO AI STUDIO.
 This app is meant to run on a GPU environment (e.g., RunPod), NOT your laptop.
 
 Responsibilities:
-- Receive GPU dispatch requests (/api/gpu/dispatch) from the local app.
+- Receive GPU dispatch requests (/api/gpu/dispatch) from the local app (8000).
 - Update job meta.json files.
 - In "skeleton" mode:
-    * Only updates statuses and (optionally) creates dummy PNGs.
+    * Only updates statuses and creates dummy PNGs.
 - In "real" mode (SD35_RUNTIME_MODE=real and RUN_REAL_SD35=1):
     * Loads SD3.5 Large via SD35Runtime.
     * Actually runs txt2img for text2img jobs.
     * Saves real output.png in the job folder.
-
-Env flags:
-- SD35_RUNTIME_MODE = "skeleton" (default) or "real"
-- RUN_REAL_SD35 = "1"/"true"/"yes"/"on" to allow real mode.
-
-If anything goes wrong in real mode, the app gracefully falls back to skeleton.
 """
 
 import os
@@ -49,7 +43,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-# If this is True AND SD35_RUNTIME_MODE=real, we will attempt real SD3.5 txt2img.
 ENABLE_REAL_SD35 = _env_flag("RUN_REAL_SD35", False)
 
 
@@ -101,9 +94,11 @@ async def on_startup():
         logger.info("Initializing SD35Runtime in REAL mode (GPU).")
         sd35_runtime = SD35Runtime(mode="real", device="cuda")
         sd35_runtime.load()
-        if sd35_runtime.mode != "real" or sd35_runtime.pipe is None:  # type: ignore[attr-defined]
+
+        if sd35_runtime.mode != "real":
             logger.warning(
-                "SD35Runtime failed to initialize in real mode; falling back to skeleton."
+                "SD35Runtime failed to stay in real mode (likely missing model or imports). "
+                "Falling back to skeleton behavior."
             )
             sd35_runtime = None
     else:
@@ -159,9 +154,10 @@ def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
 def _create_dummy_png(job_folder: str, filename: str = "output.png") -> str:
     """
     Create a simple 512x512 gray PNG for skeleton testing.
+    Requires Pillow, but if it's missing we fail silently.
     """
     try:
-        from PIL import Image  # type: ignore
+        from PIL import Image
     except Exception as e:  # noqa: BLE001
         logger.warning("PIL not available for dummy PNG: %s", e)
         return filename
@@ -193,22 +189,31 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
     Called by the local API (port 8000):
 
     - Ensures job_folder exists
-    - Uses provided meta (from CPU planner)
+    - Reads meta.json (and/or uses provided meta)
     - If REAL SD3.5 is enabled and job type is 'text2img':
         * runs txt2img
         * writes real output.png
         * updates meta status to 'completed'
     - Else:
-        * skeleton behavior: update status to 'dispatched_skeleton', create dummy PNG.
+        * skeleton behavior: update status to 'dispatched_skeleton'
+          and create a dummy output.png
     """
     global sd35_runtime
 
     job_folder = payload.job_folder
-    meta = payload.meta
-
     _ensure_job_folder(job_folder)
 
-    # REAL MODE: use SD35Runtime to generate a real image if available
+    # Start from the meta on disk, merge with payload.meta (payload wins)
+    try:
+        meta = _read_meta(job_folder)
+    except HTTPException:
+        meta = {}
+
+    meta.update(payload.meta or {})
+    meta["job_folder"] = job_folder
+    meta["dispatched_at"] = datetime.utcnow().isoformat()
+
+    # REAL SD3.5 PATH
     if sd35_runtime is not None and meta.get("type") == "text2img":
         try:
             updated_meta = sd35_runtime.generate_text2img(job_folder, meta)
@@ -220,28 +225,13 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
                 "meta": updated_meta,
             }
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "SD35Runtime.generate_text2img() failed; falling back to skeleton: %s",
-                exc,
-            )
+            logger.exception("SD35Runtime.generate_text2img() failed: %s", exc)
+            # Fall through to skeleton behavior below.
 
-    # SKELETON MODE: no real SD3.5, just update meta + optional dummy PNG
-    try:
-        # If meta.json already exists, merge/override basic fields
-        existing_meta = _read_meta(job_folder)
-        existing_meta.update(meta)
-        meta = existing_meta
-    except HTTPException:
-        # If meta.json isn't there yet, just use payload meta
-        pass
-
+    # SKELETON PATH
+    _create_dummy_png(job_folder, filename="output.png")
     meta["status"] = "dispatched_skeleton"
     meta["mode"] = "skeleton-no-inference"
-    meta["dispatched_at"] = datetime.utcnow().isoformat()
-
-    # Create dummy PNG for easier debugging / UI previews
-    _create_dummy_png(job_folder, filename="output.png")
-
     _write_meta(job_folder, meta)
 
     return {

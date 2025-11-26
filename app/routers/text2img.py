@@ -4,12 +4,12 @@ import os
 import uuid
 import json
 import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.clients.gpu_client import dispatch_sd35_text2img  # NEW: GPU dispatcher
+from app.clients.gpu_client import dispatch_sd35_text2img
 
 router = APIRouter(prefix="/api/sd35", tags=["SD3.5 Text2Img"])
 
@@ -31,7 +31,7 @@ def _load_json_file(path: str) -> Dict[str, Any]:
     If the file does not exist or is invalid, return an empty dict.
     """
     if not os.path.isfile(path):
-        # Silent empty – we just treat it as "no profiles defined yet"
+        # treat it as "no profiles defined yet"
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -66,7 +66,7 @@ def _ensure_job_folder(base_outputs_dir: str = "outputs") -> str:
 
 class SD35Text2ImgRequest(BaseModel):
     """
-    Skeleton schema for SD3.5 text-to-image.
+    Schema for SD3.5 text-to-image.
     """
     prompt: str = Field(..., description="Main text prompt for SD3.5.")
     negative_prompt: Optional[str] = Field(
@@ -89,13 +89,13 @@ class SD35Text2ImgRequest(BaseModel):
         default=25,
         ge=1,
         le=100,
-        description="Planned number of inference steps.",
+        description="Number of diffusion steps.",
     )
     guidance_scale: float = Field(
         default=6.0,
         ge=0.0,
         le=20.0,
-        description="Planned CFG guidance scale.",
+        description="CFG guidance scale.",
     )
     style_preset: Optional[str] = Field(
         default=None,
@@ -164,12 +164,16 @@ def _validate_refiner_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
 @router.post("/render")
 async def sd35_render(request: SD35Text2ImgRequest):
     """
-    SD3.5 Text2Img endpoint (CPU-side).
+    SD3.5 Text2Img endpoint for RENDEREXPO AI STUDIO.
 
-    Steps:
-    - Validate LoRA + refiner profile names.
-    - Create outputs/{date}/{job_id}/ and meta.json.
-    - Dispatch the job to the GPU worker (port 8001) via /api/gpu/dispatch.
+    Flow:
+    - Validate LoRA + refiner profiles (if any).
+    - Create job folder under outputs/{date}/{job_id}/.
+    - Write meta.json with planned settings.
+    - Dispatch the job to GPU worker (port 8001) via /api/gpu/dispatch.
+    - Return:
+        * status="dispatched" and GPU response, or
+        * status="gpu_error" with error details.
     """
     # 1) Validate LoRA + refiner if provided
     lora_cfg = _validate_lora_profile(request.lora_profile)
@@ -199,7 +203,7 @@ async def sd35_render(request: SD35Text2ImgRequest):
         "seed": request.seed,
         "planned_output_image": "output.png",
         "status": "planned",
-        "mode": "cpu-planner",
+        "mode": "skeleton-or-real",  # actual mode decided on GPU
         "lora_profile": request.lora_profile,
         "lora_config": lora_cfg,
         "refiner_profile": request.refiner_profile,
@@ -210,28 +214,28 @@ async def sd35_render(request: SD35Text2ImgRequest):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    # 5) Dispatch to GPU worker (8001) via /api/gpu/dispatch
-    gpu_ok, gpu_data = dispatch_sd35_text2img(job_folder, meta)
+    # 5) Dispatch to GPU worker (port 8001)
+    ok, gpu_resp = dispatch_sd35_text2img(job_folder=job_folder, meta=meta)
 
-    if not gpu_ok:
-        # GPU failed – we still have meta.json, but no guarantee of output.png
+    if not ok:
+        # GPU worker failed or is unreachable; job remains "planned"
         return {
             "status": "gpu_error",
             "message": "Job planned but GPU worker failed.",
             "job_folder": job_folder,
             "meta_path": meta_path,
             "planned_output_image": planned_output_image,
-            "gpu_error": gpu_data,
+            "gpu_error": gpu_resp,
         }
 
-    # 6) If GPU succeeded, just return its info along with paths
+    # If GPU accepted the job, it may update meta.json and create output.png
     return {
         "status": "dispatched",
         "message": "Text2Img job dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "output_image": planned_output_image,
-        "gpu_response": gpu_data,
+        "gpu_response": gpu_resp,
     }
 
 
