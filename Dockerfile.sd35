@@ -1,5 +1,5 @@
 # 1) Base image – REPLACE this with the exact PyTorch 2.8 image name you use in RunPod
-FROM REPLACE_WITH_YOUR_PYTORCH_IMAGE
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
 WORKDIR /workspace
 
