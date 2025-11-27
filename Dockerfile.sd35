@@ -1,0 +1,28 @@
+# 1) Base image – REPLACE this with the exact PyTorch 2.8 image name you use in RunPod
+FROM REPLACE_WITH_YOUR_PYTORCH_IMAGE
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/lalsaman-cyber/RENDEREXPO-AI-Studio-Backend.git /workspace/RENDEREXPO-AI-Studio-Backend
+
+WORKDIR /workspace/RENDEREXPO-AI-Studio-Backend
+
+RUN python3 -m venv .venv --system-site-packages
+
+RUN . .venv/bin/activate && \
+    pip install --no-cache-dir \
+      fastapi "uvicorn[standard]" "pydantic<2" python-multipart \
+      pillow "diffusers>=0.32.0" "transformers>=4.45.0" \
+      "huggingface_hub>=0.24.0" "protobuf>=4.25.0" \
+      sentencepiece accelerate safetensors
+
+RUN chmod +x /workspace/RENDEREXPO-AI-Studio-Backend/start.sh
+
+EXPOSE 8000
+EXPOSE 8011
+
+CMD ["/workspace/RENDEREXPO-AI-Studio-Backend/start.sh"]

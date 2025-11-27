@@ -170,7 +170,7 @@ async def sd35_render(request: SD35Text2ImgRequest):
     - Validate LoRA + refiner profiles (if any).
     - Create job folder under outputs/{date}/{job_id}/.
     - Write meta.json with planned settings.
-    - Dispatch the job to GPU worker (port 8001) via /api/gpu/dispatch.
+    - Dispatch the job to GPU worker (port 8011) via /api/gpu/dispatch.
     - Return:
         * status="dispatched" and GPU response, or
         * status="gpu_error" with error details.
@@ -214,7 +214,7 @@ async def sd35_render(request: SD35Text2ImgRequest):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    # 5) Dispatch to GPU worker (port 8001)
+    # 5) Dispatch to GPU worker (port 8011)
     ok, gpu_resp = dispatch_sd35_text2img(job_folder=job_folder, meta=meta)
 
     if not ok:

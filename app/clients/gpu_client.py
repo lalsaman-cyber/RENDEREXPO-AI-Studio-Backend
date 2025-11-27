@@ -4,17 +4,17 @@ from typing import Any, Dict, Tuple
 import requests
 
 # Local GPU worker URL inside the pod
-GPU_BASE_URL = "http://127.0.0.1:8001"
+GPU_BASE_URL = "http://127.0.0.1:8011"
 
 
 class GPUClientError(Exception):
-    """Raised when the GPU worker (8001) fails or is unreachable."""
+    """Raised when the GPU worker (8011) fails or is unreachable."""
     pass
 
 
 def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """
-    Dispatch an SD3.5 text2img job to the GPU worker (port 8001).
+    Dispatch an SD3.5 text2img job to the GPU worker (port 8011).
 
     This sends a POST to /api/gpu/dispatch with:
       - job_folder: outputs/.../<job_id>

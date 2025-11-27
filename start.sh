@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
-echo "==============================================="
-echo " Starting RENDEREXPO AI STUDIO GPU API (SD3.5)"
-echo "==============================================="
+cd /workspace/RENDEREXPO-AI-Studio-Backend
+source .venv/bin/activate
 
-# Optional: print basic torch / CUDA info
-python3 - << 'EOF'
-try:
-    import torch
-    print("Torch version:", torch.__version__)
-    print("CUDA available:", torch.cuda.is_available())
-    if torch.cuda.is_available():
-        print("CUDA device count:", torch.cuda.device_count())
-        print("Current device:", torch.cuda.current_device())
-except Exception as e:
-    print("Torch/CUDA check failed:", e)
-EOF
+export SD35_MODEL_PATH=/workspace/models/sd35-large
 
-# Start FastAPI app (GPU-only entrypoint)
-# This will use app/gpu_entry.py and SD35Runtime inside runtime/sd35_runtime.py
-uvicorn app.gpu_entry:app --host 0.0.0.0 --port 8000
+# GPU worker – SD3.5 real mode
+export SD35_RUNTIME_MODE=real
+export RUN_REAL_SD35=1
+uvicorn app.gpu_entry:app --host 0.0.0.0 --port 8011 &
+
+# CPU planner – foreground
+uvicorn app.main:app --host 0.0.0.0 --port 8000
