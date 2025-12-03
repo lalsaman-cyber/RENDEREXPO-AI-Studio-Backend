@@ -189,3 +189,65 @@ def simulate_text2img_render(job_folder: str) -> Dict[str, Any]:
 
     save_job_meta(job_folder, meta)
     return meta
+
+
+# ---------------------------------------------------------------------------
+# PipelineManager (skeleton)
+# ---------------------------------------------------------------------------
+
+class PipelineManager:
+    """
+    Skeleton pipeline manager used by runpod_server.py.
+
+    For now, it:
+    - locates a job folder under outputs/{date_str}/{job_id}
+    - reads meta.json
+    - if status is "planned", writes a planned_actions list
+    - simulates a render by creating a dummy PNG
+    - returns the final meta dict
+
+    Later we will plug in real SD3.5 GPU inference here.
+    """
+
+    def __init__(self, base_outputs_dir: str = "outputs") -> None:
+        # This should match where the main app writes jobs, e.g.:
+        # outputs/2025-12-03/<job_id>/
+        self.base_outputs_dir = base_outputs_dir
+
+    def get_job_folder(self, date_str: str, job_id: str) -> str:
+        """
+        Resolve and validate the job folder path.
+        """
+        job_folder = os.path.join(self.base_outputs_dir, date_str, job_id)
+        if not os.path.isdir(job_folder):
+            raise FileNotFoundError(f"Job folder not found: {job_folder}")
+        return job_folder
+
+    def dispatch_job(self, date_str: str, job_id: str, sd35_runtime=None) -> dict:
+        """
+        Skeleton dispatch:
+
+        - Load meta.json
+        - If status is 'planned', create a plan and mark as 'dispatched_skeleton'
+        - Simulate a render (dummy PNG)
+        - Return updated meta
+
+        sd35_runtime is accepted but unused for now (future real GPU hook).
+        """
+        job_folder = self.get_job_folder(date_str, job_id)
+
+        # 1) Load current meta
+        meta = load_job_meta(job_folder)
+
+        # 2) If still planned, create a plan and mark as dispatched
+        status = meta.get("status", JobStatus.PLANNED.value)
+        if status in ("planned", JobStatus.PLANNED.value):
+            # write planned_actions and gpu_planning flags
+            meta = make_text2img_plan_for_job(job_folder)
+            meta["status"] = JobStatus.DISPATCHED.value
+            save_job_meta(job_folder, meta)
+
+        # 3) Simulate the render (creates dummy PNG + marks completed_skeleton)
+        final_meta = simulate_text2img_render(job_folder)
+
+        return final_meta
