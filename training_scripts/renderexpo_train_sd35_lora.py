@@ -1,15 +1,11 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LoRA trainer (simple + stable)
+# RENDEREXPO SD3.5-Large LoRA trainer (simple + fp32 only)
 #
 # - Trains LoRA on Stable Diffusion 3.5 Large (diffusers format)
 # - Uses a local image folder (instance_data_dir)
 # - Ignores .txt caption files; uses a single instance_prompt for all images
 # - Simple noise schedule, no FlowMatch tricks
-#
-# Designed for:
-#   --pretrained_model_name_or_path /workspace-data/models/sd35-large
-#   --instance_data_dir /workspace-data/lora_datasets/lora_test_dataset
-#   --instance_prompt "renderexpo building lora style"
+# - EVERYTHING runs in float32 to avoid NaNs/overflows.
 
 import argparse
 import os
@@ -147,13 +143,12 @@ def encode_prompt_sd3(
     tokenizer_three,
     max_sequence_length: int = 77,
     device: torch.device = torch.device("cuda"),
-    dtype: torch.dtype = torch.float16,
 ):
     """
     Encodes a single prompt for SD3:
     - 2x CLIP text encoders
     - 1x T5 encoder
-    Returns prompt_embeds, pooled_prompt_embeds
+    Returns prompt_embeds, pooled_prompt_embeds (both float32)
     """
     prompt_list = [prompt]
 
@@ -180,8 +175,8 @@ def encode_prompt_sd3(
         pooled = outputs[0]  # last layer CLS
         hidden = outputs.hidden_states[-2]  # penultimate hidden
 
-        hidden = hidden.to(dtype=dtype, device=device)
-        pooled = pooled.to(dtype=dtype, device=device)
+        hidden = hidden.to(dtype=torch.float32, device=device)
+        pooled = pooled.to(dtype=torch.float32, device=device)
 
         # [batch, seq, hidden]
         clip_embeds_list.append(hidden)
@@ -201,7 +196,7 @@ def encode_prompt_sd3(
     )
     t5_ids = t5_inputs.input_ids.to(device)
     t5_out = text_encoder_three(t5_ids)[0]  # [batch, seq, hidden]
-    t5_out = t5_out.to(dtype=dtype, device=device)
+    t5_out = t5_out.to(dtype=torch.float32, device=device)
 
     # Pad CLIP channels to match T5 hidden size along channel dimension, then concat along sequence
     if clip_prompt_embeds.shape[-1] < t5_out.shape[-1]:
@@ -221,7 +216,7 @@ def encode_prompt_sd3(
 
 
 def parse_args():
-    p = argparse.ArgumentParser("RENDEREXPO SD3.5 LoRA trainer")
+    p = argparse.ArgumentParser("RENDEREXPO SD3.5 LoRA trainer (fp32)")
 
     p.add_argument(
         "--pretrained_model_name_or_path",
@@ -281,7 +276,7 @@ def parse_args():
         type=str,
         default="fp16",
         choices=["no", "fp16", "bf16"],
-        help="We load weights in this dtype; loss is computed in fp32 for stability.",
+        help="Ignored in this script; we always use float32 for stability.",
     )
     p.add_argument(
         "--seed",
@@ -303,13 +298,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Choose weight dtype for GPU modules
-    if args.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-    elif args.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    else:
-        weight_dtype = torch.float32
+    # Everything in float32
+    weight_dtype = torch.float32
 
     # Make sure we start as clean as possible
     if torch.cuda.is_available():
@@ -320,11 +310,11 @@ def main():
     # ---------------------------------
     print("Loading SD3.5-Large components...")
 
-    # VAE (keep encode in float32, move latents to half)
+    # VAE
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
-        torch_dtype=torch.float32,
+        torch_dtype=weight_dtype,
     ).to(device)
 
     # Transformer
@@ -348,7 +338,7 @@ def main():
         subfolder="tokenizer_3",
     )
 
-    # Text encoders (kept frozen, just for embeddings)
+    # Text encoders
     te1_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder")
     te2_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_2")
     te3_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_3")
@@ -435,19 +425,18 @@ def main():
             tokenizer_three,
             max_sequence_length=77,
             device=device,
-            dtype=weight_dtype,
         )
 
     prompt_embeds = prompt_embeds.to(device, dtype=weight_dtype)
     pooled_prompt_embeds = pooled_prompt_embeds.to(device, dtype=weight_dtype)
 
     # ---------------------------------
-    # Training loop (simple noise, fixed timestep)
+    # Training loop (simple noise, fixed timestep, fp32)
     # ---------------------------------
     total_steps = args.max_train_steps
     global_step = 0
 
-    print(f"Starting training for {total_steps} steps (simple objective)...")
+    print(f"Starting training for {total_steps} steps (simple objective, fp32)...")
     progress_bar = tqdm(range(total_steps), desc="Training steps")
 
     transformer.train()
@@ -471,7 +460,6 @@ def main():
 
             # Clamp latents to avoid huge values
             latents = torch.clamp(latents, -10.0, 10.0)
-            latents = latents.to(dtype=weight_dtype)
 
             # Sample noise
             noise = torch.randn_like(latents)
@@ -497,8 +485,15 @@ def main():
                 return_dict=False,
             )[0]
 
+            # Check for NaNs in model_pred before loss
+            if not torch.isfinite(model_pred).all():
+                print(f"⚠️ model_pred has non-finite values at step {global_step}, skipping.")
+                global_step += 1
+                progress_bar.update(1)
+                continue
+
             # Compute loss in float32 for stability
-            loss = F.mse_loss(model_pred.float(), noise.float())
+            loss = F.mse_loss(model_pred, noise)
 
             if not torch.isfinite(loss):
                 print(
@@ -529,7 +524,18 @@ def main():
     transformer.eval()
     lora_state = get_peft_model_state_dict(transformer)
 
-    StableDiffusion3Pipeline.save_lora_weights(
+    # Free GPU before building pipeline for saving
+    del vae, text_encoder_one, text_encoder_two, text_encoder_three
+    free_memory()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    pipe = StableDiffusion3Pipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        torch_dtype=torch.float16,  # pipeline on CPU by default; dtype here is just storage
+    )
+
+    pipe.save_lora_weights(
         save_directory=args.output_dir,
         transformer_lora_layers=lora_state,
         text_encoder_lora_layers=None,
