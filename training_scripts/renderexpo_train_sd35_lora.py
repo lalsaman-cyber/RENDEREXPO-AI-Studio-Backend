@@ -5,7 +5,6 @@
 # - Uses a local image folder (instance_data_dir)
 # - Ignores .txt caption files; uses a single instance_prompt for all images
 #
-# Minimal but practical: no prior preservation, no hub push, no fancy schedulers.
 # Designed for your setup:
 #   --pretrained_model_name_or_path /workspace-data/models/sd35-large
 #   --instance_data_dir /workspace-data/lora_datasets/lora_test_dataset
@@ -390,6 +389,10 @@ def main():
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
+    # Prepare timesteps & sigmas for training
+    noise_scheduler.set_timesteps(noise_scheduler.config.num_train_timesteps)
+    schedule_timesteps = noise_scheduler.timesteps.to(device)
+    schedule_sigmas = noise_scheduler.sigmas.to(device, dtype=weight_dtype)
 
     train_dataset = RenderExpoImageDataset(
         instance_data_root=args.instance_data_dir,
@@ -448,23 +451,27 @@ def main():
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
 
-            # Standard latent scaling for SD models (for SD3 this may be slightly different,
-            # but this works reasonably in practice)
+            # Standard latent scaling for SD models
             latents = latents * vae.config.scaling_factor
 
             # Sample noise and timesteps
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
 
-            timesteps = torch.randint(
+            # Sample a timestep index and corresponding sigma (FlowMatch style)
+            idx = torch.randint(
                 0,
-                noise_scheduler.config.num_train_timesteps,
+                schedule_timesteps.shape[0],
                 (bsz,),
                 device=device,
                 dtype=torch.long,
             )
+            timesteps = schedule_timesteps[idx]
 
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            sigmas = schedule_sigmas[idx].view(bsz, 1, 1, 1)
+
+            # Flow-like mixing: x_t = (1 - sigma) * x_0 + sigma * z
+            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
             # Forward through transformer
             transformer.train()
@@ -498,11 +505,9 @@ def main():
     # ---------------------------------
     # Save LoRA weights
     # ---------------------------------
-    # Save in diffusers LoRA format via pipeline helper
-    pipe.save_lora_weights(
-        save_directory=args.output_dir,
-        transformer_lora_layers=transformer,
-    )
+    # Pipeline holds the same transformer with LoRA attached,
+    # so we can use the helper to save just LoRA weights.
+    pipe.save_lora_weights(args.output_dir)
 
     print(f"LoRA weights saved to: {args.output_dir}")
     del pipe
