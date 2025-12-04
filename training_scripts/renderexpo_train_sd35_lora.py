@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LoRA trainer (custom script)
+# RENDEREXPO SD3.5-Large LoRA trainer (stable version)
 #
 # - Trains LoRA on Stable Diffusion 3.5 Large (diffusers format)
 # - Uses a local image folder (instance_data_dir)
 # - Ignores .txt caption files; uses a single instance_prompt for all images
+# - Uses normalized sigmas + full float32 math to avoid NaNs
 #
 # Designed for your setup:
 #   --pretrained_model_name_or_path /workspace-data/models/sd35-large
@@ -267,7 +268,7 @@ def parse_args():
     p.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-5,  # slightly safer default than 1e-4
+        default=1e-5,  # safer default
     )
     p.add_argument(
         "--rank",
@@ -280,6 +281,7 @@ def parse_args():
         type=str,
         default="fp16",
         choices=["no", "fp16", "bf16"],
+        help="Kept for compatibility; training math is forced to float32 for stability.",
     )
     p.add_argument(
         "--seed",
@@ -301,13 +303,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Mixed precision
-    if args.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-    else:
-        weight_dtype = torch.float32
+    # For stability: force full float32 math during training
+    weight_dtype = torch.float32
 
     # ---------------------------------
     # Load base SD3.5 pipeline & pieces
@@ -352,7 +349,6 @@ def main():
     # ---------------------------
     # Add LoRA to transformer
     # ---------------------------
-    # Target modules follow SD3 attention naming (similar to official example)
     target_modules = [
         "attn.add_k_proj",
         "attn.add_q_proj",
@@ -371,7 +367,6 @@ def main():
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
-    # diffusers SD3 transformer has built-in adapter support
     transformer.add_adapter(lora_config)
 
     # Collect trainable LoRA params
@@ -392,10 +387,13 @@ def main():
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
-    # Prepare timesteps & sigmas for training
     noise_scheduler.set_timesteps(noise_scheduler.config.num_train_timesteps)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
-    schedule_sigmas = noise_scheduler.sigmas.to(device, dtype=weight_dtype)
+    schedule_sigmas = noise_scheduler.sigmas.to(device, dtype=torch.float32)
+
+    # Normalize sigmas into [0, 1] to avoid huge scales
+    max_sigma = schedule_sigmas.max().clamp(min=1e-6)
+    norm_sigmas = schedule_sigmas / max_sigma  # in [0, 1]
 
     train_dataset = RenderExpoImageDataset(
         instance_data_root=args.instance_data_dir,
@@ -444,7 +442,7 @@ def main():
     transformer.to(device, dtype=weight_dtype)
 
     num_t = schedule_timesteps.shape[0]
-    # Avoid extreme final timesteps (slightly safer)
+    # Avoid extreme timesteps (use 90% of range)
     max_idx_for_sampling = max(1, int(0.9 * num_t))
 
     while global_step < total_steps:
@@ -460,12 +458,12 @@ def main():
 
             # Standard latent scaling for SD models
             latents = latents * vae.config.scaling_factor
+            latents = latents.to(dtype=weight_dtype)
 
             # Sample noise and timesteps
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
 
-            # Sample a timestep index and corresponding sigma (FlowMatch style)
             idx = torch.randint(
                 0,
                 max_idx_for_sampling,
@@ -475,12 +473,12 @@ def main():
             )
             timesteps = schedule_timesteps[idx]
 
-            sigmas = schedule_sigmas[idx].view(bsz, 1, 1, 1)
+            # Normalized sigma in [0, 1]
+            sigma = norm_sigmas[idx].view(bsz, 1, 1, 1)
 
-            # Flow-like mixing: x_t = (1 - sigma) * x_0 + sigma * z
-            noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+            # Simple noise mixing: x_t = x_0 + sigma * noise
+            noisy_latents = latents + sigma * noise
 
-            # Forward through transformer
             transformer.train()
             optimizer.zero_grad()
 
@@ -492,12 +490,14 @@ def main():
                 return_dict=False,
             )[0]
 
-            # Simple MSE loss between predicted noise and true noise
+            # Target is the true noise
             loss = F.mse_loss(model_pred.float(), noise.float())
 
             if not torch.isfinite(loss):
-                print(f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}")
-                # Skip this step instead of backpropagating NaNs
+                print(f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}, skipping this step.")
+                # Still count the step so we don't loop forever
+                global_step += 1
+                progress_bar.update(1)
                 continue
 
             loss.backward()
