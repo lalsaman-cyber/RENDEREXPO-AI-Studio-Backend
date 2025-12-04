@@ -1,17 +1,17 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LoRA trainer (memory-safe + stable)
+# RENDEREXPO SD3.5-Large LoRA trainer (simple + stable)
 #
 # - Trains LoRA on Stable Diffusion 3.5 Large (diffusers format)
 # - Uses a local image folder (instance_data_dir)
 # - Ignores .txt caption files; uses a single instance_prompt for all images
-# - Uses normalized sigmas + MSE on noise, with FP16 weights and FP32 loss
+# - Simple noise schedule, no FlowMatch tricks
 #
 # Designed for:
 #   --pretrained_model_name_or_path /workspace-data/models/sd35-large
 #   --instance_data_dir /workspace-data/lora_datasets/lora_test_dataset
+#   --instance_prompt "renderexpo building lora style"
 
 import argparse
-import math
 import os
 import random
 from pathlib import Path
@@ -28,7 +28,6 @@ from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
 
 from diffusers import (
-    FlowMatchEulerDiscreteScheduler,
     AutoencoderKL,
     SD3Transformer2DModel,
     StableDiffusion3Pipeline,
@@ -321,11 +320,11 @@ def main():
     # ---------------------------------
     print("Loading SD3.5-Large components...")
 
-    # VAE
+    # VAE (keep encode in float32, move latents to half)
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
-        torch_dtype=weight_dtype,
+        torch_dtype=torch.float32,
     ).to(device)
 
     # Transformer
@@ -405,20 +404,8 @@ def main():
     )
 
     # ---------------------------
-    # Scheduler & dataset
+    # Dataset
     # ---------------------------
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="scheduler",
-    )
-    noise_scheduler.set_timesteps(noise_scheduler.config.num_train_timesteps)
-    schedule_timesteps = noise_scheduler.timesteps.to(device)
-    schedule_sigmas = noise_scheduler.sigmas.to(device, dtype=torch.float32)
-
-    # Normalize sigmas into [0, 1] to avoid huge scales
-    max_sigma = schedule_sigmas.max().clamp(min=1e-6)
-    norm_sigmas = schedule_sigmas / max_sigma  # in [0, 1]
-
     train_dataset = RenderExpoImageDataset(
         instance_data_root=args.instance_data_dir,
         instance_prompt=args.instance_prompt,
@@ -455,62 +442,58 @@ def main():
     pooled_prompt_embeds = pooled_prompt_embeds.to(device, dtype=weight_dtype)
 
     # ---------------------------------
-    # Training loop
+    # Training loop (simple noise, fixed timestep)
     # ---------------------------------
     total_steps = args.max_train_steps
     global_step = 0
 
-    print(f"Starting training for {total_steps} steps...")
+    print(f"Starting training for {total_steps} steps (simple objective)...")
     progress_bar = tqdm(range(total_steps), desc="Training steps")
 
-    num_t = schedule_timesteps.shape[0]
-    # Avoid extreme timesteps (use 90% of range)
-    max_idx_for_sampling = max(1, int(0.9 * num_t))
-
     transformer.train()
+
+    noise_scale = 0.2  # small, safe noise
 
     while global_step < total_steps:
         for batch in train_dataloader:
             if global_step >= total_steps:
                 break
 
-            pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
+            pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
 
-            # Encode images to latents
+            # Encode images to latents in float32 for stability
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
 
             # Standard latent scaling for SD
             if hasattr(vae.config, "scaling_factor"):
                 latents = latents * vae.config.scaling_factor
+
+            # Clamp latents to avoid huge values
+            latents = torch.clamp(latents, -10.0, 10.0)
             latents = latents.to(dtype=weight_dtype)
 
-            # Sample noise and timesteps
+            # Sample noise
             noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
+            noise = torch.clamp(noise, -10.0, 10.0)
 
-            idx = torch.randint(
-                0,
-                max_idx_for_sampling,
-                (bsz,),
+            # Fixed timestep (0) and simple noise mixing
+            timesteps = torch.zeros(
+                latents.shape[0],
                 device=device,
                 dtype=torch.long,
             )
-            timesteps = schedule_timesteps[idx]
 
-            # Normalized sigma in [0, 1]
-            sigma = norm_sigmas[idx].view(bsz, 1, 1, 1).to(device, dtype=weight_dtype)
-
-            # Simple noise mixing: x_t = x_0 + sigma * noise
-            noisy_latents = latents + sigma * noise
+            noisy_latents = latents + noise_scale * noise
+            noisy_latents = torch.clamp(noisy_latents, -10.0, 10.0)
 
             optimizer.zero_grad(set_to_none=True)
 
             model_pred = transformer(
                 hidden_states=noisy_latents,
                 timestep=timesteps,
-                encoder_hidden_states=prompt_embeds.repeat(bsz, 1, 1),
-                pooled_projections=pooled_prompt_embeds.repeat(bsz, 1),
+                encoder_hidden_states=prompt_embeds.repeat(latents.shape[0], 1, 1),
+                pooled_projections=pooled_prompt_embeds.repeat(latents.shape[0], 1),
                 return_dict=False,
             )[0]
 
@@ -518,7 +501,10 @@ def main():
             loss = F.mse_loss(model_pred.float(), noise.float())
 
             if not torch.isfinite(loss):
-                print(f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}, skipping this step.")
+                print(
+                    f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}, "
+                    "skipping this step."
+                )
                 global_step += 1
                 progress_bar.update(1)
                 continue
