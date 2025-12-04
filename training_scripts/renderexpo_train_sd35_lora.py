@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LoRA trainer (stable version)
+# RENDEREXPO SD3.5-Large LoRA trainer (memory-safe + stable)
 #
 # - Trains LoRA on Stable Diffusion 3.5 Large (diffusers format)
 # - Uses a local image folder (instance_data_dir)
 # - Ignores .txt caption files; uses a single instance_prompt for all images
-# - Uses normalized sigmas + full float32 math to avoid NaNs
+# - Uses normalized sigmas + MSE on noise, with FP16 weights and FP32 loss
 #
-# Designed for your setup:
+# Designed for:
 #   --pretrained_model_name_or_path /workspace-data/models/sd35-large
 #   --instance_data_dir /workspace-data/lora_datasets/lora_test_dataset
 
@@ -28,10 +28,10 @@ from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
 
 from diffusers import (
-    StableDiffusion3Pipeline,
     FlowMatchEulerDiscreteScheduler,
     AutoencoderKL,
     SD3Transformer2DModel,
+    StableDiffusion3Pipeline,
 )
 from diffusers.training_utils import free_memory
 from peft import LoraConfig, get_peft_model_state_dict
@@ -148,6 +148,7 @@ def encode_prompt_sd3(
     tokenizer_three,
     max_sequence_length: int = 77,
     device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.float16,
 ):
     """
     Encodes a single prompt for SD3:
@@ -180,8 +181,8 @@ def encode_prompt_sd3(
         pooled = outputs[0]  # last layer CLS
         hidden = outputs.hidden_states[-2]  # penultimate hidden
 
-        hidden = hidden.to(dtype=enc.dtype, device=device)
-        pooled = pooled.to(dtype=enc.dtype, device=device)
+        hidden = hidden.to(dtype=dtype, device=device)
+        pooled = pooled.to(dtype=dtype, device=device)
 
         # [batch, seq, hidden]
         clip_embeds_list.append(hidden)
@@ -201,7 +202,7 @@ def encode_prompt_sd3(
     )
     t5_ids = t5_inputs.input_ids.to(device)
     t5_out = text_encoder_three(t5_ids)[0]  # [batch, seq, hidden]
-    t5_out = t5_out.to(dtype=text_encoder_three.dtype, device=device)
+    t5_out = t5_out.to(dtype=dtype, device=device)
 
     # Pad CLIP channels to match T5 hidden size along channel dimension, then concat along sequence
     if clip_prompt_embeds.shape[-1] < t5_out.shape[-1]:
@@ -268,7 +269,7 @@ def parse_args():
     p.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-5,  # safer default
+        default=1e-5,  # safe default
     )
     p.add_argument(
         "--rank",
@@ -281,7 +282,7 @@ def parse_args():
         type=str,
         default="fp16",
         choices=["no", "fp16", "bf16"],
-        help="Kept for compatibility; training math is forced to float32 for stability.",
+        help="We load weights in this dtype; loss is computed in fp32 for stability.",
     )
     p.add_argument(
         "--seed",
@@ -303,43 +304,66 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # For stability: force full float32 math during training
-    weight_dtype = torch.float32
+    # Choose weight dtype for GPU modules
+    if args.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    else:
+        weight_dtype = torch.float32
+
+    # Make sure we start as clean as possible
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ---------------------------------
-    # Load base SD3.5 pipeline & pieces
+    # Load components individually (no full pipeline on GPU)
     # ---------------------------------
-    print("Loading SD3.5-Large pipeline...")
-    pipe = StableDiffusion3Pipeline.from_pretrained(
+    print("Loading SD3.5-Large components...")
+
+    # VAE
+    vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
+        subfolder="vae",
         torch_dtype=weight_dtype,
+    ).to(device)
+
+    # Transformer
+    transformer: SD3Transformer2DModel = SD3Transformer2DModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        torch_dtype=weight_dtype,
+    ).to(device)
+
+    # Tokenizers
+    tokenizer_one: CLIPTokenizer = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
     )
-    pipe.to(device)
-    pipe.set_progress_bar_config(disable=True)
+    tokenizer_two: CLIPTokenizer = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_2",
+    )
+    tokenizer_three: T5TokenizerFast = T5TokenizerFast.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_3",
+    )
 
-    # Grab components
-    vae: AutoencoderKL = pipe.vae
-    transformer: SD3Transformer2DModel = pipe.transformer
-    tokenizer_one: CLIPTokenizer = pipe.tokenizer
-    tokenizer_two: CLIPTokenizer = pipe.tokenizer_2
-    tokenizer_three: T5TokenizerFast = pipe.tokenizer_3
-
-    # Load text encoders in trainable form (not frozen copies)
+    # Text encoders (kept frozen, just for embeddings)
     te1_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder")
     te2_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_2")
     te3_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_3")
 
     text_encoder_one = te1_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder"
-    ).to(device, dtype=weight_dtype)
+        args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype
+    ).to(device)
     text_encoder_two = te2_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2"
-    ).to(device, dtype=weight_dtype)
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=weight_dtype
+    ).to(device)
     text_encoder_three = te3_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_3"
-    ).to(device, dtype=weight_dtype)
+        args.pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=weight_dtype
+    ).to(device)
 
-    # Freeze everything except LoRA layers
     vae.requires_grad_(False)
     transformer.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
@@ -424,6 +448,7 @@ def main():
             tokenizer_three,
             max_sequence_length=77,
             device=device,
+            dtype=weight_dtype,
         )
 
     prompt_embeds = prompt_embeds.to(device, dtype=weight_dtype)
@@ -438,12 +463,11 @@ def main():
     print(f"Starting training for {total_steps} steps...")
     progress_bar = tqdm(range(total_steps), desc="Training steps")
 
-    vae.to(device, dtype=weight_dtype)
-    transformer.to(device, dtype=weight_dtype)
-
     num_t = schedule_timesteps.shape[0]
     # Avoid extreme timesteps (use 90% of range)
     max_idx_for_sampling = max(1, int(0.9 * num_t))
+
+    transformer.train()
 
     while global_step < total_steps:
         for batch in train_dataloader:
@@ -456,8 +480,9 @@ def main():
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
 
-            # Standard latent scaling for SD models
-            latents = latents * vae.config.scaling_factor
+            # Standard latent scaling for SD
+            if hasattr(vae.config, "scaling_factor"):
+                latents = latents * vae.config.scaling_factor
             latents = latents.to(dtype=weight_dtype)
 
             # Sample noise and timesteps
@@ -474,13 +499,12 @@ def main():
             timesteps = schedule_timesteps[idx]
 
             # Normalized sigma in [0, 1]
-            sigma = norm_sigmas[idx].view(bsz, 1, 1, 1)
+            sigma = norm_sigmas[idx].view(bsz, 1, 1, 1).to(device, dtype=weight_dtype)
 
             # Simple noise mixing: x_t = x_0 + sigma * noise
             noisy_latents = latents + sigma * noise
 
-            transformer.train()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             model_pred = transformer(
                 hidden_states=noisy_latents,
@@ -490,18 +514,17 @@ def main():
                 return_dict=False,
             )[0]
 
-            # Target is the true noise
+            # Compute loss in float32 for stability
             loss = F.mse_loss(model_pred.float(), noise.float())
 
             if not torch.isfinite(loss):
                 print(f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}, skipping this step.")
-                # Still count the step so we don't loop forever
                 global_step += 1
                 progress_bar.update(1)
                 continue
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_((lora_params), 1.0)
+            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
             optimizer.step()
 
             global_step += 1
@@ -528,7 +551,7 @@ def main():
     )
 
     print(f"LoRA weights saved to: {args.output_dir}")
-    del pipe
+
     free_memory()
 
 
