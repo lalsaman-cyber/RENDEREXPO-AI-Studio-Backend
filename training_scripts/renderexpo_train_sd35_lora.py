@@ -25,7 +25,6 @@ from PIL.ImageOps import exif_transpose
 from tqdm.auto import tqdm
 
 from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
-from transformers import CLIPTextModelWithProjection, T5EncoderModel
 
 from diffusers import (
     StableDiffusion3Pipeline,
@@ -34,7 +33,7 @@ from diffusers import (
     SD3Transformer2DModel,
 )
 from diffusers.training_utils import free_memory
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model_state_dict
 
 
 # ------------------------------
@@ -127,8 +126,12 @@ def import_text_encoder_class(model_path: str, subfolder: str):
     cfg = PretrainedConfig.from_pretrained(model_path, subfolder=subfolder)
     arch = cfg.architectures[0]
     if arch == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+
         return CLIPTextModelWithProjection
     elif arch == "T5EncoderModel":
+        from transformers import T5EncoderModel
+
         return T5EncoderModel
     else:
         raise ValueError(f"Unsupported text encoder architecture: {arch}")
@@ -264,7 +267,7 @@ def parse_args():
     p.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=5e-5,  # slightly safer default than 1e-4
     )
     p.add_argument(
         "--rank",
@@ -440,6 +443,10 @@ def main():
     vae.to(device, dtype=weight_dtype)
     transformer.to(device, dtype=weight_dtype)
 
+    num_t = schedule_timesteps.shape[0]
+    # Avoid extreme final timesteps (slightly safer)
+    max_idx_for_sampling = max(1, int(0.9 * num_t))
+
     while global_step < total_steps:
         for batch in train_dataloader:
             if global_step >= total_steps:
@@ -461,7 +468,7 @@ def main():
             # Sample a timestep index and corresponding sigma (FlowMatch style)
             idx = torch.randint(
                 0,
-                schedule_timesteps.shape[0],
+                max_idx_for_sampling,
                 (bsz,),
                 device=device,
                 dtype=torch.long,
@@ -488,12 +495,17 @@ def main():
             # Simple MSE loss between predicted noise and true noise
             loss = F.mse_loss(model_pred.float(), noise.float())
 
+            if not torch.isfinite(loss):
+                print(f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}")
+                # Skip this step instead of backpropagating NaNs
+                continue
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+            torch.nn.utils.clip_grad_norm_((lora_params), 1.0)
             optimizer.step()
 
             global_step += 1
-            progress_bar.set_postfix({"loss": loss.item()})
+            progress_bar.set_postfix({"loss": float(loss.item())})
             progress_bar.update(1)
 
             if global_step >= total_steps:
@@ -503,11 +515,17 @@ def main():
     print("Training finished, saving LoRA weights...")
 
     # ---------------------------------
-    # Save LoRA weights
+    # Save LoRA weights (PEFT → diffusers format)
     # ---------------------------------
-    # Pipeline holds the same transformer with LoRA attached,
-    # so we can use the helper to save just LoRA weights.
-    pipe.save_lora_weights(args.output_dir)
+    transformer.eval()
+    lora_state = get_peft_model_state_dict(transformer)
+
+    StableDiffusion3Pipeline.save_lora_weights(
+        save_directory=args.output_dir,
+        transformer_lora_layers=lora_state,
+        text_encoder_lora_layers=None,
+        text_encoder_2_lora_layers=None,
+    )
 
     print(f"LoRA weights saved to: {args.output_dir}")
     del pipe
