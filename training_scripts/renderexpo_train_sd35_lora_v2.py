@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LoRA trainer v2 (simple + fp32 only)
+# RENDEREXPO SD3.5-Large LoRA trainer (simple + fp32 only)
 #
 # - Trains LoRA on Stable Diffusion 3.5 Large (diffusers format)
 # - Uses a local image folder (instance_data_dir)
@@ -226,7 +226,7 @@ def encode_prompt_sd3(
 
 
 def parse_args():
-    p = argparse.ArgumentParser("RENDEREXPO SD3.5 LoRA trainer v2 (fp32, text encoders on CPU)")
+    p = argparse.ArgumentParser("RENDEREXPO SD3.5 LoRA trainer (fp32, text encoders on CPU)")
 
     p.add_argument(
         "--pretrained_model_name_or_path",
@@ -249,7 +249,7 @@ def parse_args():
     p.add_argument(
         "--output_dir",
         type=str,
-        default="sd35_lora_output_v2",
+        default="sd35_lora_output",
         help="Where to save LoRA weights",
     )
     p.add_argument(
