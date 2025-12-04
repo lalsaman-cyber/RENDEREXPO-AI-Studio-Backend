@@ -5,7 +5,7 @@
 # - Uses a local image folder (instance_data_dir)
 # - Ignores .txt caption files; uses a single instance_prompt for all images
 # - Simple noise schedule, no FlowMatch tricks
-# - EVERYTHING runs in float32 to avoid NaNs/overflows.
+# - EVERYTHING in transformer/VAE runs in float32; text encoders stay on CPU to avoid OOM.
 
 import argparse
 import os
@@ -142,13 +142,16 @@ def encode_prompt_sd3(
     tokenizer_two,
     tokenizer_three,
     max_sequence_length: int = 77,
-    device: torch.device = torch.device("cuda"),
+    device: torch.device = torch.device("cpu"),
 ):
     """
     Encodes a single prompt for SD3:
+
     - 2x CLIP text encoders
     - 1x T5 encoder
-    Returns prompt_embeds, pooled_prompt_embeds (both float32)
+
+    All encoders are assumed to be on CPU in this script.
+    Returns prompt_embeds, pooled_prompt_embeds (both float32, on `device`).
     """
     prompt_list = [prompt]
 
@@ -166,19 +169,20 @@ def encode_prompt_sd3(
             truncation=True,
             return_tensors="pt",
         )
-        input_ids = text_inputs.input_ids.to(device)
+        input_ids = text_inputs.input_ids  # stay on CPU
 
-        outputs = enc(
-            input_ids,
-            output_hidden_states=True,
-        )
+        with torch.no_grad():
+            outputs = enc(
+                input_ids,
+                output_hidden_states=True,
+            )
+
         pooled = outputs[0]  # last layer CLS
         hidden = outputs.hidden_states[-2]  # penultimate hidden
 
-        hidden = hidden.to(dtype=torch.float32, device=device)
-        pooled = pooled.to(dtype=torch.float32, device=device)
+        hidden = hidden.to(dtype=torch.float32)
+        pooled = pooled.to(dtype=torch.float32)
 
-        # [batch, seq, hidden]
         clip_embeds_list.append(hidden)
         clip_pooled_list.append(pooled)
 
@@ -194,9 +198,11 @@ def encode_prompt_sd3(
         add_special_tokens=True,
         return_tensors="pt",
     )
-    t5_ids = t5_inputs.input_ids.to(device)
-    t5_out = text_encoder_three(t5_ids)[0]  # [batch, seq, hidden]
-    t5_out = t5_out.to(dtype=torch.float32, device=device)
+    t5_ids = t5_inputs.input_ids  # CPU
+    with torch.no_grad():
+        t5_out = text_encoder_three(t5_ids)[0]  # [batch, seq, hidden]
+
+    t5_out = t5_out.to(dtype=torch.float32)
 
     # Pad CLIP channels to match T5 hidden size along channel dimension, then concat along sequence
     if clip_prompt_embeds.shape[-1] < t5_out.shape[-1]:
@@ -207,6 +213,10 @@ def encode_prompt_sd3(
 
     prompt_embeds = torch.cat([clip_prompt_embeds, t5_out], dim=-2)
 
+    # Move to requested device (GPU) at the very end
+    prompt_embeds = prompt_embeds.to(device)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(device)
+
     return prompt_embeds, pooled_prompt_embeds
 
 
@@ -216,7 +226,7 @@ def encode_prompt_sd3(
 
 
 def parse_args():
-    p = argparse.ArgumentParser("RENDEREXPO SD3.5 LoRA trainer (fp32)")
+    p = argparse.ArgumentParser("RENDEREXPO SD3.5 LoRA trainer (fp32, text encoders on CPU)")
 
     p.add_argument(
         "--pretrained_model_name_or_path",
@@ -297,8 +307,9 @@ def main():
         random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cpu_device = torch.device("cpu")
 
-    # Everything in float32
+    # Everything in VAE + transformer uses float32
     weight_dtype = torch.float32
 
     # Make sure we start as clean as possible
@@ -306,25 +317,25 @@ def main():
         torch.cuda.empty_cache()
 
     # ---------------------------------
-    # Load components individually (no full pipeline on GPU)
+    # Load components individually
     # ---------------------------------
     print("Loading SD3.5-Large components...")
 
-    # VAE
+    # VAE on GPU
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         torch_dtype=weight_dtype,
     ).to(device)
 
-    # Transformer
+    # Transformer on GPU
     transformer: SD3Transformer2DModel = SD3Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="transformer",
         torch_dtype=weight_dtype,
     ).to(device)
 
-    # Tokenizers
+    # Tokenizers (CPU)
     tokenizer_one: CLIPTokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer",
@@ -338,20 +349,20 @@ def main():
         subfolder="tokenizer_3",
     )
 
-    # Text encoders
+    # Text encoders (CPU ONLY to avoid OOM)
     te1_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder")
     te2_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_2")
     te3_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_3")
 
     text_encoder_one = te1_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype
-    ).to(device)
+    ).to(cpu_device)
     text_encoder_two = te2_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=weight_dtype
-    ).to(device)
+    ).to(cpu_device)
     text_encoder_three = te3_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=weight_dtype
-    ).to(device)
+    ).to(cpu_device)
 
     vae.requires_grad_(False)
     transformer.requires_grad_(False)
@@ -411,7 +422,7 @@ def main():
     )
 
     # ---------------------------------
-    # Pre-encode the fixed instance prompt
+    # Pre-encode the fixed instance prompt (text encoders on CPU)
     # ---------------------------------
     print("Encoding instance prompt...")
     with torch.no_grad():
@@ -424,7 +435,7 @@ def main():
             tokenizer_two,
             tokenizer_three,
             max_sequence_length=77,
-            device=device,
+            device=device,  # move embeddings to GPU at the end
         )
 
     prompt_embeds = prompt_embeds.to(device, dtype=weight_dtype)
