@@ -32,10 +32,10 @@ from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
 from diffusers import (
     AutoencoderKL,
     SD3Transformer2DModel,
-    StableDiffusion3Pipeline,
 )
 from diffusers.training_utils import free_memory
 from peft import LoraConfig, get_peft_model_state_dict
+import safetensors.torch as sft
 
 
 # ------------------------------
@@ -351,6 +351,7 @@ def main():
     # Load components individually
     # ---------------------------------
     print("Loading SD3.5-Large components...")
+    print(f"Using default instance prompt: {args.instance_prompt}")
 
     # VAE on GPU
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
@@ -572,32 +573,24 @@ def main():
     print("Training finished, saving LoRA weights...")
 
     # ---------------------------------
-    # Save LoRA weights (PEFT → diffusers format)
+    # Save LoRA weights (direct safetensors save, no pipeline reload)
     # ---------------------------------
     transformer.eval()
     lora_state = get_peft_model_state_dict(transformer)
 
-    # Free GPU before building pipeline for saving
+    # Free GPU before saving
     del vae, text_encoder_one, text_encoder_two, text_encoder_three
     free_memory()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    pipe = StableDiffusion3Pipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        torch_dtype=torch.float16,  # pipeline on CPU by default; dtype here is just storage
-    )
+    print("Saving LoRA weights (direct safetensors save, no pipeline reload)...")
 
-    pipe.save_lora_weights(
-        save_directory=args.output_dir,
-        transformer_lora_layers=lora_state,
-        text_encoder_lora_layers=None,
-        text_encoder_2_lora_layers=None,
-    )
+    os.makedirs(args.output_dir, exist_ok=True)
+    save_path = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")
+    sft.save_file(lora_state, save_path)
 
-    print(f"LoRA weights saved to: {args.output_dir}")
-
-    free_memory()
+    print(f"LoRA weights saved to: {save_path}")
 
 
 if __name__ == "__main__":
