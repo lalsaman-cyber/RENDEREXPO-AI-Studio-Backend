@@ -33,7 +33,7 @@ from diffusers.training_utils import free_memory
 import safetensors.torch as sft
 
 # True LyCORIS (LoCon / LoHa)
-from lycoris import create_lycoris, LycorisNetwork
+from lycoris_lora import create_lycoris, LycorisNetwork
 
 
 # --------------------------------------------------
