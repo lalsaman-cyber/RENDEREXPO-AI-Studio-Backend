@@ -1,20 +1,14 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LyCORIS trainer (PRO v2, caption-aware, fp32, 896px, rank 8)
+# RENDEREXPO SD3.5-Large LyCORIS trainer (PRO v2, caption-aware, fp16 on GPU, 896px, rank 8)
 #
 # - Base model: Stable Diffusion 3.5 Large (diffusers format)
 # - True LyCORIS adapters (LoCon / LoHa) using the `lycoris-lora` library
 # - 225 fully captioned Corona-quality RENDEREXPO images
-# - Resolution: 896x896 (square, random-crop, random-flip)
-# - Rank: 8, Alpha: 8  (per your spec)
-# - LR schedule: 1e-4  →  5e-5  →  2e-5 over 6000 steps
-# - Caption-aware:
-#       * Uses per-image .txt caption if present
-#       * If missing/empty, falls back to --instance_prompt
-#       * Optional caption_dropout mixes in the global style prompt
-#
-# NOTE:
-#   This script ONLY handles the training logic.
-#   tmux + nohup will be handled in the shell when we actually start training.
+# - Resolution: 896x896
+# - Rank: 8, Alpha: 8
+# - LR schedule: 1e-4 -> 5e-5 -> 2e-5
+# - Uses fp16 on GPU to reduce VRAM, text encoders stay fp32 on CPU
+# - Enables gradient checkpointing on the transformer for further memory savings
 
 import argparse
 import os
@@ -38,12 +32,12 @@ from diffusers.training_utils import free_memory
 
 import safetensors.torch as sft
 
-# 🔸 True LyCORIS (LoCon / LoHa)
+# True LyCORIS (LoCon / LoHa)
 from lycoris import create_lycoris, LycorisNetwork
 
 
 # --------------------------------------------------
-# Dataset: image + caption pairs (225 Corona renders)
+# Dataset: image + caption pairs
 # --------------------------------------------------
 
 
@@ -56,7 +50,7 @@ class RenderExpoCaptionDataset(Dataset):
     - If found and non-empty: uses that text as the prompt
     - Otherwise: falls back to the global --instance_prompt
     - Optional caption_dropout: with probability p, we ignore the caption and use
-      the global instance_prompt instead (helps the LoRA/LyCORIS generalize).
+      the global instance_prompt instead (helps the adapter generalize).
     """
 
     def __init__(
@@ -179,6 +173,7 @@ def encode_prompt_sd3(
     tokenizer_three,
     max_sequence_length: int = 77,
     device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
 ):
     """
     Encodes a batch of prompts for SD3:
@@ -186,8 +181,7 @@ def encode_prompt_sd3(
     - 2x CLIP text encoders
     - 1x T5 encoder
 
-    All encoders are assumed to be on CPU in this script.
-    Returns (prompt_embeds, pooled_prompt_embeds) on `device`, float32.
+    Text encoders are on CPU; we output embeddings on `device` with dtype `dtype`.
     """
 
     # --- CLIP encoders (two) ---
@@ -248,9 +242,9 @@ def encode_prompt_sd3(
 
     prompt_embeds = torch.cat([clip_prompt_embeds, t5_out], dim=-2)
 
-    # Move to requested device (GPU) at the very end
-    prompt_embeds = prompt_embeds.to(device)
-    pooled_prompt_embeds = pooled_prompt_embeds.to(device)
+    # Move to requested device and dtype at the end
+    prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
 
     return prompt_embeds, pooled_prompt_embeds
 
@@ -288,7 +282,7 @@ def three_phase_lr(step: int, total_steps: int, lr_start: float, lr_mid: float, 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        "RENDEREXPO SD3.5 LoRA/LyCORIS trainer PRO v2 (caption-aware, fp32, 896px, rank 8)"
+        "RENDEREXPO SD3.5 LyCORIS trainer PRO v2 (caption-aware, fp16 on GPU, 896px, rank 8)"
     )
 
     p.add_argument(
@@ -408,10 +402,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cpu_device = torch.device("cpu")
 
-    # Everything in VAE + transformer uses float32 for stability
-    weight_dtype = torch.float32
+    # Use fp16 for big GPU modules to reduce VRAM
+    weight_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
+    # Enable TF32 for a bit more speed (optional)
     if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         torch.cuda.empty_cache()
 
     # ---------------------------------
@@ -426,33 +423,35 @@ def main():
     print(f"Resolution:             {args.resolution}")
     print(f"Batch size:             {args.train_batch_size}")
     print(f"Max steps:              {args.max_train_steps}")
-    print(f"LR schedule:            {args.learning_rate} → {args.lr_mid} → {args.lr_final}")
+    print(f"LR schedule:            {args.learning_rate} -> {args.lr_mid} -> {args.lr_final}")
     print(f"LyCORIS algo:           {args.lycoris_algo}")
     print(f"LyCORIS rank (dim):     {args.rank}")
     print(f"LyCORIS alpha:          {args.alpha}")
     print(f"Caption dropout:        {args.caption_dropout}")
     print(f"Seed:                   {args.seed}")
+    print(f"weight_dtype (GPU):     {weight_dtype}")
     print("==========================================")
-
-    # ---------------------------------
-    # Load SD3.5 components
-    # ---------------------------------
     print("Loading SD3.5-Large components...")
     print(f"Using default instance prompt: {args.instance_prompt}")
 
-    # VAE on GPU
+    # VAE on GPU (fp16 or fp32 depending on weight_dtype)
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         torch_dtype=weight_dtype,
     ).to(device)
 
-    # Transformer on GPU
+    # Transformer on GPU (fp16 or fp32)
     transformer: SD3Transformer2DModel = SD3Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="transformer",
         torch_dtype=weight_dtype,
     ).to(device)
+
+    # Enable gradient checkpointing to save activation memory
+    if hasattr(transformer, "enable_gradient_checkpointing"):
+        transformer.enable_gradient_checkpointing()
+        print("Enabled gradient checkpointing on transformer.")
 
     # Tokenizers (CPU)
     tokenizer_one: CLIPTokenizer = CLIPTokenizer.from_pretrained(
@@ -468,19 +467,19 @@ def main():
         subfolder="tokenizer_3",
     )
 
-    # Text encoders (CPU ONLY)
+    # Text encoders (CPU ONLY, fp32)
     te1_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder")
     te2_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_2")
     te3_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_3")
 
     text_encoder_one = te1_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype
+        args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=torch.float32
     ).to(cpu_device)
     text_encoder_two = te2_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=weight_dtype
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=torch.float32
     ).to(cpu_device)
     text_encoder_three = te3_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=weight_dtype
+        args.pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=torch.float32
     ).to(cpu_device)
 
     vae.requires_grad_(False)
@@ -490,31 +489,30 @@ def main():
     text_encoder_three.requires_grad_(False)
 
     # ---------------------------------
-    # Add TRUE LyCORIS adapter (LoCon / LoHa)
+    # Attach LyCORIS adapter (LoCon / LoHa)
     # ---------------------------------
     print("Attaching LyCORIS adapter to SD3.5 transformer...")
 
-    # Target preset: here we follow the standard example and adapt attention modules.
-    # LyCon itself is implemented inside LyCORIS; we just pick algo="locon" or "loha".
+    # Target attention modules; LyCORIS internally expands to LoCon style
     LycorisNetwork.apply_preset(
         {
-            "target_name": [".*attn.*"],  # focus on attention modules; LyCon extends into convs internally
+            "target_name": [".*attn.*"],
         }
     )
 
     lyco_net = create_lycoris(
         transformer,
-        1.0,  # multiplier (weight at inference time, we keep 1.0 here)
+        1.0,  # multiplier at inference time
         linear_dim=args.rank,
         linear_alpha=float(args.alpha),
         algo=args.lycoris_algo,
     )
     lyco_net.apply_to()
+    lyco_net.to(device=device, dtype=weight_dtype)
 
-    # Collect trainable parameters from LyCORIS wrapper
     trainable_params = list(lyco_net.parameters())
     if len(trainable_params) == 0:
-        raise RuntimeError("No trainable LyCORIS parameters found – something went wrong with create_lycoris().")
+        raise RuntimeError("No trainable LyCORIS parameters found – check create_lycoris / apply_preset config.")
 
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -548,15 +546,12 @@ def main():
     total_steps = args.max_train_steps
     global_step = 0
 
-    print(f"Starting PRO v2 training for {total_steps} steps (LyCORIS {args.lycoris_algo}, 896px)...")
+    print(f"Starting PRO v2 training for {total_steps} steps (LyCORIS {args.lycoris_algo}, 896px, fp16 on GPU)...")
     progress_bar = tqdm(range(total_steps), desc="Training steps")
 
     transformer.train()
 
-    # noise_scale controls how hard the denoising task is; small is more stable
     noise_scale = 0.2
-
-    # Optional: record last loss for quick sanity check
     last_loss_value = None
 
     while global_step < total_steps:
@@ -564,10 +559,10 @@ def main():
             if global_step >= total_steps:
                 break
 
-            pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
-            prompts = batch["prompt"]  # list of strings
+            pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
+            prompts = batch["prompt"]
 
-            # Encode prompts using CPU text encoders, then move embeds to GPU
+            # Encode prompts (text encoders on CPU, outputs to GPU fp16/fp32)
             with torch.no_grad():
                 prompt_embeds, pooled_prompt_embeds = encode_prompt_sd3(
                     prompts,
@@ -579,23 +574,21 @@ def main():
                     tokenizer_three,
                     max_sequence_length=77,
                     device=device,
+                    dtype=weight_dtype,
                 )
 
-            # Encode images to latents with VAE (fp32)
+            # Encode images to latents with VAE
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
 
-            # Scaling for SD
             if hasattr(vae.config, "scaling_factor"):
                 latents = latents * vae.config.scaling_factor
 
-            latents = torch.clamp(latents, -10.0, 10.0)
+            latents = torch.clamp(latents, -10.0, 10.0).to(dtype=weight_dtype)
 
-            # Sample noise
             noise = torch.randn_like(latents)
             noise = torch.clamp(noise, -10.0, 10.0)
 
-            # Simple fixed timestep (0) noise setup
             timesteps = torch.zeros(
                 latents.shape[0],
                 device=device,
@@ -605,7 +598,7 @@ def main():
             noisy_latents = latents + noise_scale * noise
             noisy_latents = torch.clamp(noisy_latents, -10.0, 10.0)
 
-            # Set LR from three-phase scheduler
+            # LR from three-phase scheduler
             lr = three_phase_lr(
                 global_step,
                 total_steps,
@@ -626,15 +619,14 @@ def main():
                 return_dict=False,
             )[0]
 
-            # Check for NaNs in model_pred before loss
             if not torch.isfinite(model_pred).all():
                 print(f"⚠️ model_pred has non-finite values at step {global_step}, skipping.")
                 global_step += 1
                 progress_bar.update(1)
                 continue
 
-            # MSE loss in float32
-            loss = F.mse_loss(model_pred, noise)
+            # Compute loss in float32 for stability
+            loss = F.mse_loss(model_pred.float(), noise.float())
 
             if not torch.isfinite(loss):
                 print(
@@ -675,7 +667,6 @@ def main():
     transformer.eval()
     lyco_state = lyco_net.state_dict()
 
-    # Free big stuff before saving
     del vae, text_encoder_one, text_encoder_two, text_encoder_three
     free_memory()
     if torch.cuda.is_available():
