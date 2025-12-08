@@ -1,0 +1,20 @@
+{
+  "model_name": "sd35_renderexpo_pro_v1",
+  "description": "Original RENDEREXPO SD3.5 LoRA PRO v1. This is the expert baseline model and must never be modified or overwritten.",
+  "archive_date": "2025-12-08",
+  "archive_path_backend": "outputs/lora_archive/sd35_renderexpo_pro_v1_20251208/sd35_renderexpo_pro_v1",
+  "original_path_backend": "outputs/lora/sd35_renderexpo_pro_v1",
+  "files": [
+    {
+      "filename": "pytorch_lora_weights.safetensors",
+      "original_path": "outputs/lora/sd35_renderexpo_pro_v1/pytorch_lora_weights.safetensors",
+      "archive_path": "outputs/lora_archive/sd35_renderexpo_pro_v1_20251208/sd35_renderexpo_pro_v1/pytorch_lora_weights.safetensors",
+      "sha256": "0060b70cbb153385ca7509e76957917ab020223b3308ef8842b1444211b4c6ec"
+    }
+  ],
+  "notes": [
+    "Trained on 225 RENDEREXPO Corona-level images with per-image captions.",
+    "This manifest records the exact SHA256 hash of the PRO v1 LoRA weights.",
+    "Use this file to verify integrity any time or to restore from archive."
+  ]
+}
