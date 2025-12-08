@@ -7,8 +7,8 @@
 # - Resolution: 896x896
 # - Rank: 8, Alpha: 8
 # - LR schedule: 1e-4 -> 5e-5 -> 2e-5
-# - Uses fp16 on GPU to reduce VRAM, text encoders stay fp32 on CPU
-# - Enables gradient checkpointing on the transformer for further memory savings
+# - Uses fp16 on GPU + grad checkpointing to fit in VRAM
+# - Uses *gentler* noise (smaller magnitude) and tighter clamping to avoid NaNs in fp16
 
 import argparse
 import os
@@ -551,7 +551,8 @@ def main():
 
     transformer.train()
 
-    noise_scale = 0.2
+    # Gentler noise to avoid fp16 overflow
+    noise_scale = 0.05
     last_loss_value = None
 
     while global_step < total_steps:
@@ -584,10 +585,13 @@ def main():
             if hasattr(vae.config, "scaling_factor"):
                 latents = latents * vae.config.scaling_factor
 
-            latents = torch.clamp(latents, -10.0, 10.0).to(dtype=weight_dtype)
+            # Tighter clamping in fp16 to avoid huge activations
+            latents = torch.clamp(latents, -3.0, 3.0).to(dtype=weight_dtype)
 
-            noise = torch.randn_like(latents)
-            noise = torch.clamp(noise, -10.0, 10.0)
+            # Noise in float32, then cast down
+            noise_f32 = torch.randn_like(latents, dtype=torch.float32)
+            noise_f32 = torch.clamp(noise_f32, -3.0, 3.0)
+            noise = noise_f32.to(dtype=weight_dtype, device=device)
 
             timesteps = torch.zeros(
                 latents.shape[0],
@@ -596,7 +600,7 @@ def main():
             )
 
             noisy_latents = latents + noise_scale * noise
-            noisy_latents = torch.clamp(noisy_latents, -10.0, 10.0)
+            noisy_latents = torch.clamp(noisy_latents, -3.0, 3.0)
 
             # LR from three-phase scheduler
             lr = three_phase_lr(
@@ -626,7 +630,7 @@ def main():
                 continue
 
             # Compute loss in float32 for stability
-            loss = F.mse_loss(model_pred.float(), noise.float())
+            loss = F.mse_loss(model_pred.float(), noise_f32)
 
             if not torch.isfinite(loss):
                 print(
