@@ -1,23 +1,20 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LoRA trainer PRO v2 (caption-aware, fp32, 896px, rank 8)
+# RENDEREXPO SD3.5-Large LyCORIS trainer (PRO v2, caption-aware, fp32, 896px, rank 8)
 #
-# - Trains LoRA on Stable Diffusion 3.5 Large (diffusers format)
-# - Uses a local image folder (instance_data_dir)
-# - For each image `name.ext` it looks for `name.txt` as the caption
-# - If caption exists and is non-empty -> uses that text
-# - If missing/empty -> falls back to --instance_prompt
-# - No special "renderexpo token" is required; prompts are normal language
-# - Text encoders stay on CPU to avoid CUDA OOM
-# - VAE + Transformer run in float32 for stability
-# - Simple but safer noise objective (no FlowMatch tricks)
-# - Optional caption dropout so the model learns both "style" and "plain" descriptions
-# - PRO v2 defaults:
-#       resolution = 896
-#       rank = 8
-#       alpha = 8
-#       max_train_steps = 6000
-#       learning_rate ~ 1e-4 -> 5e-5 -> 2e-5
-#       periodic checkpoint saving
+# - Base model: Stable Diffusion 3.5 Large (diffusers format)
+# - True LyCORIS adapters (LoCon / LoHa) using the `lycoris-lora` library
+# - 225 fully captioned Corona-quality RENDEREXPO images
+# - Resolution: 896x896 (square, random-crop, random-flip)
+# - Rank: 8, Alpha: 8  (per your spec)
+# - LR schedule: 1e-4  →  5e-5  →  2e-5 over 6000 steps
+# - Caption-aware:
+#       * Uses per-image .txt caption if present
+#       * If missing/empty, falls back to --instance_prompt
+#       * Optional caption_dropout mixes in the global style prompt
+#
+# NOTE:
+#   This script ONLY handles the training logic.
+#   tmux + nohup will be handled in the shell when we actually start training.
 
 import argparse
 import os
@@ -36,18 +33,18 @@ from tqdm.auto import tqdm
 
 from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
 
-from diffusers import (
-    AutoencoderKL,
-    SD3Transformer2DModel,
-)
+from diffusers import AutoencoderKL, SD3Transformer2DModel
 from diffusers.training_utils import free_memory
-from peft import LoraConfig, get_peft_model_state_dict
+
 import safetensors.torch as sft
 
+# 🔸 True LyCORIS (LoCon / LoHa)
+from lycoris import create_lycoris, LycorisNetwork
 
-# ------------------------------
-# Dataset: image + caption pairs
-# ------------------------------
+
+# --------------------------------------------------
+# Dataset: image + caption pairs (225 Corona renders)
+# --------------------------------------------------
 
 
 class RenderExpoCaptionDataset(Dataset):
@@ -59,14 +56,14 @@ class RenderExpoCaptionDataset(Dataset):
     - If found and non-empty: uses that text as the prompt
     - Otherwise: falls back to the global --instance_prompt
     - Optional caption_dropout: with probability p, we ignore the caption and use
-      the global instance_prompt instead (helps the LoRA generalize).
+      the global instance_prompt instead (helps the LoRA/LyCORIS generalize).
     """
 
     def __init__(
         self,
         instance_data_root: str,
         default_prompt: str,
-        resolution: int = 512,
+        resolution: int = 896,
         center_crop: bool = False,
         caption_dropout: float = 0.15,
     ):
@@ -88,7 +85,7 @@ class RenderExpoCaptionDataset(Dataset):
         if len(self.image_paths) == 0:
             raise ValueError(f"No valid images found in: {instance_data_root}")
 
-        # Basic transforms
+        # Basic transforms (896px)
         self.resize = transforms.Resize(
             resolution, interpolation=transforms.InterpolationMode.BILINEAR
         )
@@ -152,9 +149,9 @@ class RenderExpoCaptionDataset(Dataset):
         }
 
 
-# ------------------------------
+# --------------------------------------------------
 # Text encoding helpers for SD3
-# ------------------------------
+# --------------------------------------------------
 
 
 def import_text_encoder_class(model_path: str, subfolder: str):
@@ -258,27 +255,40 @@ def encode_prompt_sd3(
     return prompt_embeds, pooled_prompt_embeds
 
 
-# ------------------------------
-# Utility: save LoRA weights
-# ------------------------------
+# --------------------------------------------------
+# LR schedule: 1e-4 → 5e-5 → 2e-5 across training
+# --------------------------------------------------
 
 
-def save_lora_safetensors(transformer, output_dir: str, filename: str):
-    os.makedirs(output_dir, exist_ok=True)
-    state = get_peft_model_state_dict(transformer)
-    path = os.path.join(output_dir, filename)
-    sft.save_file(state, path)
-    print(f"✅ Saved LoRA checkpoint to: {path}")
+def three_phase_lr(step: int, total_steps: int, lr_start: float, lr_mid: float, lr_final: float) -> float:
+    """
+    Simple 3-phase schedule:
+
+    - First 40% of steps: lr_start
+    - Next 30% of steps:  lr_mid
+    - Last 30% of steps:  lr_final
+    """
+    if total_steps <= 0:
+        return lr_final
+
+    ratio = step / float(total_steps)
+
+    if ratio < 0.4:
+        return lr_start
+    elif ratio < 0.7:
+        return lr_mid
+    else:
+        return lr_final
 
 
-# ------------------------------
-# Training loop
-# ------------------------------
+# --------------------------------------------------
+# Argument parsing
+# --------------------------------------------------
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        "RENDEREXPO SD3.5 LoRA trainer PRO v2 (caption-aware, fp32, 896px, rank 8)"
+        "RENDEREXPO SD3.5 LoRA/LyCORIS trainer PRO v2 (caption-aware, fp32, 896px, rank 8)"
     )
 
     p.add_argument(
@@ -303,7 +313,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default="outputs/lora/sd35_renderexpo_pro_v2",
-        help="Where to save LoRA weights",
+        help="Where to save LyCORIS weights",
     )
     p.add_argument(
         "--resolution",
@@ -345,13 +355,20 @@ def parse_args():
         "--rank",
         type=int,
         default=8,
-        help="LoRA rank (PRO v2 default = 8).",
+        help="LyCORIS rank (PRO v2 default = 8).",
     )
     p.add_argument(
         "--alpha",
         type=int,
         default=8,
-        help="LoRA alpha (PRO v2 default = 8).",
+        help="LyCORIS alpha (PRO v2 default = 8).",
+    )
+    p.add_argument(
+        "--lycoris_algo",
+        type=str,
+        default="locon",
+        choices=["locon", "loha"],
+        help='LyCORIS algorithm to use: "locon" or "loha".',
     )
     p.add_argument(
         "--caption_dropout",
@@ -374,45 +391,9 @@ def parse_args():
     return p.parse_args()
 
 
-def get_lr(step: int, total_steps: int, base_lr: float, mid_lr: float, final_lr: float,
-           warmup_ratio: float = 0.05, mid_ratio: float = 0.6) -> float:
-    """
-    Piecewise LR schedule for PRO v2:
-
-    - Warmup:    0 -> base_lr over warmup_ratio of total steps (e.g. 5%)
-    - Plateau:   keep ~base_lr until mid_ratio of total steps (e.g. 60%)
-    - Decay 1:   base_lr -> mid_lr (e.g. 1e-4 -> 5e-5)
-    - Decay 2:   mid_lr -> final_lr (e.g. 5e-5 -> 2e-5)
-    """
-    if total_steps <= 0:
-        return base_lr
-    if step <= 0:
-        return 0.0
-
-    warmup_steps = max(1, int(total_steps * warmup_ratio))
-    mid_step = max(warmup_steps + 1, int(total_steps * mid_ratio))
-
-    # Warmup 0 -> base_lr
-    if step < warmup_steps:
-        return base_lr * float(step) / float(warmup_steps)
-
-    # Plateau at base_lr
-    if step < mid_step:
-        return base_lr
-
-    # Tail decay from mid_step -> total_steps
-    tail_steps = max(1, total_steps - mid_step)
-    t = float(step - mid_step) / float(tail_steps)
-    t = max(0.0, min(1.0, t))
-
-    # First half of tail: base_lr -> mid_lr
-    if t < 0.5:
-        t2 = t / 0.5  # 0 -> 1
-        return base_lr + (mid_lr - base_lr) * t2
-
-    # Second half of tail: mid_lr -> final_lr
-    t2 = (t - 0.5) / 0.5  # 0 -> 1
-    return mid_lr + (final_lr - mid_lr) * t2
+# --------------------------------------------------
+# Main training logic
+# --------------------------------------------------
 
 
 def main():
@@ -427,21 +408,37 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cpu_device = torch.device("cpu")
 
-    # Everything in VAE + transformer uses float32
+    # Everything in VAE + transformer uses float32 for stability
     weight_dtype = torch.float32
 
-    # Make sure we start as clean as possible
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # ---------------------------------
-    # Load components individually
+    # CONFIG SUMMARY
+    # ---------------------------------
+    print("==========================================")
+    print("RENDEREXPO PRO v2 – SD3.5 LyCORIS Trainer")
+    print("==========================================")
+    print(f"Base model path:        {args.pretrained_model_name_or_path}")
+    print(f"Instance data dir:      {args.instance_data_dir}")
+    print(f"Output dir:             {args.output_dir}")
+    print(f"Resolution:             {args.resolution}")
+    print(f"Batch size:             {args.train_batch_size}")
+    print(f"Max steps:              {args.max_train_steps}")
+    print(f"LR schedule:            {args.learning_rate} → {args.lr_mid} → {args.lr_final}")
+    print(f"LyCORIS algo:           {args.lycoris_algo}")
+    print(f"LyCORIS rank (dim):     {args.rank}")
+    print(f"LyCORIS alpha:          {args.alpha}")
+    print(f"Caption dropout:        {args.caption_dropout}")
+    print(f"Seed:                   {args.seed}")
+    print("==========================================")
+
+    # ---------------------------------
+    # Load SD3.5 components
     # ---------------------------------
     print("Loading SD3.5-Large components...")
     print(f"Using default instance prompt: {args.instance_prompt}")
-    print(f"PRO v2 settings: resolution={args.resolution}, rank={args.rank}, alpha={args.alpha}")
-    print(f"LR schedule: base={args.learning_rate}, mid={args.lr_mid}, final={args.lr_final}")
-    print(f"Max steps: {args.max_train_steps}, save_steps={args.save_steps}")
 
     # VAE on GPU
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
@@ -471,7 +468,7 @@ def main():
         subfolder="tokenizer_3",
     )
 
-    # Text encoders (CPU ONLY to avoid OOM)
+    # Text encoders (CPU ONLY)
     te1_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder")
     te2_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_2")
     te3_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_3")
@@ -492,43 +489,44 @@ def main():
     text_encoder_two.requires_grad_(False)
     text_encoder_three.requires_grad_(False)
 
-    # ---------------------------
-    # Add LoRA adapters to transformer
-    # ---------------------------
-    target_modules = [
-        "attn.add_k_proj",
-        "attn.add_q_proj",
-        "attn.add_v_proj",
-        "attn.to_add_out",
-        "attn.to_k",
-        "attn.to_out.0",
-        "attn.to_q",
-        "attn.to_v",
-    ]
+    # ---------------------------------
+    # Add TRUE LyCORIS adapter (LoCon / LoHa)
+    # ---------------------------------
+    print("Attaching LyCORIS adapter to SD3.5 transformer...")
 
-    lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.alpha,
-        lora_dropout=0.0,
-        init_lora_weights="gaussian",
-        target_modules=target_modules,
+    # Target preset: here we follow the standard example and adapt attention modules.
+    # LyCon itself is implemented inside LyCORIS; we just pick algo="locon" or "loha".
+    LycorisNetwork.apply_preset(
+        {
+            "target_name": [".*attn.*"],  # focus on attention modules; LyCon extends into convs internally
+        }
     )
-    transformer.add_adapter(lora_config)
 
-    # Collect trainable LoRA params
-    lora_params = [p for p in transformer.parameters() if p.requires_grad]
+    lyco_net = create_lycoris(
+        transformer,
+        1.0,  # multiplier (weight at inference time, we keep 1.0 here)
+        linear_dim=args.rank,
+        linear_alpha=float(args.alpha),
+        algo=args.lycoris_algo,
+    )
+    lyco_net.apply_to()
+
+    # Collect trainable parameters from LyCORIS wrapper
+    trainable_params = list(lyco_net.parameters())
+    if len(trainable_params) == 0:
+        raise RuntimeError("No trainable LyCORIS parameters found – something went wrong with create_lycoris().")
 
     optimizer = torch.optim.AdamW(
-        lora_params,
+        trainable_params,
         lr=args.learning_rate,
         betas=(0.9, 0.999),
         weight_decay=1e-4,
         eps=1e-8,
     )
 
-    # ---------------------------
+    # ---------------------------------
     # Dataset
-    # ---------------------------
+    # ---------------------------------
     train_dataset = RenderExpoCaptionDataset(
         instance_data_root=args.instance_data_dir,
         default_prompt=args.instance_prompt,
@@ -545,18 +543,21 @@ def main():
     )
 
     # ---------------------------------
-    # Training loop (simple noise, fp32)
+    # Training loop
     # ---------------------------------
     total_steps = args.max_train_steps
     global_step = 0
 
-    print(f"Starting PRO v2 training for {total_steps} steps (caption-aware, fp32)...")
-    progress_bar = tqdm(range(total_steps), desc="PRO v2 training steps")
+    print(f"Starting PRO v2 training for {total_steps} steps (LyCORIS {args.lycoris_algo}, 896px)...")
+    progress_bar = tqdm(range(total_steps), desc="Training steps")
 
     transformer.train()
 
-    # noise_scale controls how hard the task is; small is more stable
+    # noise_scale controls how hard the denoising task is; small is more stable
     noise_scale = 0.2
+
+    # Optional: record last loss for quick sanity check
+    last_loss_value = None
 
     while global_step < total_steps:
         for batch in train_dataloader:
@@ -566,7 +567,7 @@ def main():
             pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
             prompts = batch["prompt"]  # list of strings
 
-            # Encode per-batch prompts with text encoders on CPU
+            # Encode prompts using CPU text encoders, then move embeds to GPU
             with torch.no_grad():
                 prompt_embeds, pooled_prompt_embeds = encode_prompt_sd3(
                     prompts,
@@ -580,22 +581,21 @@ def main():
                     device=device,
                 )
 
-            # Encode images to latents in float32 for stability
+            # Encode images to latents with VAE (fp32)
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
 
-            # Standard latent scaling for SD
+            # Scaling for SD
             if hasattr(vae.config, "scaling_factor"):
                 latents = latents * vae.config.scaling_factor
 
-            # Clamp latents to avoid huge values
             latents = torch.clamp(latents, -10.0, 10.0)
 
             # Sample noise
             noise = torch.randn_like(latents)
             noise = torch.clamp(noise, -10.0, 10.0)
 
-            # Fixed timestep (0) and simple noise mixing
+            # Simple fixed timestep (0) noise setup
             timesteps = torch.zeros(
                 latents.shape[0],
                 device=device,
@@ -605,13 +605,13 @@ def main():
             noisy_latents = latents + noise_scale * noise
             noisy_latents = torch.clamp(noisy_latents, -10.0, 10.0)
 
-            # Set LR from PRO v2 scheduler
-            lr = get_lr(
-                step=global_step,
-                total_steps=total_steps,
-                base_lr=args.learning_rate,
-                mid_lr=args.lr_mid,
-                final_lr=args.lr_final,
+            # Set LR from three-phase scheduler
+            lr = three_phase_lr(
+                global_step,
+                total_steps,
+                lr_start=args.learning_rate,
+                lr_mid=args.lr_mid,
+                lr_final=args.lr_final,
             )
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
@@ -633,7 +633,7 @@ def main():
                 progress_bar.update(1)
                 continue
 
-            # Compute loss in float32 for stability
+            # MSE loss in float32
             loss = F.mse_loss(model_pred, noise)
 
             if not torch.isfinite(loss):
@@ -645,37 +645,52 @@ def main():
                 continue
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
+            last_loss_value = float(loss.item())
             global_step += 1
-            progress_bar.set_postfix({"loss": float(loss.item()), "lr": lr})
+            progress_bar.set_postfix({"loss": last_loss_value, "lr": lr})
             progress_bar.update(1)
 
             # Periodic checkpoint saving
-            if args.save_steps > 0 and global_step % args.save_steps == 0:
-                ckpt_name = f"pytorch_lora_weights_step_{global_step}.safetensors"
-                save_lora_safetensors(transformer, args.output_dir, ckpt_name)
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                ckpt_path = os.path.join(
+                    args.output_dir,
+                    f"pytorch_lora_lycoris_step_{global_step:06d}.safetensors",
+                )
+                print(f"Saving intermediate LyCORIS weights at step {global_step} -> {ckpt_path}")
+                lyco_state = lyco_net.state_dict()
+                sft.save_file(lyco_state, ckpt_path)
 
             if global_step >= total_steps:
                 break
 
     progress_bar.close()
-    print("PRO v2 training finished, saving final LoRA weights...")
+    print("Training finished, saving FINAL LyCORIS weights...")
 
     # ---------------------------------
-    # Save final LoRA weights
+    # Save final LyCORIS weights
     # ---------------------------------
     transformer.eval()
-    save_lora_safetensors(transformer, args.output_dir, "pytorch_lora_weights_final.safetensors")
+    lyco_state = lyco_net.state_dict()
 
-    # Free memory after saving
+    # Free big stuff before saving
     del vae, text_encoder_one, text_encoder_two, text_encoder_three
     free_memory()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"✅ PRO v2 LoRA training complete. Final weights saved in: {args.output_dir}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    final_path = os.path.join(args.output_dir, "pytorch_lora_lycoris_pro_v2_final.safetensors")
+    sft.save_file(lyco_state, final_path)
+
+    print("==========================================")
+    print("✅ RENDEREXPO PRO v2 LyCORIS training DONE")
+    print(f"Final LyCORIS file: {final_path}")
+    if last_loss_value is not None:
+        print(f"Final loss (last step): {last_loss_value:.6f}")
+    print("==========================================")
 
 
 if __name__ == "__main__":
