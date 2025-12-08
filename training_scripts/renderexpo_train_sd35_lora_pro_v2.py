@@ -8,7 +8,7 @@
 # - If missing/empty -> falls back to --instance_prompt
 # - No special "renderexpo token" is required; prompts are normal language
 # - Text encoders always stay on CPU to avoid CUDA OOM
-# - VAE + Transformer run in fp16 on GPU (standard SD training)
+# - VAE runs in float32 for stability, transformer runs in fp16 on GPU
 # - Simple but stable noise objective (no FlowMatch tricks)
 # - Caption dropout lets the model learn both "style" and "plain" descriptions
 
@@ -32,7 +32,7 @@ from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
 from diffusers import AutoencoderKL, SD3Transformer2DModel
 from diffusers.training_utils import free_memory
 
-# ✅ LyCORIS import (this matches your venv: `import lycoris`)
+# ✅ LyCORIS import (matches your venv: `import lycoris`)
 from lycoris import create_lycoris, LycorisNetwork
 
 import safetensors.torch as sft
@@ -403,7 +403,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cpu_device = torch.device("cpu")
 
-    # Standard SD practice: fp16 on GPU
+    # Standard SD practice: fp16 on GPU for transformer
     weight_dtype = torch.float16
 
     if torch.cuda.is_available():
@@ -435,11 +435,11 @@ def main():
     print("Loading SD3.5-Large components...")
     print(f"Using default instance prompt: {args.instance_prompt}")
 
-    # VAE on GPU (fp16)
+    # ✅ VAE on GPU (float32 for stability, matches pixel_values.to(float32))
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
-        torch_dtype=weight_dtype,
+        torch_dtype=torch.float32,
     ).to(device)
 
     # Transformer on GPU (fp16)
@@ -559,7 +559,7 @@ def main():
             if global_step >= total_steps:
                 break
 
-            pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
+            pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
             prompts = batch["prompt"]  # list of strings
 
             # Encode per-batch prompts with text encoders on CPU
@@ -577,9 +577,9 @@ def main():
                     dtype=weight_dtype,
                 )
 
-            # Encode images to latents in float32, then cast to fp16
+            # Encode images to latents in float32, then cast to fp16 for transformer
             with torch.no_grad():
-                latents = vae.encode(pixel_values.to(dtype=torch.float32)).latent_dist.sample()
+                latents = vae.encode(pixel_values).latent_dist.sample()
 
             if hasattr(vae.config, "scaling_factor"):
                 latents = latents * vae.config.scaling_factor
