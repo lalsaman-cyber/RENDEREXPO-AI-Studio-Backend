@@ -57,74 +57,7 @@ def _ensure_job_folder(base_outputs_dir: str = "outputs") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Pydantic model
-# ---------------------------------------------------------------------------
-
-ControlMode = Literal["precise", "balanced", "creative"]
-
-
-class SD35Text2ImgRequest(BaseModel):
-    """
-    Schema for SD3.5 text-to-image.
-    """
-    prompt: str = Field(..., description="Main text prompt for SD3.5.")
-    negative_prompt: Optional[str] = Field(
-        default=None,
-        description="Optional negative prompt to avoid bad artifacts.",
-    )
-
-    width: int = Field(default=1024, ge=64, le=2048)
-    height: int = Field(default=1024, ge=64, le=2048)
-
-    num_inference_steps: int = Field(default=25, ge=1, le=100)
-    guidance_scale: float = Field(default=6.0, ge=0.0, le=20.0)
-
-    style_preset: Optional[str] = Field(default=None)
-    material_preset: Optional[str] = Field(default=None)
-    lighting_preset: Optional[str] = Field(default=None)
-
-    seed: Optional[int] = Field(default=None)
-
-    lora_profile: Optional[str] = Field(
-        default=None,
-        description="Name of LoRA profile defined in config/lora_profiles.json.",
-    )
-    refiner_profile: Optional[str] = Field(
-        default=None,
-        description="Name of refiner profile defined in config/refiner_profiles.json.",
-    )
-
-    # -----------------------------------------------------------------------
-    # NEW: Precision modes + detail pass switches (stored in meta for GPU side)
-    # -----------------------------------------------------------------------
-
-    control_mode: ControlMode = Field(
-        default="balanced",
-        description="Controls how strictly we preserve structure: precise | balanced | creative.",
-    )
-
-    detail_pass: bool = Field(
-        default=False,
-        description="If true, run a second enhancement pass after base generation (GPU real mode only).",
-    )
-
-    detail_strength: float = Field(
-        default=0.25,
-        ge=0.0,
-        le=1.0,
-        description="How aggressive the detail pass is (0 = off, higher = more change).",
-    )
-
-    upscale_factor: int = Field(
-        default=2,
-        ge=1,
-        le=4,
-        description="Upscale multiplier for the detail pass (e.g. 2 = 2x).",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers for validation
+# Validation helpers
 # ---------------------------------------------------------------------------
 
 def _validate_lora_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -149,6 +82,90 @@ def _validate_refiner_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
     return REFINER_PROFILES[name]
 
 
+def _build_detail_pass(
+    mode: Literal["off", "standard", "strong"],
+    custom: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Produces meta["detail_pass"] that your GPU runtime understands.
+
+    - off      -> disabled
+    - standard -> safe clarity boost
+    - strong   -> stronger clarity boost (still controlled)
+
+    If custom dict is provided, it overrides presets.
+    Expected keys (your runtime supports):
+      enabled: bool
+      amount: float
+      radius: float
+      threshold: int
+    """
+    presets = {
+        "off": {"enabled": False},
+        "standard": {"enabled": True, "amount": 1.0, "radius": 1.15, "threshold": 3},
+        "strong": {"enabled": True, "amount": 1.6, "radius": 1.25, "threshold": 2},
+    }
+    dp = presets.get(mode, presets["standard"]).copy()
+    if custom and isinstance(custom, dict):
+        dp.update(custom)
+        # If they pass any params but forget enabled, assume enabled
+        if "enabled" not in dp:
+            dp["enabled"] = True
+    return dp
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request model
+# ---------------------------------------------------------------------------
+
+class SD35Text2ImgRequest(BaseModel):
+    prompt: str = Field(..., description="Main text prompt for SD3.5.")
+    negative_prompt: Optional[str] = Field(
+        default=None,
+        description="Optional negative prompt to avoid bad artifacts.",
+    )
+
+    width: int = Field(default=1024, ge=64, le=2048)
+    height: int = Field(default=1024, ge=64, le=2048)
+
+    num_inference_steps: int = Field(default=25, ge=1, le=100)
+    guidance_scale: float = Field(default=6.0, ge=0.0, le=20.0)
+
+    style_preset: Optional[str] = None
+    material_preset: Optional[str] = None
+    lighting_preset: Optional[str] = None
+
+    seed: Optional[int] = Field(default=None)
+
+    # Existing profiles
+    lora_profile: Optional[str] = Field(
+        default=None,
+        description="Name of LoRA profile defined in config/lora_profiles.json.",
+    )
+    refiner_profile: Optional[str] = Field(
+        default=None,
+        description="Name of refiner profile defined in config/refiner_profiles.json.",
+    )
+
+    # NEW: precision modes (stored into meta, GPU will interpret)
+    render_mode: Literal["precise", "balanced", "creative"] = Field(
+        default="balanced",
+        description="Controls how strictly architecture is preserved vs creative variation.",
+    )
+
+    # NEW: detail pass control (groundwork for sharper materials/details)
+    detail_mode: Literal["off", "standard", "strong"] = Field(
+        default="standard",
+        description="Post-process clarity boost (implemented on GPU runtime).",
+    )
+
+    # Optional manual override for detail pass params
+    detail_pass: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional override dict for detail pass: {enabled, amount, radius, threshold}.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -156,15 +173,14 @@ def _validate_refiner_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
 @router.post("/render")
 async def sd35_render(request: SD35Text2ImgRequest):
     """
-    SD3.5 Text2Img endpoint for RENDEREXPO AI STUDIO.
+    SD3.5 Text2Img planner endpoint.
 
-    Flow:
-    - Validate LoRA + refiner profiles (if any).
-    - Create job folder under outputs/{date}/{job_id}/.
-    - Write meta.json with planned settings.
-    - Dispatch the job to GPU worker (port 8011) via /api/gpu/dispatch.
+    - Validates LoRA + refiner profiles (if any).
+    - Creates job folder outputs/{date}/{job_id}/
+    - Writes meta.json
+    - Dispatches to GPU worker (port 8011) via /api/gpu/dispatch
     """
-    # 1) Validate LoRA + refiner if provided
+    # 1) Validate profiles
     lora_cfg = _validate_lora_profile(request.lora_profile)
     refiner_cfg = _validate_refiner_profile(request.refiner_profile)
 
@@ -174,7 +190,7 @@ async def sd35_render(request: SD35Text2ImgRequest):
     meta_path = os.path.join(job_folder, "meta.json")
     planned_output_image = os.path.join(job_folder, "output.png")
 
-    # 3) Build meta data
+    # 3) Build meta
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
@@ -197,25 +213,26 @@ async def sd35_render(request: SD35Text2ImgRequest):
 
         "planned_output_image": "output.png",
         "status": "planned",
-        "mode": "skeleton-or-real",  # actual mode decided on GPU
 
+        # NEW: modes
+        "render_mode": request.render_mode,
+        "detail_pass": _build_detail_pass(request.detail_mode, request.detail_pass),
+
+        # Profiles
         "lora_profile": request.lora_profile,
         "lora_config": lora_cfg,
         "refiner_profile": request.refiner_profile,
         "refiner_config": refiner_cfg,
 
-        # NEW: precision modes + detail pass (GPU uses these)
-        "control_mode": request.control_mode,          # precise | balanced | creative
-        "detail_pass": request.detail_pass,            # bool
-        "detail_strength": request.detail_strength,    # 0..1
-        "upscale_factor": request.upscale_factor,      # 1..4
+        # Runtime decides skeleton vs real
+        "mode": "skeleton-or-real",
     }
 
     # 4) Write meta.json
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    # 5) Dispatch to GPU worker (port 8011)
+    # 5) Dispatch to GPU worker
     ok, gpu_resp = dispatch_sd35_text2img(job_folder=job_folder, meta=meta)
 
     if not ok:
@@ -239,7 +256,7 @@ async def sd35_render(request: SD35Text2ImgRequest):
 
 
 # ---------------------------------------------------------------------------
-# DEBUG endpoints
+# Debug endpoints
 # ---------------------------------------------------------------------------
 
 @router.get("/config/lora-profiles")
