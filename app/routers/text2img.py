@@ -4,7 +4,7 @@ import os
 import uuid
 import json
 import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -31,16 +31,12 @@ def _load_json_file(path: str) -> Dict[str, Any]:
     If the file does not exist or is invalid, return an empty dict.
     """
     if not os.path.isfile(path):
-        # treat it as "no profiles defined yet"
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return data
-        return {}
+        return data if isinstance(data, dict) else {}
     except Exception:
-        # If there's a JSON error, also treat as empty.
         return {}
 
 
@@ -64,6 +60,9 @@ def _ensure_job_folder(base_outputs_dir: str = "outputs") -> str:
 # Pydantic model
 # ---------------------------------------------------------------------------
 
+ControlMode = Literal["precise", "balanced", "creative"]
+
+
 class SD35Text2ImgRequest(BaseModel):
     """
     Schema for SD3.5 text-to-image.
@@ -73,46 +72,19 @@ class SD35Text2ImgRequest(BaseModel):
         default=None,
         description="Optional negative prompt to avoid bad artifacts.",
     )
-    width: int = Field(
-        default=1024,
-        ge=64,
-        le=2048,
-        description="Target width of the output image (pixels).",
-    )
-    height: int = Field(
-        default=1024,
-        ge=64,
-        le=2048,
-        description="Target height of the output image (pixels).",
-    )
-    num_inference_steps: int = Field(
-        default=25,
-        ge=1,
-        le=100,
-        description="Number of diffusion steps.",
-    )
-    guidance_scale: float = Field(
-        default=6.0,
-        ge=0.0,
-        le=20.0,
-        description="CFG guidance scale.",
-    )
-    style_preset: Optional[str] = Field(
-        default=None,
-        description="Style preset ID (e.g. 'soft_luxury').",
-    )
-    material_preset: Optional[str] = Field(
-        default=None,
-        description="Material preset ID (e.g. 'warm_oak_veneer').",
-    )
-    lighting_preset: Optional[str] = Field(
-        default=None,
-        description="Lighting preset ID (e.g. 'daylight_soft').",
-    )
-    seed: Optional[int] = Field(
-        default=None,
-        description="Random seed. If null, will be random in real GPU runtime.",
-    )
+
+    width: int = Field(default=1024, ge=64, le=2048)
+    height: int = Field(default=1024, ge=64, le=2048)
+
+    num_inference_steps: int = Field(default=25, ge=1, le=100)
+    guidance_scale: float = Field(default=6.0, ge=0.0, le=20.0)
+
+    style_preset: Optional[str] = Field(default=None)
+    material_preset: Optional[str] = Field(default=None)
+    lighting_preset: Optional[str] = Field(default=None)
+
+    seed: Optional[int] = Field(default=None)
+
     lora_profile: Optional[str] = Field(
         default=None,
         description="Name of LoRA profile defined in config/lora_profiles.json.",
@@ -122,16 +94,40 @@ class SD35Text2ImgRequest(BaseModel):
         description="Name of refiner profile defined in config/refiner_profiles.json.",
     )
 
+    # -----------------------------------------------------------------------
+    # NEW: Precision modes + detail pass switches (stored in meta for GPU side)
+    # -----------------------------------------------------------------------
+
+    control_mode: ControlMode = Field(
+        default="balanced",
+        description="Controls how strictly we preserve structure: precise | balanced | creative.",
+    )
+
+    detail_pass: bool = Field(
+        default=False,
+        description="If true, run a second enhancement pass after base generation (GPU real mode only).",
+    )
+
+    detail_strength: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="How aggressive the detail pass is (0 = off, higher = more change).",
+    )
+
+    upscale_factor: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="Upscale multiplier for the detail pass (e.g. 2 = 2x).",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers for validation
 # ---------------------------------------------------------------------------
 
 def _validate_lora_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
-    """
-    Ensure lora_profile (if provided) exists in LORA_PROFILES.
-    Returns the profile dict or None.
-    """
     if not name:
         return None
     if name not in LORA_PROFILES:
@@ -143,10 +139,6 @@ def _validate_lora_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def _validate_refiner_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
-    """
-    Ensure refiner_profile (if provided) exists in REFINER_PROFILES.
-    Returns the profile dict or None.
-    """
     if not name:
         return None
     if name not in REFINER_PROFILES:
@@ -171,9 +163,6 @@ async def sd35_render(request: SD35Text2ImgRequest):
     - Create job folder under outputs/{date}/{job_id}/.
     - Write meta.json with planned settings.
     - Dispatch the job to GPU worker (port 8011) via /api/gpu/dispatch.
-    - Return:
-        * status="dispatched" and GPU response, or
-        * status="gpu_error" with error details.
     """
     # 1) Validate LoRA + refiner if provided
     lora_cfg = _validate_lora_profile(request.lora_profile)
@@ -191,23 +180,35 @@ async def sd35_render(request: SD35Text2ImgRequest):
         "created_at": datetime.datetime.utcnow().isoformat(),
         "type": "text2img",
         "model_name": "sd3.5-large",
+
         "prompt": request.prompt,
         "negative_prompt": request.negative_prompt,
+
         "width": request.width,
         "height": request.height,
         "num_inference_steps": request.num_inference_steps,
         "guidance_scale": request.guidance_scale,
+
         "style_preset": request.style_preset,
         "material_preset": request.material_preset,
         "lighting_preset": request.lighting_preset,
+
         "seed": request.seed,
+
         "planned_output_image": "output.png",
         "status": "planned",
         "mode": "skeleton-or-real",  # actual mode decided on GPU
+
         "lora_profile": request.lora_profile,
         "lora_config": lora_cfg,
         "refiner_profile": request.refiner_profile,
         "refiner_config": refiner_cfg,
+
+        # NEW: precision modes + detail pass (GPU uses these)
+        "control_mode": request.control_mode,          # precise | balanced | creative
+        "detail_pass": request.detail_pass,            # bool
+        "detail_strength": request.detail_strength,    # 0..1
+        "upscale_factor": request.upscale_factor,      # 1..4
     }
 
     # 4) Write meta.json
@@ -218,7 +219,6 @@ async def sd35_render(request: SD35Text2ImgRequest):
     ok, gpu_resp = dispatch_sd35_text2img(job_folder=job_folder, meta=meta)
 
     if not ok:
-        # GPU worker failed or is unreachable; job remains "planned"
         return {
             "status": "gpu_error",
             "message": "Job planned but GPU worker failed.",
@@ -228,7 +228,6 @@ async def sd35_render(request: SD35Text2ImgRequest):
             "gpu_error": gpu_resp,
         }
 
-    # If GPU accepted the job, it may update meta.json and create output.png
     return {
         "status": "dispatched",
         "message": "Text2Img job dispatched to GPU worker.",
@@ -240,14 +239,11 @@ async def sd35_render(request: SD35Text2ImgRequest):
 
 
 # ---------------------------------------------------------------------------
-# DEBUG endpoints (optional but helpful)
+# DEBUG endpoints
 # ---------------------------------------------------------------------------
 
 @router.get("/config/lora-profiles")
 async def list_lora_profiles():
-    """
-    Small helper to see which LoRA profile keys are currently loaded.
-    """
     return {
         "status": "ok",
         "source": LORA_PROFILES_PATH,
@@ -257,9 +253,6 @@ async def list_lora_profiles():
 
 @router.get("/config/refiner-profiles")
 async def list_refiner_profiles():
-    """
-    Small helper to see which refiner profile keys are currently loaded.
-    """
     return {
         "status": "ok",
         "source": REFINER_PROFILES_PATH,
