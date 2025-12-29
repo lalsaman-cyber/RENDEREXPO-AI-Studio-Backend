@@ -1,0 +1,67 @@
+import os, time
+import torch
+import safetensors.torch as sft
+from diffusers import StableDiffusion3Pipeline
+from lycoris import create_lycoris_from_weights
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def apply_lycoris(pipe, lyco_path, multiplier=1.0):
+    log("Loading LyCORIS safetensors...")
+    weights_sd = sft.load_file(lyco_path)
+
+    log("Creating LyCORIS network...")
+    lyco, _ = create_lycoris_from_weights(
+        multiplier=multiplier,
+        file=None,
+        module=pipe.transformer,
+        weights_sd=weights_sd,
+    )
+
+    log("Applying LyCORIS...")
+    lyco.apply_to()
+    lyco.to("cuda", dtype=torch.float16)
+    return lyco
+
+def main():
+    ckpt = os.environ["CKPT"]
+    base = os.environ["BASE"]
+    out = os.environ.get("OUT", "out.png")
+
+    prompt = os.environ["PROMPT"]
+    negative = os.environ.get("NEG", "")
+
+    steps = int(os.environ.get("STEPS", "28"))
+    cfg = float(os.environ.get("CFG", "4.5"))
+    seed = int(os.environ.get("SEED", "12345"))
+    mult = float(os.environ.get("MULT", "1.0"))
+
+    log("Loading SD3.5 pipeline (float16 only)")
+    pipe = StableDiffusion3Pipeline.from_pretrained(
+        base,
+        torch_dtype=torch.float16,
+    ).to("cuda")
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    lyco = apply_lycoris(pipe, ckpt, multiplier=mult)
+
+    log("Generating image...")
+    image = pipe(
+        prompt=prompt,
+        negative_prompt=negative,
+        num_inference_steps=steps,
+        guidance_scale=cfg,
+        generator=gen,
+        output_type="pil",
+    ).images[0]
+
+    image.save(out)
+    log(f"Saved: {out}")
+
+    lyco.restore()
+    log("LyCORIS restored")
+
+if __name__ == "__main__":
+    main()

@@ -275,7 +275,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cpu_device = torch.device("cpu")
-    weight_dtype = torch.bfloat16
+    weight_dtype = torch.float16
 
     print("==============================================")
     print("RENDEREXPO PRO v2.1 – SD3.5 LyCORIS RESUME")
@@ -455,7 +455,7 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.cuda.amp.autocast(enabled=True, dtype=weight_dtype):
                 model_pred = transformer(
                     hidden_states=noisy_latents,
                     timestep=timesteps,

@@ -1,0 +1,91 @@
+import os, time
+import torch
+import safetensors.torch as sft
+from diffusers import StableDiffusion3Pipeline
+from lycoris import create_lycoris_from_weights
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def apply_lycoris(pipe, lyco_path, multiplier=1.0, device="cuda", dtype=torch.bfloat16):
+    log("Loading LyCORIS safetensors...")
+    weights_sd = sft.load_file(lyco_path)
+
+    log("Creating LyCORIS network from weights...")
+    lyco, _ = create_lycoris_from_weights(
+        multiplier=multiplier,
+        file=None,
+        module=pipe.transformer,
+        weights_sd=weights_sd,
+    )
+
+    log("Applying LyCORIS to transformer...")
+    lyco.apply_to()
+    lyco.to(device, dtype=dtype)
+    return lyco
+def main():
+    ckpt = os.environ["CKPT"]
+    base = os.environ.get("BASE", "/workspace-data/models/sd35-large")
+    out = os.environ.get("OUT", "/tmp/out.png")
+
+    prompt = os.environ.get(
+        "PROMPT",
+        "RENDEREXPO, photorealistic architectural visualization, ultra-detailed materials"
+    )
+    negative = os.environ.get("NEG", "low quality, blurry, watermark, text")
+
+    steps = int(os.environ.get("STEPS", "28"))
+    cfg = float(os.environ.get("CFG", "4.5"))
+    seed = int(os.environ.get("SEED", "12345"))
+    mult = float(os.environ.get("MULT", "1.0"))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    log(f"Device={device} dtype={dtype}")
+    log("Loading SD3.5 pipeline... (this is the slowest step)")
+    t0 = time.time()
+    pipe = StableDiffusion3Pipeline.from_pretrained(base, torch_dtype=dtype)
+    log(f"Pipeline loaded in {time.time()-t0:.1f}s")
+
+    log("Moving pipeline to device...")
+    t1 = time.time()
+    pipe = pipe.to(device)
+    # --- VAE safety: decode in fp32 to avoid NaNs / garbage ---
+    pipe.vae.to(device=device, dtype=torch.float32)
+    try:
+        pipe.vae.enable_slicing()
+        pipe.vae.enable_tiling()
+    except Exception:
+        pass
+    # Force VAE decode in fp32 to avoid garbage / NaNs
+    pipe.vae.to(dtype=torch.float32)
+    log(f"Moved to {device} in {time.time()-t1:.1f}s")
+    log("Applying LyCORIS...")
+    t2 = time.time()
+    lyco = apply_lycoris(pipe, ckpt, multiplier=mult, device=device, dtype=dtype)
+    log(f"LyCORIS applied in {time.time()-t2:.1f}s")
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    log("Generating image...")
+    t3 = time.time()
+    image = pipe(
+        prompt=prompt,
+        negative_prompt=negative,
+        num_inference_steps=steps,
+        guidance_scale=cfg,
+        generator=gen,
+        output_type="pil",
+        output_type="pil",
+    ).images[0]
+    log(f"Inference done in {time.time()-t3:.1f}s")
+
+    image.save(out)
+    log(f"Saved: {out}")
+
+    try:
+        lyco.restore()
+        log("LyCORIS restored (unapplied).")
+    except Exception as e:
+        log(f"LyCORIS restore skipped: {e}")
+
+if __name__ == "__main__":
+    main()
