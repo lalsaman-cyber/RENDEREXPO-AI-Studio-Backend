@@ -1,15 +1,23 @@
 #!/usr/bin/env python
-# RENDEREXPO SD3.5-Large LyCORIS trainer (PRO v2.1 RESUME, caption-aware, 1024px, rank 16)
+# RENDEREXPO SD3.5-Large LyCORIS trainer (GEOMETRY+MATERIALS adapter, caption-aware, rank 16, saves+samples every 500)
 #
-# - Same training loop as PRO v2.1
-# - Adds resume_from (.safetensors) + resume_step (global_step start)
-# - Adds configurable grad clipping (max_grad_norm) to reduce fp16 NaN cascades
+# Goal:
+# - Complement PRO 2.1 (style) with a second adapter that forces:
+#   sharp geometry, rigid lines, crisp material boundaries, depth clarity, no smudginess
+# - Dataset is paired: 1.jpg + 1.txt, etc (342 pairs verified)
+# - A6000 training, FP16 transformer, VAE float32 for stability
+# - Saves checkpoint safetensors every --save_steps (default 500)
+# - ALSO saves reference sample images every --sample_steps (default 500)
 #
-# NOTE: This script is meant to run directly.
+# Notes:
+# - This script trains ONLY LyCORIS params attached to SD3 transformer.
+# - For sampling we temporarily build a StableDiffusion3Pipeline and generate 2-3 fixed prompts.
+# - This is slower but extremely reliable and produces “proof images” every 500 steps even if you sleep.
 
 import argparse
 import os
 import random
+import time
 from pathlib import Path
 from typing import List
 
@@ -23,7 +31,8 @@ from PIL.ImageOps import exif_transpose
 from tqdm.auto import tqdm
 
 from transformers import CLIPTokenizer, T5TokenizerFast, PretrainedConfig
-from diffusers import AutoencoderKL, SD3Transformer2DModel
+
+from diffusers import AutoencoderKL, SD3Transformer2DModel, StableDiffusion3Pipeline
 from diffusers.training_utils import free_memory
 
 from lycoris import create_lycoris, LycorisNetwork
@@ -36,11 +45,13 @@ import safetensors.torch as sft
 
 class RenderExpoCaptionDataset(Dataset):
     """
+    Caption-aware dataset:
+
     - Scans instance_data_root for image files (.jpg/.jpeg/.png/.webp)
-    - For each image `name.ext`, looks for `name.txt` in the same folder
-    - If caption exists + non-empty: use it
-    - Else: fallback to global --instance_prompt
-    - Optional caption_dropout: with probability p, ignore caption and use fallback prompt
+    - For each image `name.ext`, looks for `name.txt`
+    - If found and non-empty: uses that caption
+    - Otherwise: falls back to global --instance_prompt
+    - Optional caption_dropout: sometimes use instance_prompt for generalization
     """
 
     def __init__(
@@ -61,16 +72,15 @@ class RenderExpoCaptionDataset(Dataset):
             raise ValueError(f"Instance data root does not exist: {instance_data_root}")
 
         valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
-        self.image_paths = [
-            p for p in root.iterdir()
-            if p.is_file() and p.suffix.lower() in valid_exts
-        ]
+        self.image_paths = [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+
         if len(self.image_paths) == 0:
             raise ValueError(f"No valid images found in: {instance_data_root}")
 
-        self.resize = transforms.Resize(
-            resolution, interpolation=transforms.InterpolationMode.BILINEAR
-        )
+        # Sort for determinism
+        self.image_paths = sorted(self.image_paths, key=lambda p: p.name.lower())
+
+        self.resize = transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR)
         self.random_crop = transforms.RandomCrop(resolution)
         self.center_crop_tf = transforms.CenterCrop(resolution)
         self.hflip = transforms.RandomHorizontalFlip(p=1.0)
@@ -84,7 +94,7 @@ class RenderExpoCaptionDataset(Dataset):
         txt_path = image_path.with_suffix(".txt")
         if txt_path.exists():
             try:
-                text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
+                text = txt_path.read_text(encoding="utf-8").strip()
                 if text:
                     return text
             except Exception:
@@ -101,15 +111,14 @@ class RenderExpoCaptionDataset(Dataset):
 
         image = self.resize(image)
 
+        # Random flip 50%
         if random.random() < 0.5:
             image = self.hflip(image)
 
         if self.center_crop:
             image = self.center_crop_tf(image)
         else:
-            y1, x1, h, w = self.random_crop.get_params(
-                image, (self.resolution, self.resolution)
-            )
+            y1, x1, h, w = self.random_crop.get_params(image, (self.resolution, self.resolution))
             image = crop(image, y1, x1, h, w)
 
         image = self.to_tensor(image)
@@ -132,10 +141,11 @@ def import_text_encoder_class(model_path: str, subfolder: str):
     if arch == "CLIPTextModelWithProjection":
         from transformers import CLIPTextModelWithProjection
         return CLIPTextModelWithProjection
-    if arch == "T5EncoderModel":
+    elif arch == "T5EncoderModel":
         from transformers import T5EncoderModel
         return T5EncoderModel
-    raise ValueError(f"Unsupported text encoder architecture: {arch}")
+    else:
+        raise ValueError(f"Unsupported text encoder architecture: {arch}")
 
 
 def encode_prompt_sd3(
@@ -150,7 +160,7 @@ def encode_prompt_sd3(
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float16,
 ):
-    # 2x CLIP
+    # CLIP encoders
     clip_tokenizers = [tokenizer_one, tokenizer_two]
     clip_encoders = [text_encoder_one, text_encoder_two]
     clip_embeds_list = []
@@ -181,7 +191,7 @@ def encode_prompt_sd3(
     clip_prompt_embeds = torch.cat(clip_embeds_list, dim=-1)
     pooled_prompt_embeds = torch.cat(clip_pooled_list, dim=-1)
 
-    # T5
+    # T5 encoder
     t5_inputs = tokenizer_three(
         prompts,
         padding="max_length",
@@ -190,16 +200,15 @@ def encode_prompt_sd3(
         add_special_tokens=True,
         return_tensors="pt",
     )
-    t5_ids = t5_inputs.input_ids  # CPU
+    t5_ids = t5_inputs.input_ids
     with torch.no_grad():
         t5_out = text_encoder_three(t5_ids)[0]
 
     t5_out = t5_out.to(dtype=torch.float32)
 
-    # Pad CLIP channels to match T5 hidden size (channels), then concat along sequence
     if clip_prompt_embeds.shape[-1] < t5_out.shape[-1]:
         pad_channels = t5_out.shape[-1] - clip_prompt_embeds.shape[-1]
-        clip_prompt_embeds = F.pad(clip_prompt_embeds, (0, pad_channels))
+        clip_prompt_embeds = torch.nn.functional.pad(clip_prompt_embeds, (0, pad_channels))
 
     prompt_embeds = torch.cat([clip_prompt_embeds, t5_out], dim=-2)
 
@@ -209,7 +218,7 @@ def encode_prompt_sd3(
 
 
 # ------------------------------
-# LR schedule (3-phase)
+# LR schedule (3-phase decay)
 # ------------------------------
 
 def three_phase_lr(step: int, total_steps: int, lr_start: float, lr_mid: float, lr_final: float) -> float:
@@ -219,8 +228,76 @@ def three_phase_lr(step: int, total_steps: int, lr_start: float, lr_mid: float, 
     if step <= half:
         t = step / max(1, half)
         return lr_start + t * (lr_mid - lr_start)
-    t = (step - half) / max(1, total_steps - half)
-    return lr_mid + t * (lr_final - lr_mid)
+    else:
+        t = (step - half) / max(1, total_steps - half)
+        return lr_mid + t * (lr_final - lr_mid)
+
+
+# ------------------------------
+# Sampling helpers
+# ------------------------------
+
+def _log(msg: str):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def generate_reference_samples(
+    base_model_path: str,
+    transformer_with_lyco: SD3Transformer2DModel,
+    out_dir: str,
+    step: int,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """
+    Saves a few “proof images” every N steps.
+
+    Reliability > speed:
+    - We build a temporary SD3 pipeline
+    - Swap in our transformer (already has LyCORIS attached)
+    - Generate fixed prompts with fixed seed
+    - Save PNGs
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    prompts = [
+        # Exterior geometry stress test
+        "Ultra-sharp architectural photograph, rigid rectilinear geometry, straight verticals and horizontals, crisp balcony edges, clean glass boundaries, no smudginess, no blur, photographic spatial clarity at all depths",
+        # Interior geometry/material boundary stress test
+        "Ultra-sharp interior architectural photograph, straight ceiling lines, clean wall intersections, sharp cabinetry edges, discrete material boundaries, no texture smear, no softened edges, realistic depth clarity",
+    ]
+    negative = "smudgy, blurry, softened edges, melted geometry, warped lines, painterly, CGI look, over-smoothed, haze, bloom"
+
+    _log(f"[SAMPLES] Building temporary pipeline for step {step}...")
+    pipe = StableDiffusion3Pipeline.from_pretrained(base_model_path, torch_dtype=dtype)
+
+    # Swap transformer (LyCORIS lives inside this transformer)
+    pipe.transformer = transformer_with_lyco
+
+    pipe = pipe.to(device)
+
+    g = torch.Generator(device=device).manual_seed(seed + step)
+
+    for i, p in enumerate(prompts):
+        out_path = os.path.join(out_dir, f"step_{step:06d}_{i:02d}.png")
+        _log(f"[SAMPLES] Generating {out_path}")
+        img = pipe(
+            prompt=p,
+            negative_prompt=negative,
+            num_inference_steps=28,
+            guidance_scale=4.5,
+            generator=g,
+        ).images[0]
+        img.save(out_path)
+
+    # Cleanup
+    del pipe
+    free_memory()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _log(f"[SAMPLES] Done for step {step}.")
 
 
 # ------------------------------
@@ -229,34 +306,45 @@ def three_phase_lr(step: int, total_steps: int, lr_start: float, lr_mid: float, 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        "RENDEREXPO SD3.5 LyCORIS trainer PRO v2.1 RESUME (caption-aware, fp16, 1024px, rank 16)"
+        "RENDEREXPO SD3.5 LyCORIS trainer (GEOMETRY+MATERIALS, caption-aware, rank 16, saves+samples every 500)"
     )
 
     p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     p.add_argument("--instance_data_dir", type=str, required=True)
     p.add_argument("--instance_prompt", type=str, required=True)
-    p.add_argument("--output_dir", type=str, required=True)
+
+    p.add_argument("--output_dir", type=str, required=True, help="Where to save LyCORIS weights (.safetensors)")
+    p.add_argument("--samples_dir", type=str, required=True, help="Where to save reference sample images")
 
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--train_batch_size", type=int, default=1)
-    p.add_argument("--max_train_steps", type=int, default=15000)
 
-    # IMPORTANT: defaults kept safe/stable for resume
-    p.add_argument("--learning_rate", type=float, default=8e-6)
-    p.add_argument("--lr_mid", type=float, default=1.2e-5)
-    p.add_argument("--lr_final", type=float, default=8e-6)
+    # For 342 images batch=1:
+    # 6000 steps ~ 17.5 epochs, good for “behavior correction” without heavy overfit.
+    p.add_argument("--max_train_steps", type=int, default=6000)
 
+    # Slightly safer LR for geometry/material training (less chance of “noise weights”)
+    p.add_argument("--learning_rate", type=float, default=6e-5)
+    p.add_argument("--lr_mid", type=float, default=2.5e-5)
+    p.add_argument("--lr_final", type=float, default=1.0e-5)
+
+    # Rank 16 (you requested)
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--alpha", type=float, default=16.0)
-    p.add_argument("--lycoris_algo", type=str, default="locon", choices=["locon", "loha"])
-    p.add_argument("--caption_dropout", type=float, default=0.10)
-    p.add_argument("--save_steps", type=int, default=500)
-    p.add_argument("--seed", type=int, default=42)
 
-    # Resume + stability
-    p.add_argument("--resume_from", type=str, default=None, help="Path to LyCORIS .safetensors checkpoint to resume from.")
-    p.add_argument("--resume_step", type=int, default=0, help="Step number of the resume checkpoint (global_step starts here).")
-    p.add_argument("--max_grad_norm", type=float, default=0.5, help="Gradient clipping norm (helps prevent fp16 NaNs).")
+    # locon tends to preserve crisp structure well
+    p.add_argument("--lycoris_algo", type=str, default="locon", choices=["locon", "loha"])
+
+    # Keep some dropout so this doesn’t “lock” to captions too hard
+    p.add_argument("--caption_dropout", type=float, default=0.10)
+
+    # Must save every 500
+    p.add_argument("--save_steps", type=int, default=500)
+
+    # Must also save sample images every 500
+    p.add_argument("--sample_steps", type=int, default=500)
+
+    p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
 
@@ -267,22 +355,29 @@ def parse_args():
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        random.seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.samples_dir, exist_ok=True)
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cpu_device = torch.device("cpu")
-    weight_dtype = torch.bfloat16
 
-    print("==============================================")
-    print("RENDEREXPO PRO v2.1 – SD3.5 LyCORIS RESUME")
-    print("==============================================")
+    # Transformer FP16 on GPU
+    weight_dtype = torch.float16
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("===============================================================")
+    print("RENDEREXPO — GEOMETRY + MATERIALS LyCORIS Trainer (Rank 16)")
+    print("===============================================================")
     print(f"Base model path:        {args.pretrained_model_name_or_path}")
     print(f"Instance data dir:      {args.instance_data_dir}")
     print(f"Output dir:             {args.output_dir}")
+    print(f"Samples dir:            {args.samples_dir}")
     print(f"Resolution:             {args.resolution}")
     print(f"Batch size:             {args.train_batch_size}")
     print(f"Max steps:              {args.max_train_steps}")
@@ -291,46 +386,34 @@ def main():
     print(f"LyCORIS rank (dim):     {args.rank}")
     print(f"LyCORIS alpha:          {args.alpha}")
     print(f"Caption dropout:        {args.caption_dropout}")
-    print(f"Resume from:            {args.resume_from}")
-    print(f"Resume step:            {args.resume_step}")
-    print(f"Max grad norm:          {args.max_grad_norm}")
-    print(f"weight_dtype (GPU):     {weight_dtype}")
-    print("==============================================")
+    print(f"Save steps:             {args.save_steps}")
+    print(f"Sample steps:           {args.sample_steps}")
+    print(f"Seed:                   {args.seed}")
+    print(f"GPU dtype:              {weight_dtype}")
+    print("===============================================================")
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Load model components
+    _log("Loading SD3.5 components...")
 
-    print("Loading SD3.5-Large components...")
-    print(f"Using default instance prompt: {args.instance_prompt}")
-
-    # VAE on GPU float32 for stability
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         torch_dtype=torch.float32,
     ).to(device)
+    vae.requires_grad_(False)
 
-    # Transformer on GPU fp16
     transformer: SD3Transformer2DModel = SD3Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="transformer",
         torch_dtype=weight_dtype,
     ).to(device)
-
     transformer.enable_gradient_checkpointing()
+    transformer.requires_grad_(True)
 
-    # Tokenizers CPU
-    tokenizer_one: CLIPTokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer"
-    )
-    tokenizer_two: CLIPTokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer_2"
-    )
-    tokenizer_three: T5TokenizerFast = T5TokenizerFast.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer_3"
-    )
+    tokenizer_one: CLIPTokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+    tokenizer_two: CLIPTokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
+    tokenizer_three: T5TokenizerFast = T5TokenizerFast.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_3")
 
-    # Text encoders CPU ONLY
     te1_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder")
     te2_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_2")
     te3_cls = import_text_encoder_class(args.pretrained_model_name_or_path, "text_encoder_3")
@@ -345,14 +428,14 @@ def main():
         args.pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=torch.float32
     ).to(cpu_device)
 
-    vae.requires_grad_(False)
-    transformer.requires_grad_(True)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     text_encoder_three.requires_grad_(False)
 
-    print("Attaching LyCORIS adapter to SD3.5 transformer...")
+    # Attach LyCORIS
+    _log("Attaching LyCORIS adapter to SD3 transformer...")
 
+    # IMPORTANT: we target attention modules like before (stable behavior)
     LycorisNetwork.apply_preset({"target_name": [".*attn.*"]})
 
     lyco_net = create_lycoris(
@@ -365,14 +448,7 @@ def main():
     lyco_net.apply_to()
 
     lyco_params = list(lyco_net.parameters())
-    print(f"LyCORIS parameters: {sum(p.numel() for p in lyco_params):,}")
-
-    # Resume weights if provided
-    if args.resume_from:
-        print(f"[Resume] Loading LyCORIS weights from: {args.resume_from}")
-        sd = sft.load_file(args.resume_from)
-        missing, unexpected = lyco_net.load_state_dict(sd, strict=False)
-        print(f"[Resume] Loaded. missing={len(missing)} unexpected={len(unexpected)}")
+    _log(f"LyCORIS trainable params: {sum(p.numel() for p in lyco_params):,}")
 
     optimizer = torch.optim.AdamW(
         lyco_params,
@@ -382,6 +458,7 @@ def main():
         eps=1e-8,
     )
 
+    # Dataset
     train_dataset = RenderExpoCaptionDataset(
         instance_data_root=args.instance_data_dir,
         default_prompt=args.instance_prompt,
@@ -389,22 +466,32 @@ def main():
         center_crop=False,
         caption_dropout=args.caption_dropout,
     )
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
+    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=0)
 
+    # Training loop
     total_steps = args.max_train_steps
-    global_step = int(args.resume_step)
-
-    print(f"Starting PRO v2.1 RESUME training from step {global_step} to {total_steps}...")
-    progress_bar = tqdm(range(global_step, total_steps), desc="Training steps", initial=global_step, total=total_steps)
+    global_step = 0
 
     transformer.train()
+    noise_scale = 0.25  # keeps it “sharp” like your previous runs
 
-    noise_scale = 0.25
+    _log(f"Starting training for {total_steps} steps...")
+
+    progress_bar = tqdm(range(total_steps), desc="Training")
+
+    # Save an initial sample at step 0 (so you have a baseline reference)
+    try:
+        generate_reference_samples(
+            base_model_path=args.pretrained_model_name_or_path,
+            transformer_with_lyco=transformer,
+            out_dir=args.samples_dir,
+            step=0,
+            seed=args.seed,
+            device=device,
+            dtype=weight_dtype,
+        )
+    except Exception as e:
+        _log(f"[SAMPLES] Initial sample failed (not fatal): {e}")
 
     while global_step < total_steps:
         for batch in train_dataloader:
@@ -430,8 +517,9 @@ def main():
 
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
-                if hasattr(vae.config, "scaling_factor"):
-                    latents = latents * vae.config.scaling_factor
+
+            if hasattr(vae.config, "scaling_factor"):
+                latents = latents * vae.config.scaling_factor
 
             latents = torch.clamp(latents, -10.0, 10.0).to(device=device, dtype=weight_dtype)
 
@@ -443,19 +531,13 @@ def main():
             noisy_latents = latents + noise_scale * noise
             noisy_latents = torch.clamp(noisy_latents, -10.0, 10.0)
 
-            lr = three_phase_lr(
-                global_step,
-                total_steps,
-                args.learning_rate,
-                args.lr_mid,
-                args.lr_final,
-            )
+            lr = three_phase_lr(global_step, total_steps, args.learning_rate, args.lr_mid, args.lr_final)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.cuda.amp.autocast(enabled=True, dtype=weight_dtype):
                 model_pred = transformer(
                     hidden_states=noisy_latents,
                     timestep=timesteps,
@@ -464,55 +546,61 @@ def main():
                     return_dict=False,
                 )[0]
 
-                loss = F.mse_loss(
-                    model_pred.to(dtype=torch.float32),
-                    noise.to(dtype=torch.float32),
-                )
+                loss = F.mse_loss(model_pred.to(dtype=torch.float32), noise.to(dtype=torch.float32))
 
             if not torch.isfinite(loss):
-                print(f"⚠️ Non-finite loss detected at step {global_step}: {loss.item()}, skipping this step.")
+                _log(f"⚠️ Non-finite loss at step {global_step}: {loss.item()} (skipping)")
                 global_step += 1
                 progress_bar.update(1)
                 continue
 
             loss.backward()
-
-            if args.max_grad_norm and args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(lyco_params, args.max_grad_norm)
-
+            torch.nn.utils.clip_grad_norm_(lyco_params, 1.0)
             optimizer.step()
 
             global_step += 1
             progress_bar.set_postfix({"loss": float(loss.item()), "lr": lr})
             progress_bar.update(1)
 
+            # Checkpoint save every N steps
             if args.save_steps > 0 and global_step % args.save_steps == 0:
-                ckpt_path = os.path.join(
-                    args.output_dir, f"pytorch_lycoris_step_{global_step:06d}.safetensors"
-                )
-                state = lyco_net.state_dict()
-                sft.save_file(state, ckpt_path)
-                print(f"[Checkpoint] Saved LyCORIS weights at step {global_step} -> {ckpt_path}")
+                ckpt_path = os.path.join(args.output_dir, f"pytorch_lycoris_step_{global_step:06d}.safetensors")
+                sft.save_file(lyco_net.state_dict(), ckpt_path)
+                _log(f"[Checkpoint] Saved: {ckpt_path}")
+
+            # Sample save every N steps
+            if args.sample_steps > 0 and global_step % args.sample_steps == 0:
+                try:
+                    generate_reference_samples(
+                        base_model_path=args.pretrained_model_name_or_path,
+                        transformer_with_lyco=transformer,
+                        out_dir=args.samples_dir,
+                        step=global_step,
+                        seed=args.seed,
+                        device=device,
+                        dtype=weight_dtype,
+                    )
+                except Exception as e:
+                    _log(f"[SAMPLES] Step {global_step} sample failed (not fatal): {e}")
 
             if global_step >= total_steps:
                 break
 
     progress_bar.close()
-    print("Training finished, saving final LyCORIS weights...")
+    _log("Training finished. Saving final weights...")
 
     transformer.eval()
 
+    final_path = os.path.join(args.output_dir, "pytorch_lycoris_final.safetensors")
+    sft.save_file(lyco_net.state_dict(), final_path)
+    _log(f"✅ Final LyCORIS saved: {final_path}")
+
+    # Cleanup
     del vae, text_encoder_one, text_encoder_two, text_encoder_three
     free_memory()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    final_path = os.path.join(args.output_dir, "pytorch_lycoris_final.safetensors")
-    os.makedirs(args.output_dir, exist_ok=True)
-    sft.save_file(lyco_net.state_dict(), final_path)
-    print(f"✅ LyCORIS weights saved to: {final_path}")
-
 
 if __name__ == "__main__":
     main()
-PY
