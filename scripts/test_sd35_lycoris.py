@@ -1,10 +1,3 @@
-cd /workspace-data/RENDEREXPO-AI-Studio-Backend || exit 1
-
-# safety backup
-cp -v scripts/test_sd35_lycoris.py scripts/test_sd35_lycoris.py.bak.$(date +%Y%m%d_%H%M%S)
-
-# overwrite with CLEAN patched version (CKPT autosplit + CKPT2 support)
-cat > scripts/test_sd35_lycoris.py <<'PY'
 import os
 import time
 from pathlib import Path
@@ -75,7 +68,9 @@ def stats(name: str, x: torch.Tensor):
 
 
 def _clean_path_list(s: str) -> list[str]:
-    # Accept commas, semicolons, whitespace/newlines
+    """
+    Accept commas, semicolons, whitespace/newlines.
+    """
     if not s:
         return []
     raw = s.replace(";", ",").replace("\n", ",").replace("\t", ",")
@@ -199,7 +194,9 @@ def main():
             raise RuntimeError(f"CKPT path does not exist: {ckpt}")
 
         log(f"Loading LyCORIS #1 CKPT={ckpt} MULT={mult}")
-        lyco1 = apply_lycoris_to_sd35_transformer(pipe, ckpt, multiplier=mult, device=device, dtype=dtype)
+        lyco1 = apply_lycoris_to_sd35_transformer(
+            pipe, ckpt, multiplier=mult, device=device, dtype=dtype
+        )
     log(f"LyCORIS #1 step done in {time.time() - t2:.1f}s")
 
     # -----------------------
@@ -215,7 +212,9 @@ def main():
             raise RuntimeError(f"CKPT2 path does not exist: {ckpt2}")
 
         log(f"Loading LyCORIS #2 CKPT2={ckpt2} MULT2={mult2}")
-        lyco2 = apply_lycoris_to_sd35_transformer(pipe, ckpt2, multiplier=mult2, device=device, dtype=dtype)
+        lyco2 = apply_lycoris_to_sd35_transformer(
+            pipe, ckpt2, multiplier=mult2, device=device, dtype=dtype
+        )
     log(f"LyCORIS #2 step done in {time.time() - t2b:.1f}s")
 
     # -----------------------
@@ -283,8 +282,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
-
-# sanity checks
-python -m py_compile scripts/test_sd35_lycoris.py || exit 1
-grep -n "Detected CKPT list" -n scripts/test_sd35_lycoris.py
