@@ -1,3 +1,10 @@
+cd /workspace-data/RENDEREXPO-AI-Studio-Backend || exit 1
+
+# safety backup
+cp -v scripts/test_sd35_lycoris.py scripts/test_sd35_lycoris.py.bak.$(date +%Y%m%d_%H%M%S)
+
+# overwrite with CLEAN patched version (CKPT autosplit + CKPT2 support)
+cat > scripts/test_sd35_lycoris.py <<'PY'
 import os
 import time
 from pathlib import Path
@@ -60,14 +67,15 @@ def stats(name: str, x: torch.Tensor):
         any_nan = torch.isnan(xn).any().item()
         any_inf = torch.isinf(xn).any().item()
         mn = float(xn.min().item())
-   log(
+        mx = float(xn.max().item())
+        log(
             f"{name}: finite={fin} nan={any_nan} inf={any_inf} "
             f"min={mn:.6g} max={mx:.6g} dtype={xn.dtype} device={xn.device}"
         )
 
 
 def _clean_path_list(s: str) -> list[str]:
-    # Accept commas, semicolons, whitespace
+    # Accept commas, semicolons, whitespace/newlines
     if not s:
         return []
     raw = s.replace(";", ",").replace("\n", ",").replace("\t", ",")
@@ -108,7 +116,7 @@ def apply_lycoris_to_sd35_transformer(
 
 
 def main():
-   # -----------------------
+    # -----------------------
     # ENV
     # -----------------------
     base = os.environ.get("BASE", "").strip()
@@ -129,17 +137,15 @@ def main():
     mult = float(os.environ.get("MULT", "0.0"))
     ckpt = os.environ.get("CKPT", "").strip()
 
-  # LyCORIS #2 (GEO or any secondary)
+    # LyCORIS #2 (GEO or any secondary)
     mult2 = float(os.environ.get("MULT2", "0.0"))
     ckpt2 = os.environ.get("CKPT2", "").strip()
 
-    # IMPORTANT PATCH:
-    # If someone passes CKPT="path1,path2" and CKPT2 is empty, split automatically.
+    # PATCH: if user passes CKPT="path1,path2" and CKPT2 is empty, auto-split
     if ckpt and ("," in ckpt or ";" in ckpt or "\n" in ckpt) and not ckpt2:
         parts = _clean_path_list(ckpt)
         if len(parts) >= 2:
-            ckpt = parts[0]
-            ckpt2 = parts[1]
+            ckpt, ckpt2 = parts[0], parts[1]
             log(f"Detected CKPT list -> CKPT={ckpt} | CKPT2={ckpt2}")
         elif len(parts) == 1:
             ckpt = parts[0]
@@ -149,7 +155,7 @@ def main():
     # -----------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
- # BF16 is often more stable; you can force FP16 by export FORCE_FP16=1
+    # BF16 is often more stable; you can force FP16 by export FORCE_FP16=1
     force_fp16 = os.environ.get("FORCE_FP16", "0").strip() == "1"
     if device == "cuda":
         dtype = torch.float16 if force_fp16 else torch.bfloat16
@@ -171,7 +177,7 @@ def main():
     pipe = pipe.to(device)
     log(f"Moved to {device} in {time.time() - t1:.1f}s")
 
- # VAE memory helpers (safe if available)
+    # VAE memory helpers (safe if available)
     try:
         pipe.vae.enable_slicing()
         pipe.vae.enable_tiling()
@@ -196,7 +202,7 @@ def main():
         lyco1 = apply_lycoris_to_sd35_transformer(pipe, ckpt, multiplier=mult, device=device, dtype=dtype)
     log(f"LyCORIS #1 step done in {time.time() - t2:.1f}s")
 
-  # -----------------------
+    # -----------------------
     # OPTIONAL: APPLY LyCORIS #2
     # -----------------------
     lyco2 = None
@@ -212,7 +218,7 @@ def main():
         lyco2 = apply_lycoris_to_sd35_transformer(pipe, ckpt2, multiplier=mult2, device=device, dtype=dtype)
     log(f"LyCORIS #2 step done in {time.time() - t2b:.1f}s")
 
- # -----------------------
+    # -----------------------
     # GENERATE LATENTS ONLY
     # -----------------------
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -236,7 +242,7 @@ def main():
 
     stats("latents", latents)
 
-  # -----------------------
+    # -----------------------
     # MANUAL DECODE
     # -----------------------
     log("Manual VAE decode...")
@@ -259,7 +265,7 @@ def main():
     image.save(str(out_path))
     log(f"Saved: {out_path}")
 
-# -----------------------
+    # -----------------------
     # RESTORE LyCORIS (reverse order)
     # -----------------------
     try:
@@ -274,5 +280,11 @@ def main():
     except Exception as e:
         log(f"LyCORIS restore skipped: {e}")
 
+
 if __name__ == "__main__":
     main()
+PY
+
+# sanity checks
+python -m py_compile scripts/test_sd35_lycoris.py || exit 1
+grep -n "Detected CKPT list" -n scripts/test_sd35_lycoris.py
