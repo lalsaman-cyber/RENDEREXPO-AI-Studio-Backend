@@ -1,296 +1,123 @@
 #!/usr/bin/env python3
-"""
-RENDEREXPO AI Studio — SD3.5 Pass2 Img2Img Refiner (General + Masked Region)
-
-Key features:
-- Preserves input resolution (e.g., 2048 stays 2048).
-- Optional region-focused refinement via:
-  - MASK_MODE=none|bottom|top|left|right|center|box|file
-  - MASK_PCT (used by bottom/top/left/right/center), default 0.30
-  - MASK_BOX="x0,y0,x1,y1" (pixels, for MASK_MODE=box)
-  - MASK_IN="path/to/mask.png" (white=refine, black=keep), for MASK_MODE=file
-  - MASK_FEATHER (blur radius, default 24) for seamless blending
-- Applies up to 2 LoRA/LyCORIS adapters:
-  - LORA1_CKPT + LORA1_WEIGHT
-  - LORA2_CKPT + LORA2_WEIGHT
-- Uses:
-  - BASE_SD35 (preferred) or BASE (fallback)
-  - IMG_IN, OUT, PROMPT, NEG, STEPS, CFG_SCALE, DENOISE, SEED
-
-This script does NOT require an inpaint pipeline.
-It refines a full img2img output, then blends ONLY the masked region back into the original.
-This makes "fix only cars/trees/text areas" possible without destroying the tower.
-"""
-
 import os
-import sys
-import math
-import time
-from typing import Optional, Tuple
+import argparse
+from typing import Optional
 
 import torch
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
-# Diffusers import: SD3.5 image-to-image pipeline
-try:
-    from diffusers import StableDiffusion3Img2ImgPipeline
-except Exception as e:
-    raise RuntimeError(
-        "Failed to import StableDiffusion3Img2ImgPipeline from diffusers. "
-        "Check your diffusers version/environment.\n"
-        f"Import error: {e}"
-    )
+# NOTE: keep the import matching whatever you already use in your repo.
+# If your current script imports StableDiffusion3Img2ImgPipeline successfully, keep that.
+from diffusers import StableDiffusion3Img2ImgPipeline
 
 
-def _env(name: str, default: Optional[str] = None) -> str:
-    v = os.environ.get(name, default)
-    if v is None or str(v).strip() == "":
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    return v if (v is not None and str(v).strip() != "") else default
 
 
-def _env_float(name: str, default: float) -> float:
-    v = os.environ.get(name, None)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    return float(v)
+def load_image_rgb(path: str) -> Image.Image:
+    im = Image.open(path)
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    return im
 
 
-def _env_int(name: str, default: int) -> int:
-    v = os.environ.get(name, None)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    return int(v)
-
-
-def _pick_base() -> str:
-    # Prefer BASE_SD35; fall back to BASE for compatibility with older scripts
-    base = os.environ.get("BASE_SD35", "").strip()
-    if not base:
-        base = os.environ.get("BASE", "").strip()
-    if not base:
-        raise RuntimeError("BASE_SD35 (preferred) or BASE must be set to the SD3.5 model folder.")
-    if not os.path.isdir(base):
-        raise RuntimeError(f"Base model folder not found: {base}")
-    return base
-
-
-def _parse_box(s: str) -> Tuple[int, int, int, int]:
-    # "x0,y0,x1,y1"
-    parts = [p.strip() for p in s.split(",")]
-    if len(parts) != 4:
-        raise RuntimeError('MASK_BOX must be "x0,y0,x1,y1" (4 comma-separated ints).')
-    return tuple(int(p) for p in parts)  # type: ignore
-
-
-def build_mask(
-    w: int,
-    h: int,
-    mode: str,
-    pct: float,
-    feather: int,
-    box: Optional[Tuple[int, int, int, int]],
-    mask_in: Optional[str],
-) -> Image.Image:
-    """
-    Returns L-mode mask: white=refine area, black=keep original.
-    """
-    mode = (mode or "none").strip().lower()
-
-    if mode == "none":
-        return Image.new("L", (w, h), 255)  # full refine
-
-    if mode == "file":
-        if not mask_in:
-            raise RuntimeError("MASK_MODE=file requires MASK_IN to be set.")
-        if not os.path.isfile(mask_in):
-            raise RuntimeError(f"MASK_IN not found: {mask_in}")
-        m = Image.open(mask_in).convert("L")
-        if m.size != (w, h):
-            m = m.resize((w, h), Image.BILINEAR)
-        if feather > 0:
-            m = m.filter(ImageFilter.GaussianBlur(radius=feather))
-        return m
-
-    # presets and box mode build a fresh mask
-    m = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(m)
-
-    pct = max(0.01, min(0.95, float(pct)))
-
-    if mode in ("bottom", "top"):
-        band = int(h * pct)
-        if mode == "bottom":
-            d.rectangle([0, h - band, w, h], fill=255)
-        else:
-            d.rectangle([0, 0, w, band], fill=255)
-
-    elif mode in ("left", "right"):
-        band = int(w * pct)
-        if mode == "left":
-            d.rectangle([0, 0, band, h], fill=255)
-        else:
-            d.rectangle([w - band, 0, w, h], fill=255)
-
-    elif mode == "center":
-        # center box covering pct of width/height
-        cw = int(w * pct)
-        ch = int(h * pct)
-        x0 = (w - cw) // 2
-        y0 = (h - ch) // 2
-        d.rectangle([x0, y0, x0 + cw, y0 + ch], fill=255)
-
-    elif mode == "box":
-        if box is None:
-            raise RuntimeError("MASK_MODE=box requires MASK_BOX.")
-        x0, y0, x1, y1 = box
-        # clamp
-        x0 = max(0, min(w - 1, x0))
-        y0 = max(0, min(h - 1, y0))
-        x1 = max(1, min(w, x1))
-        y1 = max(1, min(h, y1))
-        if x1 <= x0 or y1 <= y0:
-            raise RuntimeError("MASK_BOX invalid after clamping.")
-        d.rectangle([x0, y0, x1, y1], fill=255)
-
-    else:
-        raise RuntimeError(f"Unknown MASK_MODE: {mode}")
-
-    if feather > 0:
+def load_mask_l(path: str, size: tuple[int, int], invert: bool, feather: int) -> Image.Image:
+    m = Image.open(path)
+    # Allow RGB/PNG masks; convert to single-channel
+    if m.mode != "L":
+        m = m.convert("L")
+    # Resize mask to match input image
+    if m.size != size:
+        m = m.resize(size, Image.Resampling.LANCZOS)
+    if invert:
+        m = ImageOps.invert(m)
+    if feather and feather > 0:
         m = m.filter(ImageFilter.GaussianBlur(radius=feather))
     return m
 
 
-def apply_lora(pipe, ckpt: str, weight: float, adapter_name: str):
-    """
-    Load LoRA/LyCORIS weights via diffusers, then activate with weight.
-    This matches the pattern that works in diffusers for many LoRA formats.
-    """
-    if not ckpt or str(ckpt).strip() == "":
-        return
-
-    if not os.path.exists(ckpt):
-        raise RuntimeError(f"LoRA checkpoint not found: {ckpt}")
-
-    # load
-    pipe.load_lora_weights(ckpt, adapter_name=adapter_name)
-
-    # set weight
-    # Diffusers expects a list of adapter names and weights
-    pipe.set_adapters([adapter_name], adapter_weights=[float(weight)])
-
-
 def main():
-    base = _pick_base()
+    ap = argparse.ArgumentParser(description="SD3.5 Pass2 img2img refine (optionally masked) at native resolution.")
+    ap.add_argument("--base", default=_env("BASE_SD35", _env("BASE", "/workspace-data/models/sd35-large")),
+                    help="Path to SD3.5 model folder.")
+    ap.add_argument("--in", dest="img_in", default=_env("IMG_IN", _env("IMG")),
+                    help="Input image path.")
+    ap.add_argument("--out", dest="out", default=_env("OUT"),
+                    help="Output image path.")
+    ap.add_argument("--prompt", default=_env("PROMPT", "ultra-photorealistic architectural photo, crisp, clean, realistic"),
+                    help="Positive prompt.")
+    ap.add_argument("--neg", default=_env("NEG", "smudge, blur, painterly, warped, bent lines, melted, artifacts, noise"),
+                    help="Negative prompt.")
+    ap.add_argument("--steps", type=int, default=int(_env("STEPS", "26")), help="Steps.")
+    ap.add_argument("--cfg", type=float, default=float(_env("CFG_SCALE", "6.0")), help="CFG scale.")
+    ap.add_argument("--denoise", type=float, default=float(_env("DENOISE", "0.20")), help="Strength/denoise (0-1).")
+    ap.add_argument("--seed", type=int, default=int(_env("SEED", "0")), help="Seed (0 means random).")
 
-    img_in = _env("IMG_IN")
-    out = _env("OUT")
-    prompt = _env("PROMPT")
-    neg = os.environ.get("NEG", "").strip()
+    # Masked refine (generic, not skyscraper-specific)
+    ap.add_argument("--mask", default=_env("MASK", None), help="Optional mask path (white=apply refine).")
+    ap.add_argument("--invert-mask", action="store_true", help="Invert mask (black=apply refine).")
+    ap.add_argument("--feather", type=int, default=int(_env("FEATHER", "24")),
+                    help="Mask feather blur radius in pixels (0 disables).")
 
-    steps = _env_int("STEPS", 26)
-    cfg = _env_float("CFG_SCALE", 6.2)
-    denoise = _env_float("DENOISE", 0.22)
-    seed = _env_int("SEED", 0)
+    # Performance / determinism
+    ap.add_argument("--fp16", action="store_true", help="Use fp16 (recommended on GPU).")
+    args = ap.parse_args()
 
-    # Mask controls
-    mask_mode = os.environ.get("MASK_MODE", "none").strip().lower()
-    mask_pct = _env_float("MASK_PCT", 0.30)
-    mask_feather = _env_int("MASK_FEATHER", 24)
-    mask_box = os.environ.get("MASK_BOX", "").strip()
-    mask_in = os.environ.get("MASK_IN", "").strip()
+    if not args.img_in or not os.path.exists(args.img_in):
+        raise SystemExit(f"Input not found: {args.img_in}")
+    if not args.out:
+        raise SystemExit("Missing --out (or OUT env var).")
 
-    box = _parse_box(mask_box) if mask_mode == "box" else None
-    mask_in = mask_in if mask_mode == "file" else None
+    img = load_image_rgb(args.img_in)
+    w, h = img.size
 
-    # Optional LoRA/LyCORIS adapters
-    lora1_ckpt = os.environ.get("LORA1_CKPT", "").strip()
-    lora1_w = _env_float("LORA1_WEIGHT", 0.0)
-    lora2_ckpt = os.environ.get("LORA2_CKPT", "").strip()
-    lora2_w = _env_float("LORA2_WEIGHT", 0.0)
-
-    if not os.path.isfile(img_in):
-        raise RuntimeError(f"IMG_IN not found: {img_in}")
-
-    # Load image and preserve resolution
-    init = Image.open(img_in).convert("RGB")
-    w, h = init.size
-
-    # Device + dtype
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-
-    print(f"[Pass2] Base: {base}")
-    print(f"[Pass2] IMG_IN: {img_in} ({w}x{h})")
-    print(f"[Pass2] OUT: {out}")
-    print(f"[Pass2] steps={steps} cfg={cfg} denoise={denoise} seed={seed}")
-    print(f"[Pass2] MASK_MODE={mask_mode} MASK_PCT={mask_pct} MASK_FEATHER={mask_feather} MASK_BOX={mask_box} MASK_IN={mask_in or ''}")
-
-    t0 = time.time()
-    pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(base, torch_dtype=dtype)
-    pipe = pipe.to(device)
-    pipe.set_progress_bar_config(disable=False)
-
-    # Load/activate LoRAs (optional)
-    if lora1_ckpt and lora1_w > 0:
-        print(f"[Pass2] Loading LoRA1: {lora1_ckpt} weight={lora1_w}")
-        apply_lora(pipe, lora1_ckpt, lora1_w, adapter_name="lora1")
-
-    if lora2_ckpt and lora2_w > 0:
-        print(f"[Pass2] Loading LoRA2: {lora2_ckpt} weight={lora2_w}")
-        apply_lora(pipe, lora2_ckpt, lora2_w, adapter_name="lora2")
-
-    g = torch.Generator(device=device)
-    if seed != 0:
-        g.manual_seed(int(seed))
-
-    # Run full img2img at the SAME resolution as IMG_IN
-    # strength in diffusers is "denoise" here
-    result = pipe(
-        prompt=prompt,
-        negative_prompt=neg if neg else None,
-        image=init,
-        strength=float(denoise),
-        guidance_scale=float(cfg),
-        num_inference_steps=int(steps),
-        generator=g,
-        height=int(h),
-        width=int(w),
-    )
-
-    refined = result.images[0].convert("RGB")
-
-    # Safety: if model returns a different size for any reason, fix it.
-    if refined.size != init.size:
-        refined = refined.resize(init.size, Image.LANCZOS)
-
-    # If masking is enabled (anything except "none" which means full refine),
-    # blend refined only into the masked region, keeping original elsewhere.
-    # NOTE: For MASK_MODE=none we return refined as-is.
-    if mask_mode != "none":
-        mask = build_mask(
-            w=w,
-            h=h,
-            mode=mask_mode,
-            pct=mask_pct,
-            feather=mask_feather,
-            box=box,
-            mask_in=mask_in,
-        )
-        # composite: where mask is white -> refined, black -> original
-        final = Image.composite(refined, init, mask)
+    # Seed
+    if args.seed == 0:
+        # Still deterministic if you set torch seed externally; otherwise random
+        gen = None
     else:
-        final = refined
+        gen = torch.Generator(device="cuda").manual_seed(args.seed)
 
-    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    final.save(out)
-    print(f"[Pass2] Saved: {out}")
-    print(f"[Pass2] Done in {time.time() - t0:.1f}s")
+    dtype = torch.float16 if args.fp16 else torch.float32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"[Pass2] base={args.base}")
+    print(f"[Pass2] in={args.img_in} size={w}x{h}")
+    print(f"[Pass2] steps={args.steps} cfg={args.cfg} denoise={args.denoise} seed={args.seed}")
+    print(f"[Pass2] masked={bool(args.mask)} feather={args.feather} invert={args.invert_mask}")
+
+    pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(
+        args.base,
+        torch_dtype=dtype,
+    )
+    pipe = pipe.to(device)
+
+    # IMPORTANT: do NOT resize. Keep native resolution.
+    # Also: keep prompt tight and not "creative" for Pass2.
+    result = pipe(
+        prompt=args.prompt,
+        negative_prompt=args.neg,
+        image=img,
+        strength=args.denoise,
+        num_inference_steps=args.steps,
+        guidance_scale=args.cfg,
+        generator=gen,
+    ).images[0].convert("RGB")
+
+    # If mask provided, composite: keep original outside mask
+    if args.mask:
+        m = load_mask_l(args.mask, size=img.size, invert=args.invert_mask, feather=args.feather)
+        # Composite wants mask where white selects first image
+        final = Image.composite(result, img, m)
+    else:
+        final = result
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    final.save(args.out)
+    print(f"[Pass2] Saved: {args.out}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[Pass2] Interrupted.")
-        sys.exit(130)
+    main()
