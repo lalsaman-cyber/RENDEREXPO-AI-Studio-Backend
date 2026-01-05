@@ -6,8 +6,7 @@ from typing import Optional
 import torch
 from PIL import Image, ImageFilter, ImageOps
 
-# NOTE: keep the import matching whatever you already use in your repo.
-# If your current script imports StableDiffusion3Img2ImgPipeline successfully, keep that.
+# Keep the same import you already use
 from diffusers import StableDiffusion3Img2ImgPipeline
 
 
@@ -25,10 +24,8 @@ def load_image_rgb(path: str) -> Image.Image:
 
 def load_mask_l(path: str, size: tuple[int, int], invert: bool, feather: int) -> Image.Image:
     m = Image.open(path)
-    # Allow RGB/PNG masks; convert to single-channel
     if m.mode != "L":
         m = m.convert("L")
-    # Resize mask to match input image
     if m.size != size:
         m = m.resize(size, Image.Resampling.LANCZOS)
     if invert:
@@ -39,7 +36,10 @@ def load_mask_l(path: str, size: tuple[int, int], invert: bool, feather: int) ->
 
 
 def main():
-    ap = argparse.ArgumentParser(description="SD3.5 Pass2 img2img refine (optionally masked) at native resolution.")
+    ap = argparse.ArgumentParser(
+        description="SD3.5 Pass2 img2img refine (optionally masked) at native resolution."
+    )
+
     ap.add_argument("--base", default=_env("BASE_SD35", _env("BASE", "/workspace-data/models/sd35-large")),
                     help="Path to SD3.5 model folder.")
     ap.add_argument("--in", dest="img_in", default=_env("IMG_IN", _env("IMG")),
@@ -61,8 +61,13 @@ def main():
     ap.add_argument("--feather", type=int, default=int(_env("FEATHER", "24")),
                     help="Mask feather blur radius in pixels (0 disables).")
 
-    # Performance / determinism
-    ap.add_argument("--fp16", action="store_true", help="Use fp16 (recommended on GPU).")
+    # Precision controls
+    # IMPORTANT DEFAULT: BF16 on CUDA to prevent FP32 OOM.
+    prec = ap.add_mutually_exclusive_group()
+    prec.add_argument("--fp16", action="store_true", help="Force FP16 on GPU.")
+    prec.add_argument("--fp32", action="store_true", help="Force FP32 (NOT recommended on GPU for SD3.5 Large).")
+    prec.add_argument("--bf16", action="store_true", help="Force BF16 on GPU (DEFAULT behavior).")
+
     args = ap.parse_args()
 
     if not args.img_in or not os.path.exists(args.img_in):
@@ -70,23 +75,36 @@ def main():
     if not args.out:
         raise SystemExit("Missing --out (or OUT env var).")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # DEFAULT DTYPE POLICY:
+    # - CUDA: BF16 by default (safe)
+    # - CPU: FP32
+    if device == "cuda":
+        if args.fp32:
+            dtype = torch.float32
+        elif args.fp16:
+            dtype = torch.float16
+        else:
+            # default (also if --bf16 passed)
+            dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+
     img = load_image_rgb(args.img_in)
     w, h = img.size
 
-    # Seed
+    # Seed / generator (use the correct device)
     if args.seed == 0:
-        # Still deterministic if you set torch seed externally; otherwise random
         gen = None
     else:
-        gen = torch.Generator(device="cuda").manual_seed(args.seed)
-
-    dtype = torch.float16 if args.fp16 else torch.float32
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        gen = torch.Generator(device=device).manual_seed(args.seed)
 
     print(f"[Pass2] base={args.base}")
     print(f"[Pass2] in={args.img_in} size={w}x{h}")
     print(f"[Pass2] steps={args.steps} cfg={args.cfg} denoise={args.denoise} seed={args.seed}")
     print(f"[Pass2] masked={bool(args.mask)} feather={args.feather} invert={args.invert_mask}")
+    print(f"[Pass2] device={device} dtype={dtype}")
 
     pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(
         args.base,
@@ -95,7 +113,6 @@ def main():
     pipe = pipe.to(device)
 
     # IMPORTANT: do NOT resize. Keep native resolution.
-    # Also: keep prompt tight and not "creative" for Pass2.
     result = pipe(
         prompt=args.prompt,
         negative_prompt=args.neg,
@@ -109,7 +126,6 @@ def main():
     # If mask provided, composite: keep original outside mask
     if args.mask:
         m = load_mask_l(args.mask, size=img.size, invert=args.invert_mask, feather=args.feather)
-        # Composite wants mask where white selects first image
         final = Image.composite(result, img, m)
     else:
         final = result
