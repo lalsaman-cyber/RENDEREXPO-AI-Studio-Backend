@@ -49,3 +49,16 @@ backend.zip
 # Runtime user data
 uploads/
 
+
+# POD runtime artifacts (DO NOT COMMIT)
+CHECK_*/
+OUT_*/
+inputs/
+pass2_out/
+upscaled/
+tools/
+*.png
+*.json
+*.sh
+VOLUME_SNAPSHOT_*.txt
+openapi.json
