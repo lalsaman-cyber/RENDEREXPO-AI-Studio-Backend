@@ -1,11 +1,10 @@
 # app/routers/__init__.py
-
 """
-Central export for all FastAPI routers used in RENDEREXPO AI STUDIO.
+Central export for all FastAPI routers used in RENDEREXPO AI STUDIO (PLANNER).
 
 Each router file defines:
 - an APIRouter instance
-- one or more endpoints (skeleton or real)
+- one or more endpoints
 
 We import them here so app.main can do:
 
@@ -22,40 +21,54 @@ We import them here so app.main can do:
         product,
         floorplan,
         sketch,
+        video_between_frames,
+        video_from_image,
+        cad,
+        mesh_from_image,
     )
 
-and then:
-
-    app.include_router(text2img.router)
-    ...
+IMPORTANT:
+- This module is for PLANNER routers only.
+- Do NOT add the GPU worker dispatch router here (/api/gpu/dispatch).
+  That route belongs to the separate GPU worker service (port 8012).
 """
 
+from __future__ import annotations
+
 from . import (
-    plan,
-    text2img,
+    cad,
+    controlnet,
+    depth,
+    floorplan,
     img2img,
     jobs,
-    depth,
-    controlnet,
-    upscale,
-    vr,
+    mesh_from_image,
     moodboard,
+    plan,
     product,
-    floorplan,
-    sketch,  # <-- NEW
+    sketch,
+    text2img,
+    upscale,
+    video_between_frames,
+    video_from_image,
+    vr,
 )
 
 __all__ = [
-    "plan",
-    "text2img",
+    "cad",
+    "controlnet",
+    "depth",
+    "floorplan",
     "img2img",
     "jobs",
-    "depth",
-    "controlnet",
-    "upscale",
-    "vr",
+    "mesh_from_image",
     "moodboard",
+    "plan",
     "product",
-    "floorplan",
-    "sketch",  # <-- NEW
+    "sketch",
+    "text2img",
+    "upscale",
+    "video_between_frames",
+    "video_from_image",
+    "vr",
 ]

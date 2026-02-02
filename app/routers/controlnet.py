@@ -1,149 +1,234 @@
 # app/routers/controlnet.py
+"""
+RENDEREXPO AI STUDIO - ControlNet Planning Router (NO GPU)
+
+CRITICAL (Doc 18):
+- ControlNet planning MUST inherit the SAME locked SD3.5 presets:
+  steps, CFG, LyCORIS(PRO 2.1), GEO multipliers, resolution
+- NO denoise anywhere
+- Upscale remains optional and stored for downstream stages
+- This router is PLANNING ONLY (no inference, no GPU)
+
+Purpose:
+- Accept a conditioning image (sketch, lineart, depth, canny, etc.)
+- Store a ControlNet plan + locked preset context in meta.json
+- Allow downstream SD3.5 stages to reuse EXACT preset logic
+"""
+
+from __future__ import annotations
 
 import os
 import uuid
+import json
+import shutil
 import datetime
-from typing import Optional
+from typing import Optional, Dict, Any, Literal, Tuple
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 
-# This router is for PLANNING ControlNet-based jobs, not running them.
-router = APIRouter(
-    prefix="/api/controlnet",
-    tags=["ControlNet Planning (NO GPU)"],
-)
+from app.presets_sd35 import apply_preset_to_meta
+
+router = APIRouter(prefix="/api/controlnet", tags=["ControlNet Planning (NO GPU)"])
+
+Category = Literal["urban", "suburban", "interior", "wide_hero"]
+Shot = Literal["wide", "close"]
+ControlType = Literal["canny", "depth", "lineart", "scribble", "normal"]
 
 
-ALLOWED_CONTROL_TYPES = [
-    "canny",
-    "depth",
-    "lineart",
-    "sketch",
-    "floorplan",
-    "normal",
-]
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _today_utc_str() -> str:
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def _create_job_folder() -> str:
-    """
-    Create a new timestamped job folder under outputs/{YYYY-MM-DD}/{job_id}/.
-    """
-    today = datetime.date.today().isoformat()
+def _create_job_folder(job_type: str) -> str:
+    today = _today_utc_str()
     job_id = uuid.uuid4().hex
     folder = os.path.join("outputs", today, job_id)
     os.makedirs(folder, exist_ok=True)
+
+    try:
+        with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
+            f.write(job_type)
+    except Exception:
+        pass
+
     return folder
 
 
+def _meta_path(job_folder: str) -> str:
+    return os.path.join(job_folder, "meta.json")
+
+
+def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
+    with open(_meta_path(job_folder), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=4)
+
+
+def _parse_job_path(job_folder: str) -> Tuple[Optional[str], Optional[str]]:
+    parts = os.path.normpath(job_folder).split(os.sep)
+    if len(parts) < 3:
+        return None, None
+    return parts[-2], parts[-1]
+
+
+def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
+    """
+    Stable URLs assuming FastAPI mounts outputs/ at /outputs.
+    """
+    date_str, job_id = _parse_job_path(job_folder)
+    if not date_str or not job_id:
+        return {"control_input_url": None, "meta_url": None}
+
+    base = f"/outputs/{date_str}/{job_id}"
+    return {
+        "control_input_url": f"{base}/control_input.png",
+        "meta_url": f"{base}/meta.json",
+    }
+
+
+def _ensure_png_jpg_only(upload: UploadFile) -> None:
+    # best-effort content-type check (not fully trusted)
+    ct = (getattr(upload, "content_type", "") or "").lower().strip()
+    if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
+        raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
+
+    # filename extension check
+    name = (upload.filename or "").lower()
+    if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
+        raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
+
+
+async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
+    """
+    Save UploadFile without reading everything into RAM.
+    """
+    try:
+        try:
+            upload.file.seek(0)
+        except Exception:
+            pass
+
+        with open(dst_path, "wb") as out:
+            shutil.copyfileobj(upload.file, out)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed saving upload '{upload.filename}': {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Route
+# ---------------------------------------------------------------------------
+
 @router.post("/plan")
 async def plan_controlnet_job(
-    image: UploadFile = File(..., description="Sketch, floor plan, edge map, or line-art image."),
-    control_type: str = Form(..., description="Type of control: canny, depth, lineart, sketch, floorplan, normal."),
-    prompt: str = Form(..., description="Main text prompt for SD3.5 guided by this control."),
-    negative_prompt: Optional[str] = Form(
-        "",
-        description="Optional negative prompt.",
+    image: UploadFile = File(..., description="Conditioning image for ControlNet (PNG/JPG only)"),
+
+    control_type: ControlType = Form(
+        ...,
+        description="Type of ControlNet conditioning (canny, depth, lineart, etc.)",
     ),
     control_strength: float = Form(
         1.0,
-        description="How strongly ControlNet should influence the result (0.0–2.0 in future).",
+        ge=0.0,
+        le=2.0,
+        description="ControlNet influence strength (planning only).",
     ),
-    width: int = Form(
-        1024,
-        description="Planned output width (pixels).",
-    ),
-    height: int = Form(
-        1024,
-        description="Planned output height (pixels).",
-    ),
-    num_inference_steps: int = Form(
-        25,
-        description="Planned number of inference steps.",
-    ),
-    guidance_scale: float = Form(
-        6.0,
-        description="Planned CFG guidance scale.",
-    ),
-    seed: Optional[int] = Form(
+
+    # LOCKED PRESET SELECTORS (Doc 18)
+    category: Category = Form(..., description="urban/suburban/interior/wide_hero"),
+    shot: Shot = Form(..., description="wide/close"),
+
+    # Optional per-request upscale override
+    upscale_2x: Optional[bool] = Form(
         None,
-        description="Random seed (optional).",
+        description="Optional override: true/false. If omitted, preset default is used.",
     ),
 ):
     """
-    PLAN a ControlNet job (NO real inference, NO SD3.5 execution).
+    Plan a ControlNet conditioning job (NO GPU).
 
-    What this does:
-    - Validates control_type and basic parameters.
-    - Creates a job folder under outputs/{YYYY-MM-DD}/{job_id}/.
-    - Saves the uploaded control image as input.png.
-    - Writes meta.json with all planned settings and:
-        * type: "controlnet"
-        * mode: "skeleton-no-inference"
-
-    Later, the GPU runtime will:
-    - Read meta.json
-    - Run SD3.5 + ControlNet
-    - Save the actual output.png
+    Output:
+    - outputs/YYYY-MM-DD/<job_id>/
+        - control_input.png
+        - meta.json (includes locked SD3.5 preset context)
     """
+    if not image.filename:
+        raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
+    _ensure_png_jpg_only(image)
 
-    # 1) Validate control_type
-    if control_type not in ALLOWED_CONTROL_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid control_type '{control_type}'. "
-                   f"Allowed: {', '.join(ALLOWED_CONTROL_TYPES)}",
-        )
-
-    # 2) Validate control_strength (soft range for now)
-    if not (0.0 <= control_strength <= 2.0):
-        raise HTTPException(
-            status_code=400,
-            detail="control_strength must be between 0.0 and 2.0",
-        )
-
-    # 3) Create job folder
-    job_folder = _create_job_folder()
+    job_folder = _create_job_folder(job_type="controlnet_plan")
     job_id = os.path.basename(job_folder)
 
-    # 4) Save uploaded image as input.png
-    input_path = os.path.join(job_folder, "input.png")
-    with open(input_path, "wb") as f:
-        f.write(await image.read())
+    # Save conditioning image
+    input_path = os.path.join(job_folder, "control_input.png")
+    await _save_upload_stream(image, input_path)
 
-    # 5) Build meta data
-    meta = {
+    meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
-        "type": "controlnet",
-        "model_name": "sd3.5-large",
-        "mode": "skeleton-no-inference",
-        "control_type": control_type,
-        "control_strength": control_strength,
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "width": width,
-        "height": height,
-        "num_inference_steps": num_inference_steps,
-        "guidance_scale": guidance_scale,
-        "seed": seed,
-        "input_image": "input.png",
-        "planned_output": "output.png",
+
+        "type": "controlnet_plan",
         "status": "planned",
+        "mode_runtime": "plan-only",
+
+        # Engine identity (NO SDXL)
+        "engine": "sd35_large_pro_v2_1",
+        "model_name": "sd35_large_pro_v2_1",
+
+        # Preset selectors (Doc 18)
+        "category": category,
+        "shot": shot,
+
+        # Hard lock
+        "denoise": 0.0,
+
+        # Inputs contract
+        "inputs": {
+            "control_image": "control_input.png",
+            "content_type": getattr(image, "content_type", None),
+        },
+
+        # ControlNet planning block
+        "controlnet": {
+            "control_type": control_type,
+            "control_strength": float(control_strength),
+            "input_image": "control_input.png",
+            "note": "Planning only. ControlNet will be applied during SD3.5 inference.",
+        },
+
+        # Outputs contract (planning artifact only)
+        "outputs": {
+            "control_input": "control_input.png",
+            "meta": "meta.json",
+        },
     }
 
-    # 6) Write meta.json
-    meta_path = os.path.join(job_folder, "meta.json")
-    import json
+    # Apply locked Doc 18 preset logic (DO NOT CHANGE multipliers here)
+    try:
+        apply_preset_to_meta(
+            meta,
+            category=category,
+            shot=shot,
+            upscale_2x=upscale_2x,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
 
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
+    # Safety re-lock
+    meta["denoise"] = 0.0
+    if isinstance(meta.get("upscale"), dict):
+        meta["upscale"]["denoise"] = 0.0
 
-    # 7) Return response
+    _write_meta(job_folder, meta)
+
     return {
         "status": "ok",
-        "message": "ControlNet job planned (skeleton, no AI run yet).",
+        "message": "ControlNet job planned with locked Doc 18 presets (NO GPU).",
         "job_folder": job_folder,
-        "input_saved_as": input_path,
-        "meta_path": meta_path,
-        "planned_output_image": os.path.join(job_folder, "output.png"),
+        "meta_path": _meta_path(job_folder),
+        "public_urls": _outputs_public_urls(job_folder),
+        "control_input_saved_as": input_path,
+        "preset_applied": meta.get("preset", {}),
     }

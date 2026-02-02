@@ -23,6 +23,11 @@ HMAC SECURITY (LOCKED):
 SECRET:
 - Environment variable required:
     RENDEREXPO_HMAC_SECRET
+
+NOTE (IMPORTANT):
+- This is the PLANNER service.
+- It should NOT expose the GPU worker's /api/gpu/dispatch route.
+  That route belongs to the GPU worker service running separately (port 8012).
 """
 
 import os
@@ -33,6 +38,7 @@ from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.routers import (
     plan,
@@ -46,7 +52,11 @@ from app.routers import (
     moodboard,
     product,
     floorplan,
-    sketch,  # <-- NEW
+    sketch,
+    video_between_frames,
+    video_from_image,
+    cad,               # CAD router (REAL via GPU dispatch)
+    mesh_from_image,   # Mesh-from-image router (REAL via GPU dispatch)
 )
 
 # ---------------------------------------------------------------------------
@@ -96,7 +106,6 @@ def _compute_signature(secret: str, timestamp: str, nonce: str, body: bytes) -> 
 
 
 def _constant_time_equal(a: str, b: str) -> bool:
-    # hmac.compare_digest is constant-time comparison
     return hmac.compare_digest(a or "", b or "")
 
 
@@ -110,6 +119,9 @@ app = FastAPI(
     version="0.2.0",
 )
 
+# Serve outputs so /outputs/... URLs work (still protected by HMAC middleware)
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+
 # In-memory nonce replay cache (nonce -> expires_at_epoch)
 _NONCE_CACHE: Dict[str, int] = {}
 
@@ -121,7 +133,6 @@ async def _startup_check_secret() -> None:
     """
     secret = os.getenv(HMAC_SECRET_ENV, "")
     if not secret or len(secret.strip()) < 32:
-        # Require at least 32 chars; you will use 64+ in production.
         raise RuntimeError(
             f"Missing or too-short {HMAC_SECRET_ENV}. "
             f"Set a strong secret (64+ chars) before running the API."
@@ -201,7 +212,10 @@ async def hmac_auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# ---------------------------------------------------------------------------
 # Attach routers
+# ---------------------------------------------------------------------------
+
 app.include_router(plan.router)
 app.include_router(text2img.router)
 app.include_router(img2img.router)
@@ -213,7 +227,22 @@ app.include_router(vr.router)
 app.include_router(moodboard.router)
 app.include_router(product.router)
 app.include_router(floorplan.router)
-app.include_router(sketch.router)  # <-- NEW
+app.include_router(sketch.router)
+
+# CAD router (REAL via GPU dispatch)
+app.include_router(cad.router)
+
+# Mesh router (REAL via GPU dispatch)
+app.include_router(mesh_from_image.router)
+
+# VIDEO routers (REAL via GPU dispatch)
+app.include_router(video_between_frames.router)
+app.include_router(video_from_image.router)
+
+# IMPORTANT:
+# Do NOT include the GPU worker router here.
+# The GPU worker service (port 8012) hosts /api/gpu/dispatch.
+# app.include_router(gpu_dispatch_router)
 
 
 # ---------------------------------------------------------------------------
@@ -223,17 +252,10 @@ app.include_router(sketch.router)  # <-- NEW
 def _read_sd35_model_dir_from_config() -> str:
     """
     Very simple parser for config/model_paths.yaml to find sd35_large_dir.
+    We avoid adding extra dependencies (like PyYAML).
 
-    We avoid adding extra dependencies (like PyYAML) for this small task.
-
-    Expected line in config/model_paths.yaml:
-
+    Expected line:
         sd35_large_dir: "models/sd35-large"
-
-    We:
-    - look for a line starting with 'sd35_large_dir'
-    - split on ':'
-    - strip quotes and spaces
     """
     config_path = os.path.join("config", "model_paths.yaml")
 
@@ -245,18 +267,15 @@ def _read_sd35_model_dir_from_config() -> str:
     with open(config_path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip()
-            # Skip empty lines and comments
             if not line or line.startswith("#"):
                 continue
 
             if line.startswith("sd35_large_dir"):
-                # Example: sd35_large_dir: "models/sd35-large"
                 parts = line.split(":", 1)
                 if len(parts) != 2:
                     continue
                 value = parts[1].strip()
 
-                # Remove optional quotes
                 if value.startswith('"') and value.endswith('"'):
                     value = value[1:-1]
                 if value.startswith("'") and value.endswith("'"):
@@ -273,17 +292,13 @@ def _read_sd35_model_dir_from_config() -> str:
 
 def _list_directory_contents(path: str, max_items: int = 200) -> Dict[str, Any]:
     """
-    Return a simple listing of the given directory.
-
-    - If the directory does not exist, raise an error.
-    - Only goes ONE level deep (top-level files & folders).
+    Return a simple listing of the given directory (one level deep).
     """
     if not os.path.isdir(path):
         raise FileNotFoundError(f"Directory not found: {path}")
 
     items: List[Dict[str, Any]] = []
 
-    # List only the immediate contents (no deep recursion)
     for name in os.listdir(path):
         full_path = os.path.join(path, name)
         item_type = "dir" if os.path.isdir(full_path) else "file"
@@ -308,10 +323,9 @@ def _list_directory_contents(path: str, max_items: int = 200) -> Dict[str, Any]:
 async def root():
     """
     Simple welcome endpoint.
-
     NOTE: This endpoint is protected by HMAC (per locked policy).
     """
-    return {"message": "RENDEREXPO AI STUDIO - Internal API (HMAC protected). Use /api/health for unauthenticated health."}
+    return {"message": "RENDEREXPO AI STUDIO - PLANNER API (HMAC protected). Use /api/health for unauthenticated health."}
 
 
 @app.get("/api/health")
@@ -319,7 +333,7 @@ async def health():
     """Basic health check (the only open endpoint)."""
     return {
         "status": "ok",
-        "mode": "internal",
+        "mode": "planner",
         "details": "FastAPI is running. HMAC auth enabled on all endpoints except /api/health.",
         "timestamp_epoch": _now_epoch(),
         "ts_window_seconds": TS_WINDOW_SECONDS,
@@ -330,12 +344,6 @@ async def health():
 async def sd35_files():
     """
     List the contents of the SD3.5 model directory, based on config/model_paths.yaml.
-
-    This helps verify:
-    - The config file exists
-    - The model path is set
-    - The SD3.5 files are actually present
-
     NOTE: This endpoint is protected by HMAC.
     """
     try:

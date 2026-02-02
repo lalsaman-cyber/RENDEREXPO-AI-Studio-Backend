@@ -39,3 +39,13 @@ datasets/
 
 # Cache
 .cache/
+
+# Archives / backups
+*.zip
+*.bak*
+backend-old.zip
+backend.zip
+
+# Runtime user data
+uploads/
+
