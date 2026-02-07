@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -9,7 +9,7 @@ import requests
 # Local GPU worker URL inside the pod
 # Can be overridden with:
 #   export GPU_BASE_URL="http://127.0.0.1:8012"
-GPU_BASE_URL = os.getenv("GPU_BASE_URL", "http://127.0.0.1:8011")
+GPU_BASE_URL = os.getenv("GPU_BASE_URL", "http://127.0.0.1:8012")
 
 
 class GPUClientError(Exception):
@@ -21,16 +21,8 @@ def _normalize_job_folder(job_folder: str) -> str:
     """
     Ensure job_folder is an absolute path so the GPU runtime
     can always resolve it correctly.
-
-    Examples:
-      "outputs/2026-01-18/abcd" ->
-        "/workspace-data/RENDEREXPO-AI-Studio-Backend/outputs/2026-01-18/abcd"
-
-      "/workspace-data/.../outputs/..." ->
-        unchanged
     """
     p = Path(job_folder)
-
     if p.is_absolute():
         return str(p)
 
@@ -39,24 +31,13 @@ def _normalize_job_folder(job_folder: str) -> str:
     return str((repo_root / p).resolve())
 
 
-def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """
-    Dispatch an SD3.5 text2img job to the GPU worker.
-
-    Sends POST /api/gpu/dispatch with:
-      - job_folder (ABSOLUTE PATH)
-      - meta (meta.json contents)
-
-    Returns:
-        (ok, data)
+    Shared dispatcher to GPU worker: POST /api/gpu/dispatch
     """
     job_folder_abs = _normalize_job_folder(job_folder)
-
     url = f"{GPU_BASE_URL}/api/gpu/dispatch"
-    payload = {
-        "job_folder": job_folder_abs,
-        "meta": meta,
-    }
+    payload = {"job_folder": job_folder_abs, "meta": meta}
 
     try:
         resp = requests.post(url, json=payload, timeout=600)
@@ -87,3 +68,18 @@ def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool,
         }
 
     return True, data
+
+
+def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """Dispatch an SD3.5 text2img job to the GPU worker."""
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_sd35_img2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """Dispatch an SD3.5 img2img job to the GPU worker (same job_folder/meta contract)."""
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_sd35_inpaint(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """Dispatch an SD3.5 inpaint job to the GPU worker (same job_folder/meta contract)."""
+    return _dispatch(job_folder, meta)
