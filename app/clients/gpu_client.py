@@ -5,7 +5,6 @@ from typing import Any, Dict, Tuple
 
 import requests
 
-
 # Local GPU worker URL inside the pod
 # Can be overridden with:
 #   export GPU_BASE_URL="http://127.0.0.1:8012"
@@ -70,16 +69,22 @@ def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, An
     return True, data
 
 
+# --- SD3.5 dispatchers used by routers ---
+
 def dispatch_sd35_text2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Dispatch an SD3.5 text2img job to the GPU worker."""
     return _dispatch(job_folder, meta)
 
 
 def dispatch_sd35_img2img(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Dispatch an SD3.5 img2img job to the GPU worker (same job_folder/meta contract)."""
     return _dispatch(job_folder, meta)
 
 
 def dispatch_sd35_inpaint(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Dispatch an SD3.5 inpaint job to the GPU worker (same job_folder/meta contract)."""
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_sd35_moodboard_to_space(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Moodboard router expects this symbol. Same contract: job_folder + meta.
+    """
     return _dispatch(job_folder, meta)
