@@ -21,6 +21,8 @@ Notes:
 Safety:
 - If optional dependencies are missing (PIL/xformers), we do NOT hard-crash.
 - If LyCORIS/GEO files are missing, we log and continue with base model.
+- If LyCORIS/GEO are requested AND present but cannot be applied, we HARD-FAIL
+  (we will never silently render base when adapters are supposed to be active).
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import os
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
 
@@ -41,20 +43,46 @@ class GenerationResult:
     error: Optional[str] = None
 
 
+def _is_lycoris_checkpoint(path: str) -> bool:
+    """
+    Detect LyCORIS-style safetensors (kohya/lycoris outputs).
+    Your files are clearly lycoris_* names with lora_down/lora_up keys.
+    """
+    try:
+        from safetensors import safe_open  # type: ignore
+        with safe_open(path, framework="pt", device="cpu") as f:
+            # cheap check: look at a few keys
+            for i, k in enumerate(f.keys()):
+                lk = k.lower()
+                if lk.startswith("lycoris_"):
+                    return True
+                if i > 80:
+                    break
+    except Exception:
+        pass
+    return False
+
+
 class SD35Runtime:
     def __init__(self, mode: str = "skeleton", device: str = "cuda") -> None:
         self.mode = mode
         self.device = device
 
-        # IMPORTANT: on your pod you are using /workspace-data/models/sd35
+        # IMPORTANT: on your pod you are using /workspace-data/models/sd35-large
         self.model_path = os.getenv("SD35_MODEL_PATH", "/workspace-data/models/sd35")
 
         self.pipe: Optional[Any] = None
         self._torch: Optional[Any] = None
 
         # Track last adapters we applied so we can avoid stacking accidentally.
-        # We keep this simple: always unload before applying new adapters.
         self._active_adapters: Tuple[str, ...] = ()
+
+        # LyCORIS caching:
+        # - weights cache lets us reuse disk reads between jobs.
+        # - active networks are per-pipe instance (because module instances differ).
+        self._lyco_weights_cache: Dict[str, Dict[str, Any]] = {}
+        self._active_lyco_networks: List[Any] = []  # list[LycorisNetworkKohya]
+        self._active_lyco_paths: Tuple[str, ...] = ()
 
         logger.info(
             "SD35Runtime initialized with mode=%s, device=%s, model_path=%s",
@@ -102,7 +130,7 @@ class SD35Runtime:
 
             pipe = StableDiffusion3Pipeline.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float16,  # diffusers warns but OK; keep stable on your pod
+                torch_dtype=torch.float16,  # keep stable on your pod
             )
 
             # Prefer xformers if available (safe)
@@ -120,7 +148,6 @@ class SD35Runtime:
                 except Exception:
                     logger.info("Model CPU offload not available; continuing without it.")
             else:
-                # Standard .to(cuda) if offload not enabled
                 pipe = pipe.to(self.device)
 
             self.pipe = pipe
@@ -132,6 +159,11 @@ class SD35Runtime:
 
     def unload(self) -> None:
         logger.info("Unloading SD35Runtime ...")
+        try:
+            self._safe_unload_adapters()
+        except Exception:
+            pass
+
         self._active_adapters = ()
         self.pipe = None
 
@@ -147,14 +179,41 @@ class SD35Runtime:
     # Adapter (LyCORIS + GEO) handling
     # ------------------------------------------------------------------
 
-    def _safe_unload_loras(self) -> None:
+    def _safe_unload_adapters(self) -> None:
+        """
+        Restores LyCORIS networks (prevents stacking across jobs),
+        and unloads any diffusers LoRA adapters if they were ever used.
+        """
         if self.pipe is None:
             return
+
+        # 1) Restore LyCORIS networks (this is the real, required part)
+        if self._active_lyco_networks:
+            te_list = self._get_text_encoders(self.pipe)
+            unet_like = self._get_unet_like(self.pipe)
+            for net in self._active_lyco_networks:
+                try:
+                    # common signature: restore(text_encoder, unet)
+                    net.restore(te_list, unet_like)
+                except TypeError:
+                    # some variants: restore(unet)
+                    try:
+                        net.restore(unet_like)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        self._active_lyco_networks = []
+        self._active_lyco_paths = ()
+
+        # 2) Best-effort: unload diffusers LoRA if present (safe no-op)
         try:
             if hasattr(self.pipe, "unload_lora_weights"):
                 self.pipe.unload_lora_weights()
         except Exception:
             pass
+
         self._active_adapters = ()
 
     def _resolve_weight_path(self, p: str) -> str:
@@ -171,36 +230,67 @@ class SD35Runtime:
         We expect:
           meta["lora_config"] -> LyCORIS PRO 2.1
           meta["geo_config"]  -> GEO
-
-        Both are optional but for Doc 18 presets they SHOULD be present.
         """
         lora_cfg = meta.get("lora_config") if isinstance(meta.get("lora_config"), dict) else None
         geo_cfg = meta.get("geo_config") if isinstance(meta.get("geo_config"), dict) else None
         return lora_cfg, geo_cfg
 
+    def _get_text_encoders(self, pipe: Any) -> List[Any]:
+        te: List[Any] = []
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            te.append(pipe.text_encoder)
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            te.append(pipe.text_encoder_2)
+        if hasattr(pipe, "text_encoder_3") and pipe.text_encoder_3 is not None:
+            te.append(pipe.text_encoder_3)
+        return te
+
+    def _get_unet_like(self, pipe: Any) -> Any:
+        # StableDiffusion3Pipeline uses `transformer` (SD3Transformer2DModel)
+        if hasattr(pipe, "transformer") and pipe.transformer is not None:
+            return pipe.transformer
+        raise RuntimeError("SD3 pipeline missing pipe.transformer (cannot apply LyCORIS).")
+
+    def _load_lycoris_weights_sd(self, path: str) -> Dict[str, Any]:
+        """
+        Cache safetensors state dict on CPU to avoid repeated disk reads.
+        """
+        if path in self._lyco_weights_cache:
+            return self._lyco_weights_cache[path]
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".safetensors":
+            from safetensors.torch import load_file  # type: ignore
+            sd = load_file(path)
+        else:
+            # fallback (rare)
+            import torch  # type: ignore
+            sd = torch.load(path, map_location="cpu")
+
+        self._lyco_weights_cache[path] = sd
+        return sd
+
     def _apply_locked_adapters(self, meta: Dict[str, Any]) -> None:
         """
-        Apply LyCORIS (PRO 2.1) + GEO adapters using diffusers LoRA APIs.
+        Apply LyCORIS (PRO 2.1) + GEO adapters using LyCORIS kohya runtime.
 
-        We treat GEO as a second adapter using the same LoRA loading mechanism.
-        This keeps the system consistent and makes it easy to reuse everywhere.
-
-        If your GEO implementation later becomes ControlNet/other, you can swap
-        this function while keeping meta contract stable.
+        IMPORTANT:
+        - Your .safetensors are LyCORIS-format outputs.
+        - We DO NOT use diffusers.load_lora_weights() for these.
+        - SD3 uses pipe.transformer (not pipe.unet).
         """
         if self.pipe is None:
             return
 
         lora_cfg, geo_cfg = self._extract_adapter_cfg(meta)
 
-        # If nothing to apply: unload and return
+        # If nothing to apply: restore/unload and return
         if not lora_cfg and not geo_cfg:
-            self._safe_unload_loras()
+            self._safe_unload_adapters()
             meta["adapters_applied"] = False
             meta["adapters_reason"] = "no_lora_or_geo_config"
             return
 
-        # Resolve + validate paths and weights
         adapters: list[Tuple[str, str, float]] = []  # (name, path, weight)
 
         def _pull(cfg: Dict[str, Any], default_name: str) -> Optional[Tuple[str, str, float]]:
@@ -224,7 +314,6 @@ class SD35Runtime:
             if w_f > 2.0:
                 w_f = 2.0
 
-            # Build stable name
             label = cfg.get("label") or default_name
             name = f"renderexpo_{label}_{os.path.basename(path).replace('.', '_')}"
             return (name, path, w_f)
@@ -237,67 +326,92 @@ class SD35Runtime:
         if g:
             adapters.append(g)
 
-        # If after validation nothing remains, unload and return
+        # If requested but files missing -> continue base (per safety note)
         if not adapters:
-            self._safe_unload_loras()
+            self._safe_unload_adapters()
             meta["adapters_applied"] = False
             meta["adapters_reason"] = "files_missing_or_zero_weight"
             return
 
-        # Always unload first to prevent stacking
-        self._safe_unload_loras()
+        # Always restore/unload first to prevent stacking
+        self._safe_unload_adapters()
 
-        # Apply
+        # Apply via LyCORIS
         try:
-            # Newer diffusers supports multi-adapter w/ set_adapters
-            if hasattr(self.pipe, "set_adapters"):
-                for (name, path, _w) in adapters:
-                    # adapter_name supported in newer versions
-                    try:
-                        self.pipe.load_lora_weights(path, adapter_name=name)
-                    except TypeError:
-                        # older signature
-                        self.pipe.load_lora_weights(path)
+            import lycoris.kohya as lk  # type: ignore
 
-                names = [a[0] for a in adapters]
-                weights = [a[2] for a in adapters]
+            te_list = self._get_text_encoders(self.pipe)
+            unet_like = self._get_unet_like(self.pipe)
+            vae = getattr(self.pipe, "vae", None)
 
+            applied_info = []
+            active_nets: List[Any] = []
+            active_paths: List[str] = []
+
+            for (name, path, weight) in adapters:
+                # sanity guard
+                if not _is_lycoris_checkpoint(path):
+                    # You told me: you are not interested in vanilla LoRA.
+                    # If something isn't LyCORIS here, we fail loudly.
+                    raise ValueError(f"Adapter is not detected as LyCORIS: {os.path.basename(path)}")
+
+                weights_sd = self._load_lycoris_weights_sd(path)
+
+                # build a new network bound to THIS pipe's modules
+                net = lk.create_network_from_weights(
+                    multiplier=weight,
+                    file=path,
+                    vae=vae,
+                    text_encoder=te_list,    # list supported in your lycoris build
+                    unet=unet_like,          # SD3 transformer goes here
+                    weights_sd=weights_sd,
+                    for_inference=True,
+                )
+
+                # attach onto modules
                 try:
-                    self.pipe.set_adapters(names, adapter_weights=weights)
+                    net.apply_to(te_list, unet_like)
+                except TypeError:
+                    # fallback signature
+                    net.apply_to(te_list[0] if te_list else None, unet_like)
+
+                # activate
+                try:
+                    net.apply()
                 except Exception:
-                    # Some variants accept singular name; try fallback
-                    if len(names) == 1:
-                        try:
-                            self.pipe.set_adapters(names[0], adapter_weights=weights[0])
-                        except Exception:
-                            pass
+                    pass
 
-            else:
-                # Old API: load one then fuse; we do best-effort sequentially.
-                # Note: this is less ideal for true multi-adapter.
-                for (name, path, w) in adapters:
-                    self.pipe.load_lora_weights(path)
-                    if hasattr(self.pipe, "fuse_lora"):
-                        try:
-                            self.pipe.fuse_lora(lora_scale=w)
-                        except Exception:
-                            pass
+                # ensure multiplier is exactly what preset wants (for transparency)
+                try:
+                    net.set_multiplier(weight)
+                except Exception:
+                    pass
 
+                active_nets.append(net)
+                active_paths.append(path)
+                applied_info.append({"name": name, "path": path, "weight": weight})
+
+                logger.info("Applied LyCORIS adapter: %s (weight=%.6f)", path, weight)
+
+            self._active_lyco_networks = active_nets
+            self._active_lyco_paths = tuple(active_paths)
             self._active_adapters = tuple([a[0] for a in adapters])
 
             meta["adapters_applied"] = True
-            meta["adapters"] = [
-                {"name": a[0], "path": a[1], "weight": a[2]} for a in adapters
-            ]
+            meta["adapters_reason"] = "applied_lycoris"
+            meta["adapters"] = applied_info
 
             logger.info(
-                "Applied adapters: %s",
-                ", ".join([f"{a[0]}(w={a[2]:.4f})" for a in adapters]),
+                "Applied LyCORIS adapters: %s",
+                ", ".join([f"{a['name']}(w={a['weight']:.6f})" for a in applied_info]),
             )
+
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to apply adapters: %s", exc)
+            # HARD FAIL (no silent base render)
+            logger.exception("Failed to apply LyCORIS adapters: %s", exc)
             meta["adapters_applied"] = False
-            meta["adapters_reason"] = f"apply_failed: {exc}"
+            meta["adapters_reason"] = f"apply_failed_lycoris: {exc}"
+            raise
 
     # ------------------------------------------------------------------
     # Detail Pass (post-process)
@@ -471,13 +585,12 @@ class SD35Runtime:
         # Optional post detail pass (safe)
         image = self._detail_pass_if_enabled(image, meta)
 
-        # Save base output first (always 1024x1024 or preset size)
+        # Save base output first
         os.makedirs(job_folder, exist_ok=True)
         base_out = os.path.join(job_folder, "output_base.png")
         try:
             image.save(base_out)
         except Exception:
-            # If base save fails, still try final output
             pass
 
         # Optional deterministic upscale (no denoise)
@@ -538,11 +651,10 @@ class SD35Runtime:
         num_steps = int(meta.get("num_inference_steps", 46))
         guidance_scale = float(meta.get("guidance_scale", 5.6))
 
-        # Apply locked adapters (LyCORIS + GEO)
+        # Apply locked adapters (LyCORIS + GEO) to the main pipe context
         self._apply_locked_adapters(meta)
 
-        # Try to build an Img2Img pipeline from the loaded components if possible.
-        # If not available in this diffusers version, fail clearly.
+        # Try to build an Img2Img pipeline
         try:
             from diffusers import StableDiffusion3Img2ImgPipeline  # type: ignore
         except Exception as exc:  # noqa: BLE001
@@ -551,13 +663,13 @@ class SD35Runtime:
                 "Upgrade diffusers or keep img2img skeleton for now."
             ) from exc
 
-        # Construct img2img pipe from same pretrained (keeps consistent weights)
         import torch  # type: ignore
+
         img_pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(
             self.model_path,
             torch_dtype=torch.float16,
         )
-        # Offload settings
+
         if os.getenv("SD35_ENABLE_CPU_OFFLOAD", "0").strip().lower() in ("1", "true", "yes", "on"):
             try:
                 img_pipe.enable_model_cpu_offload()
@@ -566,79 +678,83 @@ class SD35Runtime:
         else:
             img_pipe = img_pipe.to(self.device)
 
-        # Apply xformers if available
         try:
             img_pipe.enable_xformers_memory_efficient_attention()
         except Exception:
             pass
 
-        # Apply adapters onto img_pipe too (same meta contract)
-        self.pipe, old_pipe = img_pipe, self.pipe
+        # Apply LyCORIS adapters to img_pipe too (same meta contract), run, then restore
+        old_pipe = self.pipe
         try:
+            self.pipe = img_pipe
             self._apply_locked_adapters(meta)
-        finally:
-            # restore self.pipe back to text2img pipe so runtime stays consistent
-            self.pipe = old_pipe
 
-        seed = meta.get("seed")
-        generator = None
-        if seed is not None:
+            seed = meta.get("seed")
+            generator = None
+            if seed is not None:
+                try:
+                    generator = torch.Generator(device=self.device).manual_seed(int(seed))
+                except Exception:
+                    generator = None
+
+            logger.info(
+                "SD3.5 img2img: strength=%.3f w=%d h=%d steps=%d cfg=%.3f seed=%s prompt='%s'",
+                strength,
+                width,
+                height,
+                num_steps,
+                guidance_scale,
+                seed,
+                prompt[:140],
+            )
+
+            init_image = Image.open(input_path).convert("RGB")
+            if init_image.size != (width, height):
+                init_image = init_image.resize((width, height), Image.LANCZOS)
+
+            kwargs: Dict[str, Any] = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "image": init_image,
+                "strength": strength,
+                "num_inference_steps": num_steps,
+                "guidance_scale": guidance_scale,
+            }
+            if generator is not None:
+                kwargs["generator"] = generator
+
+            images = img_pipe(**kwargs).images
+            if not images:
+                raise RuntimeError("SD3.5 img2img pipeline returned no images.")
+
+            image = images[0]
+            image = self._detail_pass_if_enabled(image, meta)
+
+            os.makedirs(job_folder, exist_ok=True)
+            base_out = os.path.join(job_folder, "output_base.png")
             try:
-                generator = torch.Generator(device=self.device).manual_seed(int(seed))
+                image.save(base_out)
             except Exception:
-                generator = None
+                pass
 
-        logger.info(
-            "SD3.5 img2img: strength=%.3f w=%d h=%d steps=%d cfg=%.3f seed=%s prompt='%s'",
-            strength,
-            width,
-            height,
-            num_steps,
-            guidance_scale,
-            seed,
-            prompt[:140],
-        )
+            image = self._upscale_if_enabled(image, meta)
 
-        init_image = Image.open(input_path).convert("RGB")
-        if init_image.size != (width, height):
-            # keep deterministic resize for now (no denoise)
-            init_image = init_image.resize((width, height), Image.LANCZOS)
+            out_path = os.path.join(job_folder, "output.png")
+            image.save(out_path)
 
-        kwargs: Dict[str, Any] = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "image": init_image,
-            "strength": strength,
-            "num_inference_steps": num_steps,
-            "guidance_scale": guidance_scale,
-        }
-        if generator is not None:
-            kwargs["generator"] = generator
+            meta["status"] = "completed"
+            meta["completed_at"] = datetime.utcnow().isoformat()
+            meta["mode"] = "real-sd35"
+            meta["output_image"] = "output.png"
+            meta["output_base_image"] = "output_base.png"
 
-        images = img_pipe(**kwargs).images
-        if not images:
-            raise RuntimeError("SD3.5 img2img pipeline returned no images.")
+            logger.info("SD3.5 img2img completed. Saved to %s", out_path)
+            return meta
 
-        image = images[0]
-        image = self._detail_pass_if_enabled(image, meta)
-
-        os.makedirs(job_folder, exist_ok=True)
-        base_out = os.path.join(job_folder, "output_base.png")
-        try:
-            image.save(base_out)
-        except Exception:
-            pass
-
-        image = self._upscale_if_enabled(image, meta)
-
-        out_path = os.path.join(job_folder, "output.png")
-        image.save(out_path)
-
-        meta["status"] = "completed"
-        meta["completed_at"] = datetime.utcnow().isoformat()
-        meta["mode"] = "real-sd35"
-        meta["output_image"] = "output.png"
-        meta["output_base_image"] = "output_base.png"
-
-        logger.info("SD3.5 img2img completed. Saved to %s", out_path)
-        return meta
+        finally:
+            # restore/cleanup adapters on img_pipe then return runtime pipe
+            try:
+                self._safe_unload_adapters()
+            except Exception:
+                pass
+            self.pipe = old_pipe
