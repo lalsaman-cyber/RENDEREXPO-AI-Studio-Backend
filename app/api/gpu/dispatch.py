@@ -40,7 +40,6 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # SD3.5 + Upscale runners (REAL)
 # -----------------------------
-# You must have these implemented as REAL runners that write real files + return paths.
 from app.gpu.sd35 import run_sd35_txt2img, run_sd35_img2img
 from app.gpu.upscale import run_upscale_2x
 
@@ -76,8 +75,9 @@ router = APIRouter(prefix="/api/gpu", tags=["GPU Dispatch"])
 # ---------------------------------------------------------------------------
 
 JobType = Literal[
-    # SD35
-    "sd35_txt2img",
+    # SD35 (support both legacy + planner naming)
+    "sd35_txt2img",     # legacy
+    "sd35_text2img",    # planner uses this
     "sd35_img2img",
     # Upscale
     "upscale_2x",
@@ -208,8 +208,8 @@ def _route_key(job_type: str, vr_mode: Optional[str], pipeline_key: Optional[str
     if job_type == "mesh_from_image":
         return "mesh::from_image"
 
-    if job_type == "sd35_txt2img":
-        return "sd35::txt2img"
+    if job_type in ("sd35_txt2img", "sd35_text2img"):
+        return "sd35::text2img"
 
     if job_type == "sd35_img2img":
         return "sd35::img2img"
@@ -227,23 +227,70 @@ def _ensure_meta_exists(job_folder: str) -> None:
 
 def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
     """
-    Respect PRO 2.1 + locked multipliers:
-      PRO=0.05, GEO=0.010 default unless planner internally changes intentionally.
-    Clients must NOT be able to push unsafe values.
+    Enforce LyCORIS + GEO multipliers using the SAME fields the planner writes:
+
+      meta["lora_config"]["strength"/"scale"]    (LyCORIS PRO 2.1)
+      meta["geo_config"]["strength"/"scale"]     (GEO)
+      meta["preset"]["lycoris_multiplier"/"geo_multiplier"] (mirror)
+
+    Safety band:
+      LyCORIS: 0.0 .. 0.20
+      GEO:     0.0 .. 0.05
     """
-    # Pull from meta if present (planner-controlled), else lock defaults here.
-    pro = float(meta.get("pro_weight", 0.05))
-    geo = float(meta.get("geo_weight", 0.010))
+    # Defaults (Doc 18 baseline)
+    default_ly = 0.05
+    default_ge = 0.01
 
-    # Hard safety band (prevents sabotage / accidental blowups)
-    # (You can tighten further later, but this is safe and consistent.)
-    if not (0.0 < pro <= 0.20):
-        raise RuntimeError(f"Invalid PRO multiplier: {pro}. Allowed: (0, 0.20].")
-    if not (0.0 <= geo <= 0.05):
-        raise RuntimeError(f"Invalid GEO multiplier: {geo}. Allowed: [0, 0.05].")
+    lora_cfg = meta.get("lora_config") if isinstance(meta.get("lora_config"), dict) else None
+    geo_cfg = meta.get("geo_config") if isinstance(meta.get("geo_config"), dict) else None
+    preset = meta.get("preset") if isinstance(meta.get("preset"), dict) else None
 
-    meta["pro_weight"] = pro
-    meta["geo_weight"] = geo
+    # Pull values from planner fields (prefer explicit strength, fallback scale, fallback preset)
+    ly_val = None
+    ge_val = None
+
+    if isinstance(lora_cfg, dict):
+        ly_val = lora_cfg.get("strength", lora_cfg.get("scale"))
+    if ly_val is None and isinstance(preset, dict):
+        ly_val = preset.get("lycoris_multiplier")
+
+    if isinstance(geo_cfg, dict):
+        ge_val = geo_cfg.get("strength", geo_cfg.get("scale"))
+    if ge_val is None and isinstance(preset, dict):
+        ge_val = preset.get("geo_multiplier")
+
+    # If missing entirely, lock to defaults
+    try:
+        ly = float(default_ly if ly_val is None else ly_val)
+    except Exception:
+        ly = float(default_ly)
+
+    try:
+        ge = float(default_ge if ge_val is None else ge_val)
+    except Exception:
+        ge = float(default_ge)
+
+    # Clamp/validate hard safety band
+    if not (0.0 <= ly <= 0.20):
+        raise RuntimeError(f"Invalid LyCORIS multiplier: {ly}. Allowed: [0.0, 0.20].")
+    if not (0.0 <= ge <= 0.05):
+        raise RuntimeError(f"Invalid GEO multiplier: {ge}. Allowed: [0.0, 0.05].")
+
+    # Write back normalized values so runners always see clean numbers
+    if isinstance(lora_cfg, dict):
+        lora_cfg["strength"] = ly
+        lora_cfg["scale"] = ly
+        meta["lora_config"] = lora_cfg
+
+    if isinstance(geo_cfg, dict):
+        geo_cfg["strength"] = ge
+        geo_cfg["scale"] = ge
+        meta["geo_config"] = geo_cfg
+
+    if isinstance(preset, dict):
+        preset["lycoris_multiplier"] = ly
+        preset["geo_multiplier"] = ge
+        meta["preset"] = preset
 
 
 def _require_file(job_folder: str, *names: str, err: str) -> str:
@@ -263,7 +310,6 @@ def _assert_artifact_exists(path: Any, description: str) -> None:
         raise RuntimeError(f"{description} did not return a valid path.")
     if not os.path.isfile(path):
         raise RuntimeError(f"{description} path does not exist on disk: {path}")
-    # Prevent "empty file" success
     if os.path.getsize(path) < 1024:
         raise RuntimeError(f"{description} output file is too small / invalid: {path}")
 
@@ -295,35 +341,30 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
         _write_meta(job_folder, meta)
 
     try:
-        # Always re-read meta right before execution (disk is truth)
         with lock:
             meta = _read_meta(job_folder)
 
         # Enforce locked multipliers for SD35-related work
-        if job_type in ("sd35_txt2img", "sd35_img2img", "upscale_2x"):
+        if job_type in ("sd35_txt2img", "sd35_text2img", "sd35_img2img", "upscale_2x"):
             with lock:
                 _enforce_locked_multipliers(meta)
                 _write_meta(job_folder, meta)
 
         # ---------------- SD35 ----------------
-        if job_type == "sd35_txt2img":
-            # Requirements: prompt must exist in meta (planner writes it)
+        if job_type in ("sd35_txt2img", "sd35_text2img"):
             prompt = meta.get("prompt")
             if not prompt or not isinstance(prompt, str):
-                raise RuntimeError("sd35_txt2img requires meta.prompt (string).")
+                raise RuntimeError("sd35_text2img requires meta.prompt (string).")
 
-            # Optional: negative_prompt, seed, profile, width, height, etc are read by runner
             result_path = run_sd35_txt2img(
-                job={"date": meta.get("date"), "job_id": meta.get("job_id")},  # runner may ignore
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
             )
-            _assert_artifact_exists(result_path, "SD35 txt2img")
+            _assert_artifact_exists(result_path, "SD35 text2img")
 
             result = {"output_png": result_path}
 
         elif job_type == "sd35_img2img":
-            # Requires input image path inside job folder (planner must place it or reference existing output)
-            # Accept common names:
             input_path = None
             for n in ("ref_input.png", "input.png", "image.png", "output.png"):
                 p = os.path.join(job_folder, n)
@@ -331,13 +372,14 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                     input_path = p
                     break
             if not input_path:
-                raise RuntimeError("sd35_img2img requires one of: ref_input.png, input.png, image.png, output.png inside job_folder.")
+                raise RuntimeError(
+                    "sd35_img2img requires one of: ref_input.png, input.png, image.png, output.png inside job_folder."
+                )
 
             prompt = meta.get("prompt")
             if not prompt or not isinstance(prompt, str):
                 raise RuntimeError("sd35_img2img requires meta.prompt (string).")
 
-            # Pass2 refine must not invent: runner will enforce denoise/steps defaults unless planner passes intentionally
             payload = {**meta, "job_folder": job_folder, "input_image": input_path}
             result_path = run_sd35_img2img(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
@@ -349,7 +391,6 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
 
         # ---------------- UPSCALE ----------------
         elif job_type == "upscale_2x":
-            # Requires something to upscale. Prefer refine.png -> output.png -> image.png
             inp = None
             for n in ("refine.png", "output.png", "image.png", "input.png"):
                 p = os.path.join(job_folder, n)
@@ -357,7 +398,9 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                     inp = p
                     break
             if not inp:
-                raise RuntimeError("upscale_2x requires one of: refine.png, output.png, image.png, input.png in job_folder.")
+                raise RuntimeError(
+                    "upscale_2x requires one of: refine.png, output.png, image.png, input.png in job_folder."
+                )
 
             payload = {**meta, "job_folder": job_folder, "input_image": inp}
             result_path = run_upscale_2x(job={"date": meta.get("date"), "job_id": meta.get("job_id")}, payload=payload)
@@ -395,7 +438,6 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
         else:
             raise RuntimeError(f"Unsupported job_type: {job_type}")
 
-        # Mark completed only after we have real outputs
         with lock:
             meta2 = _read_meta(job_folder) or meta
             meta2["status"] = "completed"
@@ -423,22 +465,19 @@ async def dispatch(request: GPUDispatchRequest):
     _ensure_job_folder(request.job_folder)
     _ensure_meta_exists(request.job_folder)
 
-    # Read disk meta and merge planner meta (planner meta wins for declared fields)
     lock = _get_job_lock(request.job_folder)
     with lock:
         disk_meta = _read_meta(request.job_folder)
         if not isinstance(disk_meta, dict):
             disk_meta = {}
+
         # Merge: disk -> request.meta (planner wins)
         merged_meta = {**disk_meta, **(request.meta or {})}
 
-        # Ensure job_folder recorded
         merged_meta["job_folder"] = request.job_folder
 
-        # If planner didn’t set job_id/date, derive deterministically
         merged_meta.setdefault("job_id", os.path.basename(request.job_folder.rstrip("/")))
         parent = os.path.basename(os.path.dirname(request.job_folder.rstrip("/")))
-        # parent might be date folder; keep if it matches YYYY-MM-DD roughly
         if isinstance(parent, str) and len(parent) == 10 and parent[4] == "-" and parent[7] == "-":
             merged_meta.setdefault("date", parent)
 
@@ -446,13 +485,14 @@ async def dispatch(request: GPUDispatchRequest):
 
     # ---------------- Fail-early validations ----------------
 
-    # VR
     if request.job_type == "vr_reconstruct":
         vr_mode = request.vr_mode or merged_meta.get("vr_mode")
         if vr_mode not in ("gaussian_splat", "nerf", "mesh"):
-            raise HTTPException(status_code=400, detail="vr_mode is required for vr_reconstruct (gaussian_splat|nerf|mesh).")
+            raise HTTPException(
+                status_code=400,
+                detail="vr_mode is required for vr_reconstruct (gaussian_splat|nerf|mesh).",
+            )
 
-    # video_between_frames
     if request.job_type == "video_between_frames":
         first_a = os.path.join(request.job_folder, "first.png")
         last_a = os.path.join(request.job_folder, "last.png")
@@ -464,13 +504,11 @@ async def dispatch(request: GPUDispatchRequest):
                 detail="video_between_frames requires first.png+last.png or frame_start.png+frame_end.png in job_folder.",
             )
 
-    # video_from_image
     if request.job_type == "video_from_image":
         img = os.path.join(request.job_folder, "image.png")
         if not os.path.isfile(img):
             raise HTTPException(status_code=400, detail="video_from_image requires image.png in job_folder.")
 
-    # CAD
     if request.job_type == "cad_from_image":
         _require_file(
             request.job_folder,
@@ -479,28 +517,26 @@ async def dispatch(request: GPUDispatchRequest):
             err="cad_from_image requires input.png or image.png in job_folder.",
         )
 
-    # Mesh
     if request.job_type == "mesh_from_image":
         img = os.path.join(request.job_folder, "image.png")
         if not os.path.isfile(img):
             raise HTTPException(status_code=400, detail="mesh_from_image requires image.png in job_folder.")
 
-    # SD35 txt2img
-    if request.job_type == "sd35_txt2img":
+    if request.job_type in ("sd35_txt2img", "sd35_text2img"):
         if not merged_meta.get("prompt"):
-            raise HTTPException(status_code=400, detail="sd35_txt2img requires meta.prompt (string).")
-        # Enforce locked multipliers now so bad values fail fast
+            raise HTTPException(status_code=400, detail="sd35_text2img requires meta.prompt (string).")
         try:
             _enforce_locked_multipliers(merged_meta)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    # SD35 img2img
     if request.job_type == "sd35_img2img":
         if not merged_meta.get("prompt"):
             raise HTTPException(status_code=400, detail="sd35_img2img requires meta.prompt (string).")
-        # must have some input image in folder
-        has_input = any(os.path.isfile(os.path.join(request.job_folder, n)) for n in ("ref_input.png", "input.png", "image.png", "output.png"))
+        has_input = any(
+            os.path.isfile(os.path.join(request.job_folder, n))
+            for n in ("ref_input.png", "input.png", "image.png", "output.png")
+        )
         if not has_input:
             raise HTTPException(
                 status_code=400,
@@ -511,9 +547,11 @@ async def dispatch(request: GPUDispatchRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    # Upscale 2x
     if request.job_type == "upscale_2x":
-        has_input = any(os.path.isfile(os.path.join(request.job_folder, n)) for n in ("refine.png", "output.png", "image.png", "input.png"))
+        has_input = any(
+            os.path.isfile(os.path.join(request.job_folder, n))
+            for n in ("refine.png", "output.png", "image.png", "input.png")
+        )
         if not has_input:
             raise HTTPException(
                 status_code=400,
@@ -530,7 +568,15 @@ async def dispatch(request: GPUDispatchRequest):
         _safe_set(meta, "dispatch.run_id", run_id)
         _safe_set(meta, "dispatch.accepted_at_epoch", _now_epoch())
         _safe_set(meta, "dispatch.job_type", request.job_type)
-        _safe_set(meta, "dispatch.route", _route_key(request.job_type, request.vr_mode or meta.get("vr_mode"), request.pipeline_key or meta.get("pipeline_key")))
+        _safe_set(
+            meta,
+            "dispatch.route",
+            _route_key(
+                request.job_type,
+                request.vr_mode or meta.get("vr_mode"),
+                request.pipeline_key or meta.get("pipeline_key"),
+            ),
+        )
         _write_meta(request.job_folder, meta)
 
     t = threading.Thread(

@@ -1,4 +1,3 @@
-# app/routers/sd35.py
 """
 SD3.5 endpoints for RENDEREXPO AI STUDIO (Planner).
 
@@ -10,6 +9,9 @@ CRITICAL:
 Wix-friendly:
 - /api/sd35/render-form        (prompt-only via multipart/form-data)
 - /api/sd35/render-from-image  (prompt+image via multipart/form-data)
+
+JSON-friendly:
+- /api/sd35/render             (application/json)
 
 Env:
 - GPU_WORKER_URL default http://127.0.0.1:8012/api/gpu/dispatch
@@ -29,7 +31,7 @@ from datetime import datetime
 from typing import Optional, Any, Dict, Literal, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Body
 
 from app.presets_sd35 import apply_preset_to_meta
 
@@ -150,10 +152,9 @@ def _dispatch_to_gpu(job_type: str, job_folder_rel: str, meta: Dict[str, Any]) -
     url = _gpu_worker_url()
 
     payload = {
-        "job_type": job_type,                 # required by dispatcher
-        "job_folder": _abs(job_folder_rel),   # required by dispatcher
+        "job_type": job_type,
+        "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        # explicit routing key (consistent pattern with other services)
         "pipeline_key": f"sd35::{job_type}",
     }
 
@@ -200,31 +201,97 @@ def _ensure_image_type(upload: UploadFile) -> None:
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
 
 
+def _apply_override_to_meta(meta: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """
+    STRICT override handling:
+    - Accept override object: payload["override"] = {"lycoris_multiplier": x, "geo_multiplier": y}
+    - Or accept top-level keys: payload["lycoris_multiplier"], payload["geo_multiplier"]
+    - Applies even if value == 0.0
+    - Records raw + resolved values for audit.
+    """
+    override = payload.get("override")
+    ly = None
+    ge = None
+
+    if isinstance(override, dict):
+        ly = override.get("lycoris_multiplier")
+        ge = override.get("geo_multiplier")
+
+    if ly is None:
+        ly = payload.get("lycoris_multiplier")
+    if ge is None:
+        ge = payload.get("geo_multiplier")
+
+    # Store raw + resolved for transparency
+    meta["override_received_raw"] = override
+    meta["override_resolved"] = {
+        "lycoris_multiplier": ly,
+        "geo_multiplier": ge,
+    }
+
+    applied_any = False
+
+    if ly is not None:
+        ly_f = float(ly)
+        if isinstance(meta.get("lora_config"), dict):
+            meta["lora_config"]["strength"] = ly_f
+            meta["lora_config"]["scale"] = ly_f
+            applied_any = True
+        if isinstance(meta.get("preset"), dict):
+            meta["preset"]["lycoris_multiplier"] = ly_f
+
+    if ge is not None:
+        ge_f = float(ge)
+        if isinstance(meta.get("geo_config"), dict):
+            meta["geo_config"]["strength"] = ge_f
+            meta["geo_config"]["scale"] = ge_f
+            applied_any = True
+        if isinstance(meta.get("preset"), dict):
+            meta["preset"]["geo_multiplier"] = ge_f
+
+    meta["override_applied"] = {
+        "lycoris_multiplier": float(ly) if ly is not None else None,
+        "geo_multiplier": float(ge) if ge is not None else None,
+        "applied": bool(applied_any),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("/render-form")
-async def sd35_render_form(
-    prompt: str = Form(..., description="Main prompt for SD3.5"),
-    negative_prompt: Optional[str] = Form(None),
-
-    category: Category = Form(...),
-    shot: Shot = Form(...),
-
-    upscale_2x: Optional[bool] = Form(None),
-    seed: Optional[int] = Form(None),
-
-    style_preset: Optional[str] = Form(None),
-    material_preset: Optional[str] = Form(None),
-    lighting_preset: Optional[str] = Form(None),
-):
+@router.post("/render")
+async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
     """
-    Text2Img (multipart/form-data):
+    Text2Img (application/json):
     - Create job folder
     - Write meta.json WITH locked presets
+    - Optional override for LyCORIS/GEO multipliers (A/B testing)
     - Dispatch to GPU worker -> REAL SD3.5
     """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object/dict")
+
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing prompt")
+
+    negative_prompt = (payload.get("negative_prompt") or "").strip()
+
+    category = payload.get("category")
+    shot = payload.get("shot")
+    if category not in ("urban", "suburban", "interior", "wide_hero"):
+        raise HTTPException(status_code=400, detail="Invalid category")
+    if shot not in ("wide", "close"):
+        raise HTTPException(status_code=400, detail="Invalid shot")
+
+    upscale_2x = payload.get("upscale_2x")
+    seed = payload.get("seed")
+
+    style_preset = payload.get("style_preset")
+    material_preset = payload.get("material_preset")
+    lighting_preset = payload.get("lighting_preset")
+
     job_folder = _create_job_folder(job_type="sd35_text2img")
     job_id = os.path.basename(job_folder)
     public_urls = _outputs_public_urls(job_folder)
@@ -241,7 +308,7 @@ async def sd35_render_form(
 
         "prompt": prompt,
         "negative_prompt": negative_prompt,
-        "seed": final_seed,
+        "seed": int(final_seed),
 
         "style_preset": style_preset,
         "material_preset": material_preset,
@@ -250,7 +317,6 @@ async def sd35_render_form(
         "category": category,
         "shot": shot,
 
-        # Hard lock: no denoise anywhere
         "denoise": 0.0,
 
         "status": "queued",
@@ -282,12 +348,142 @@ async def sd35_render_form(
     if isinstance(meta.get("upscale"), dict):
         meta["upscale"]["denoise"] = 0.0
 
+    # STRICT override (supports 0.0)
+    _apply_override_to_meta(meta, payload)
+
     meta_path = _save_meta(job_folder, meta)
 
     try:
         gpu_resp = _dispatch_to_gpu("sd35_text2img", job_folder, meta)
 
-        # persist dispatch info (best effort)
+        try:
+            meta["status"] = "dispatched"
+            meta["dispatch"]["dispatched_at"] = datetime.utcnow().isoformat()
+            meta["dispatch"]["gpu_response"] = gpu_resp
+            _save_meta(job_folder, meta)
+        except Exception:
+            pass
+
+        return {
+            "status": "dispatched",
+            "job_id": job_id,
+            "job_folder": job_folder,
+            "meta_path": meta_path,
+            "public_urls": public_urls,
+            "gpu_response": gpu_resp,
+        }
+    except Exception as exc:
+        try:
+            meta["status"] = "gpu_error"
+            meta["dispatch"]["error"] = {"detail": str(exc)}
+            _save_meta(job_folder, meta)
+        except Exception:
+            pass
+
+        return {
+            "status": "gpu_error",
+            "job_id": job_id,
+            "job_folder": job_folder,
+            "meta_path": meta_path,
+            "public_urls": public_urls,
+            "gpu_error": {"detail": str(exc), "url": _gpu_worker_url(), "job_folder_sent": _abs(job_folder)},
+        }
+
+
+@router.post("/render-form")
+async def sd35_render_form(
+    prompt: str = Form(..., description="Main prompt for SD3.5"),
+    negative_prompt: Optional[str] = Form(None),
+
+    category: Category = Form(...),
+    shot: Shot = Form(...),
+
+    upscale_2x: Optional[bool] = Form(None),
+    seed: Optional[int] = Form(None),
+
+    style_preset: Optional[str] = Form(None),
+    material_preset: Optional[str] = Form(None),
+    lighting_preset: Optional[str] = Form(None),
+
+    # OPTIONAL override for Wix form route too
+    lycoris_multiplier: Optional[float] = Form(None),
+    geo_multiplier: Optional[float] = Form(None),
+):
+    """
+    Text2Img (multipart/form-data):
+    - Create job folder
+    - Write meta.json WITH locked presets
+    - Optional override for LyCORIS/GEO multipliers
+    - Dispatch to GPU worker -> REAL SD3.5
+    """
+    job_folder = _create_job_folder(job_type="sd35_text2img")
+    job_id = os.path.basename(job_folder)
+    public_urls = _outputs_public_urls(job_folder)
+
+    final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
+
+    meta: Dict[str, Any] = {
+        "job_id": job_id,
+        "created_at": datetime.utcnow().isoformat(),
+
+        "type": "text2img",
+        "model_name": "sd35_large_pro_v2_1",
+        "engine": "sd35_large_pro_v2_1",
+
+        "prompt": (prompt or "").strip(),
+        "negative_prompt": (negative_prompt or "").strip(),
+        "seed": int(final_seed),
+
+        "style_preset": style_preset,
+        "material_preset": material_preset,
+        "lighting_preset": lighting_preset,
+
+        "category": category,
+        "shot": shot,
+
+        "denoise": 0.0,
+
+        "status": "queued",
+        "mode_runtime": "gpu-dispatch",
+
+        "pipeline_key": "sd35::sd35_text2img",
+
+        "outputs": {
+            "image": "output.png",
+            "meta": "meta.json",
+        },
+
+        "dispatch": {
+            "job_type": "sd35_text2img",
+            "target": _gpu_worker_url(),
+            "dispatched_at": None,
+            "gpu_response": None,
+            "error": None,
+        },
+    }
+
+    try:
+        apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
+
+    meta["denoise"] = 0.0
+    if isinstance(meta.get("upscale"), dict):
+        meta["upscale"]["denoise"] = 0.0
+
+    # Apply override for form route too (top-level keys)
+    payload_for_override = {
+        "override": None,
+        "lycoris_multiplier": lycoris_multiplier,
+        "geo_multiplier": geo_multiplier,
+    }
+    _apply_override_to_meta(meta, payload_for_override)
+
+    meta_path = _save_meta(job_folder, meta)
+
+    try:
+        gpu_resp = _dispatch_to_gpu("sd35_text2img", job_folder, meta)
+
         try:
             meta["status"] = "dispatched"
             meta["dispatch"]["dispatched_at"] = datetime.utcnow().isoformat()
@@ -335,11 +531,16 @@ async def sd35_render_from_image(
 
     upscale_2x: Optional[bool] = Form(None),
     seed: Optional[int] = Form(None),
+
+    # OPTIONAL override for img2img form route too
+    lycoris_multiplier: Optional[float] = Form(None),
+    geo_multiplier: Optional[float] = Form(None),
 ):
     """
     Img2Img (multipart/form-data):
     - Save input.png
     - Write meta.json WITH locked presets + strength
+    - Optional override for LyCORIS/GEO multipliers
     - Dispatch to GPU worker -> REAL SD3.5 Img2Img (requires GPU runtime support)
     """
     if not image.filename:
@@ -350,7 +551,6 @@ async def sd35_render_from_image(
     job_id = os.path.basename(job_folder)
     public_urls = _outputs_public_urls(job_folder)
 
-    # Save input image
     input_path = os.path.join(job_folder, "input.png")
     _save_upload_stream(image, input_path)
 
@@ -364,18 +564,16 @@ async def sd35_render_from_image(
         "model_name": "sd35_large_pro_v2_1",
         "engine": "sd35_large_pro_v2_1",
 
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "seed": final_seed,
+        "prompt": (prompt or "").strip(),
+        "negative_prompt": (negative_prompt or "").strip(),
+        "seed": int(final_seed),
 
-        # runtime-specific fields (GPU runner reads these)
         "strength": float(strength),
         "input_image": "input.png",
 
         "category": category,
         "shot": shot,
 
-        # Hard lock: no denoise anywhere
         "denoise": 0.0,
 
         "status": "queued",
@@ -403,10 +601,16 @@ async def sd35_render_from_image(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
 
-    # Hard lock again (safety)
     meta["denoise"] = 0.0
     if isinstance(meta.get("upscale"), dict):
         meta["upscale"]["denoise"] = 0.0
+
+    payload_for_override = {
+        "override": None,
+        "lycoris_multiplier": lycoris_multiplier,
+        "geo_multiplier": geo_multiplier,
+    }
+    _apply_override_to_meta(meta, payload_for_override)
 
     meta_path = _save_meta(job_folder, meta)
 

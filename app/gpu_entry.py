@@ -1,4 +1,3 @@
-# app/gpu_entry.py
 """
 GPU Entry FastAPI app for RENDEREXPO AI STUDIO.
 
@@ -18,6 +17,7 @@ Important:
 import os
 import json
 import logging
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -56,7 +56,7 @@ app = FastAPI(
         "GPU-side API that receives dispatches from the local dev server "
         "(port 8002) and executes REAL SD3.5 jobs when enabled."
     ),
-    version="0.2.0",
+    version="0.2.1",
 )
 
 sd35_runtime: Optional[SD35Runtime] = None  # set on startup
@@ -130,6 +130,35 @@ def _ensure_job_folder(job_folder: str) -> None:
         )
 
 
+def _read_meta_file(meta_file: str) -> Dict[str, Any]:
+    if not os.path.isfile(meta_file):
+        return {}
+    try:
+        with open(meta_file, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    """
+    Atomic write to avoid corrupt meta.json if process crashes mid-write.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="meta_", suffix=".json", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 def _read_meta(job_folder: str) -> Dict[str, Any]:
     meta_file = _meta_path(job_folder)
     if not os.path.isfile(meta_file):
@@ -137,14 +166,30 @@ def _read_meta(job_folder: str) -> Dict[str, Any]:
             status_code=400,
             detail=f"meta.json not found in job_folder: {meta_file}",
         )
-    with open(meta_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _read_meta_file(meta_file)
 
 
 def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
     meta_file = _meta_path(job_folder)
-    with open(meta_file, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
+    _atomic_write_json(meta_file, meta)
+
+
+def _merge_meta_preserve_planner(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge meta safely:
+      - Start with existing disk meta (planner-written)
+      - Overlay incoming payload meta (payload wins)
+      - This preserves planner fields that GPU doesn't know about
+        (ex: override_received / override_applied)
+    """
+    if not isinstance(existing, dict):
+        existing = {}
+    if not isinstance(incoming, dict):
+        incoming = {}
+
+    merged = dict(existing)
+    merged.update(incoming)
+    return merged
 
 
 def _touch_status(meta: Dict[str, Any], status: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -175,7 +220,7 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
     Called by the local API (8002):
 
     - Ensures job_folder exists
-    - Reads meta.json and merges payload.meta (payload wins)
+    - Reads meta.json from disk, merges payload.meta (payload wins)
     - If REAL SD3.5 runtime is loaded:
         - If meta["type"] == "text2img": run generate_text2img()
         - If meta["type"] == "img2img": run generate_img2img() (if available)
@@ -187,13 +232,15 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
     job_folder = payload.job_folder
     _ensure_job_folder(job_folder)
 
-    # Start from meta on disk, merge with payload.meta (payload wins)
-    try:
-        meta = _read_meta(job_folder)
-    except HTTPException:
-        meta = {}
+    meta_file = _meta_path(job_folder)
 
-    meta.update(payload.meta or {})
+    # 1) Load existing meta (planner-written) if present
+    existing_meta = _read_meta_file(meta_file)
+
+    # 2) Merge payload meta on top (payload wins, planner keys preserved if missing)
+    meta = _merge_meta_preserve_planner(existing_meta, payload.meta or {})
+
+    # 3) Stamp runtime fields
     meta["job_folder"] = job_folder
     meta["dispatched_at"] = datetime.utcnow().isoformat()
 
@@ -214,30 +261,31 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
                 "error_detail": "SD35 runtime is not loaded on GPU. Check SD35_RUNTIME_MODE/RUN_REAL_SD35 and logs.",
             },
         )
-        _write_meta(job_folder, meta)
+        _atomic_write_json(meta_file, meta)
         raise HTTPException(status_code=500, detail=meta.get("error_detail"))
 
     # REAL PATH
     try:
         meta = _touch_status(meta, "running")
-        _write_meta(job_folder, meta)
+        _atomic_write_json(meta_file, meta)
 
         if job_type == "text2img":
             updated_meta = sd35_runtime.generate_text2img(job_folder, meta)
         elif job_type == "img2img":
-            # This will work if you later wire the GPU runtime for img2img.
-            # If not supported by your diffusers version, it raises a clear RuntimeError.
             updated_meta = sd35_runtime.generate_img2img(job_folder, meta)
         else:
             raise RuntimeError(f"Unsupported job type for GPU runtime: '{job_type}'")
 
-        _write_meta(job_folder, updated_meta)
+        # Final write: preserve any planner keys if runtime forgot them
+        final_existing = _read_meta_file(meta_file)
+        final_meta = _merge_meta_preserve_planner(final_existing, updated_meta if isinstance(updated_meta, dict) else {})
+        _atomic_write_json(meta_file, final_meta)
 
         return {
             "status": "ok",
             "message": "GPU dispatch completed in REAL SD3.5 mode.",
             "job_folder": job_folder,
-            "meta": updated_meta,
+            "meta": final_meta,
         }
 
     except Exception as exc:  # noqa: BLE001
@@ -251,5 +299,5 @@ async def gpu_dispatch(payload: GPUDispatchPayload):
                 "failed_at": datetime.utcnow().isoformat(),
             },
         )
-        _write_meta(job_folder, meta)
+        _atomic_write_json(meta_file, meta)
         raise HTTPException(status_code=500, detail=str(exc))

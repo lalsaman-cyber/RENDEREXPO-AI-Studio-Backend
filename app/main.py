@@ -78,6 +78,9 @@ NONCE_TTL_SECONDS = 90
 # Only health is open (everything else requires HMAC)
 OPEN_PATHS = {"/api/health"}
 
+# Static outputs must be open (Wix <img src="/outputs/..."> cannot send headers)
+OPEN_PREFIXES = ("/outputs/",)
+
 
 def _now_epoch() -> int:
     return int(time.time())
@@ -119,7 +122,7 @@ app = FastAPI(
     version="0.2.0",
 )
 
-# Serve outputs so /outputs/... URLs work (still protected by HMAC middleware)
+# Serve outputs so /outputs/... URLs work
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 # In-memory nonce replay cache (nonce -> expires_at_epoch)
@@ -142,12 +145,12 @@ async def _startup_check_secret() -> None:
 @app.middleware("http")
 async def hmac_auth_middleware(request: Request, call_next):
     """
-    Enforce HMAC auth on all paths except OPEN_PATHS.
+    Enforce HMAC auth on all paths except OPEN_PATHS and OPEN_PREFIXES.
     """
     path = request.url.path
 
-    # Allow health endpoint unauthenticated
-    if path in OPEN_PATHS:
+    # Allow open endpoints/prefixes unauthenticated
+    if path in OPEN_PATHS or any(path.startswith(p) for p in OPEN_PREFIXES):
         return await call_next(request)
 
     # Read headers
@@ -195,6 +198,9 @@ async def hmac_auth_middleware(request: Request, call_next):
 
     # Read raw body bytes exactly as sent
     body = await request.body()
+
+    # Preserve body for downstream handlers (safety in some middleware stacks)
+    request._body = body  # type: ignore[attr-defined]
 
     # Compute expected signature
     secret = os.getenv(HMAC_SECRET_ENV, "")

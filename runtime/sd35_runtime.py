@@ -1,4 +1,3 @@
-# runtime/sd35_runtime.py
 """
 SD3.5 Runtime for RENDEREXPO AI STUDIO (GPU)
 
@@ -46,17 +45,16 @@ class GenerationResult:
 def _is_lycoris_checkpoint(path: str) -> bool:
     """
     Detect LyCORIS-style safetensors (kohya/lycoris outputs).
-    Your files are clearly lycoris_* names with lora_down/lora_up keys.
+    Cheap heuristic: keys contain lycoris_ prefix.
     """
     try:
         from safetensors import safe_open  # type: ignore
         with safe_open(path, framework="pt", device="cpu") as f:
-            # cheap check: look at a few keys
             for i, k in enumerate(f.keys()):
                 lk = k.lower()
                 if lk.startswith("lycoris_"):
                     return True
-                if i > 80:
+                if i > 120:
                     break
     except Exception:
         pass
@@ -69,7 +67,8 @@ class SD35Runtime:
         self.device = device
 
         # IMPORTANT: on your pod you are using /workspace-data/models/sd35-large
-        self.model_path = os.getenv("SD35_MODEL_PATH", "/workspace-data/models/sd35")
+        # If env var is set, it wins.
+        self.model_path = os.getenv("SD35_MODEL_PATH", "/workspace-data/models/sd35-large")
 
         self.pipe: Optional[Any] = None
         self._torch: Optional[Any] = None
@@ -78,8 +77,6 @@ class SD35Runtime:
         self._active_adapters: Tuple[str, ...] = ()
 
         # LyCORIS caching:
-        # - weights cache lets us reuse disk reads between jobs.
-        # - active networks are per-pipe instance (because module instances differ).
         self._lyco_weights_cache: Dict[str, Dict[str, Any]] = {}
         self._active_lyco_networks: List[Any] = []  # list[LycorisNetworkKohya]
         self._active_lyco_paths: Tuple[str, ...] = ()
@@ -99,9 +96,7 @@ class SD35Runtime:
         """
         Loads StableDiffusion3Pipeline on GPU.
 
-        VRAM:
-        - SD3.5 Large can be heavy. You already validated CPU offload helps.
-        - Set SD35_ENABLE_CPU_OFFLOAD=1 to enable offload.
+        Set SD35_ENABLE_CPU_OFFLOAD=1 to enable offload.
         """
         if self.mode != "real":
             logger.info("SD35Runtime.load() called in skeleton mode. No model will be loaded.")
@@ -130,7 +125,7 @@ class SD35Runtime:
 
             pipe = StableDiffusion3Pipeline.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float16,  # keep stable on your pod
+                torch_dtype=torch.float16,
             )
 
             # Prefer xformers if available (safe)
@@ -187,16 +182,14 @@ class SD35Runtime:
         if self.pipe is None:
             return
 
-        # 1) Restore LyCORIS networks (this is the real, required part)
+        # Restore LyCORIS networks
         if self._active_lyco_networks:
             te_list = self._get_text_encoders(self.pipe)
             unet_like = self._get_unet_like(self.pipe)
             for net in self._active_lyco_networks:
                 try:
-                    # common signature: restore(text_encoder, unet)
                     net.restore(te_list, unet_like)
                 except TypeError:
-                    # some variants: restore(unet)
                     try:
                         net.restore(unet_like)
                     except Exception:
@@ -207,7 +200,7 @@ class SD35Runtime:
         self._active_lyco_networks = []
         self._active_lyco_paths = ()
 
-        # 2) Best-effort: unload diffusers LoRA if present (safe no-op)
+        # Best-effort: unload diffusers LoRA if present (safe no-op)
         try:
             if hasattr(self.pipe, "unload_lora_weights"):
                 self.pipe.unload_lora_weights()
@@ -263,12 +256,70 @@ class SD35Runtime:
             from safetensors.torch import load_file  # type: ignore
             sd = load_file(path)
         else:
-            # fallback (rare)
             import torch  # type: ignore
             sd = torch.load(path, map_location="cpu")
 
         self._lyco_weights_cache[path] = sd
         return sd
+
+    def _unwrap_lyco_net(self, net_obj: Any) -> Any:
+        """
+        Some lycoris builds return (net, extra). Extract the item that has apply_to().
+        """
+        if not isinstance(net_obj, tuple):
+            return net_obj
+        for item in net_obj:
+            if hasattr(item, "apply_to"):
+                return item
+        raise TypeError("create_network_from_weights returned tuple without a network object")
+
+    def _apply_to_modules(self, net: Any, te_list: List[Any], unet_like: Any) -> None:
+        """
+        LyCORIS apply_to() signature differs between versions.
+
+        We support:
+          - net.apply_to(te_list, unet_like, apply_text_encoder=..., apply_unet=...)
+          - net.apply_to(te_list, unet_like)
+          - net.apply_to(te0, unet_like, apply_text_encoder=..., apply_unet=...)
+          - net.apply_to(te0, unet_like)
+        """
+        apply_te = bool(te_list)
+        apply_unet = (unet_like is not None)
+
+        # 1) Try modern signature with list + flags
+        try:
+            net.apply_to(
+                te_list,
+                unet_like,
+                apply_text_encoder=apply_te,
+                apply_unet=apply_unet,
+            )
+            return
+        except TypeError:
+            pass
+
+        # 2) Try list without flags
+        try:
+            net.apply_to(te_list, unet_like)
+            return
+        except TypeError:
+            pass
+
+        # 3) Fallback: first text encoder
+        te0 = te_list[0] if te_list else None
+        try:
+            net.apply_to(
+                te0,
+                unet_like,
+                apply_text_encoder=(te0 is not None),
+                apply_unet=apply_unet,
+            )
+            return
+        except TypeError:
+            pass
+
+        # 4) Oldest fallback
+        net.apply_to(te0, unet_like)
 
     def _apply_locked_adapters(self, meta: Dict[str, Any]) -> None:
         """
@@ -278,28 +329,30 @@ class SD35Runtime:
         - Your .safetensors are LyCORIS-format outputs.
         - We DO NOT use diffusers.load_lora_weights() for these.
         - SD3 uses pipe.transformer (not pipe.unet).
+        - Override multipliers MUST be honored: if strength/scale == 0.0 => DO NOT apply.
         """
         if self.pipe is None:
             return
 
         lora_cfg, geo_cfg = self._extract_adapter_cfg(meta)
 
-        # If nothing to apply: restore/unload and return
+        # Nothing configured -> ensure clean state
         if not lora_cfg and not geo_cfg:
             self._safe_unload_adapters()
             meta["adapters_applied"] = False
             meta["adapters_reason"] = "no_lora_or_geo_config"
             return
 
-        adapters: list[Tuple[str, str, float]] = []  # (name, path, weight)
+        adapters: list[Tuple[str, str, float, str]] = []  # (logical, path, weight, label)
 
-        def _pull(cfg: Dict[str, Any], default_name: str) -> Optional[Tuple[str, str, float]]:
-            path = cfg.get("path")
-            if not path:
+        def _pull(cfg: Dict[str, Any], logical: str, default_label: str) -> Optional[Tuple[str, str, float, str]]:
+            raw_path = cfg.get("path")
+            if not raw_path:
                 return None
-            path = self._resolve_weight_path(str(path))
+
+            path = self._resolve_weight_path(str(raw_path))
             if not os.path.isfile(path):
-                logger.warning("Adapter file not found: %s (skipping %s)", path, default_name)
+                logger.warning("Adapter file not found: %s (skipping %s)", path, logical)
                 return None
 
             w = cfg.get("strength", cfg.get("scale", 0.0))
@@ -308,29 +361,35 @@ class SD35Runtime:
             except Exception:
                 w_f = 0.0
 
-            # Doc 18 uses small multipliers; allow 0..2 but clamp to safety
+            # clamp safety
             if w_f < 0.0:
                 w_f = 0.0
             if w_f > 2.0:
                 w_f = 2.0
 
-            label = cfg.get("label") or default_name
-            name = f"renderexpo_{label}_{os.path.basename(path).replace('.', '_')}"
-            return (name, path, w_f)
+            label = str(cfg.get("label") or default_label)
 
-        l = _pull(lora_cfg, "LYCORIS_PRO21") if lora_cfg else None
-        g = _pull(geo_cfg, "GEO") if geo_cfg else None
+            # CRITICAL: override 0.0 means "disabled"
+            if w_f <= 0.0:
+                logger.info("Adapter disabled by multiplier=0.0: %s (%s)", logical, path)
+                return None
+
+            return (logical, path, w_f, label)
+
+        l = _pull(lora_cfg, logical="LYCORIS", default_label="LYCORIS_PRO21") if lora_cfg else None
+        g = _pull(geo_cfg, logical="GEO", default_label="GEO") if geo_cfg else None
 
         if l:
             adapters.append(l)
         if g:
             adapters.append(g)
 
-        # If requested but files missing -> continue base (per safety note)
+        # If nothing to apply (either disabled or missing), ensure clean state
         if not adapters:
             self._safe_unload_adapters()
             meta["adapters_applied"] = False
-            meta["adapters_reason"] = "files_missing_or_zero_weight"
+            meta["adapters_reason"] = "disabled_or_missing"
+            meta["adapters"] = []
             return
 
         # Always restore/unload first to prevent stacking
@@ -348,32 +407,26 @@ class SD35Runtime:
             active_nets: List[Any] = []
             active_paths: List[str] = []
 
-            for (name, path, weight) in adapters:
-                # sanity guard
+            for (logical, path, weight, label) in adapters:
                 if not _is_lycoris_checkpoint(path):
-                    # You told me: you are not interested in vanilla LoRA.
-                    # If something isn't LyCORIS here, we fail loudly.
                     raise ValueError(f"Adapter is not detected as LyCORIS: {os.path.basename(path)}")
 
                 weights_sd = self._load_lycoris_weights_sd(path)
 
-                # build a new network bound to THIS pipe's modules
-                net = lk.create_network_from_weights(
+                net_obj = lk.create_network_from_weights(
                     multiplier=weight,
                     file=path,
                     vae=vae,
-                    text_encoder=te_list,    # list supported in your lycoris build
-                    unet=unet_like,          # SD3 transformer goes here
+                    text_encoder=te_list,   # list supported in some builds
+                    unet=unet_like,         # SD3 transformer goes here
                     weights_sd=weights_sd,
                     for_inference=True,
                 )
 
-                # attach onto modules
-                try:
-                    net.apply_to(te_list, unet_like)
-                except TypeError:
-                    # fallback signature
-                    net.apply_to(te_list[0] if te_list else None, unet_like)
+                net = self._unwrap_lyco_net(net_obj)
+
+                # attach onto modules (robust across builds)
+                self._apply_to_modules(net, te_list, unet_like)
 
                 # activate
                 try:
@@ -381,7 +434,7 @@ class SD35Runtime:
                 except Exception:
                     pass
 
-                # ensure multiplier is exactly what preset wants (for transparency)
+                # ensure multiplier is exactly what meta wants
                 try:
                     net.set_multiplier(weight)
                 except Exception:
@@ -389,13 +442,15 @@ class SD35Runtime:
 
                 active_nets.append(net)
                 active_paths.append(path)
-                applied_info.append({"name": name, "path": path, "weight": weight})
+
+                name = f"renderexpo_{logical}_{label}_{os.path.basename(path).replace('.', '_')}"
+                applied_info.append({"name": name, "path": path, "weight": weight, "logical": logical, "label": label})
 
                 logger.info("Applied LyCORIS adapter: %s (weight=%.6f)", path, weight)
 
             self._active_lyco_networks = active_nets
             self._active_lyco_paths = tuple(active_paths)
-            self._active_adapters = tuple([a[0] for a in adapters])
+            self._active_adapters = tuple([a["name"] for a in applied_info])
 
             meta["adapters_applied"] = True
             meta["adapters_reason"] = "applied_lycoris"
@@ -418,10 +473,6 @@ class SD35Runtime:
     # ------------------------------------------------------------------
 
     def _detail_pass_if_enabled(self, image: Any, meta: Dict[str, Any]) -> Any:
-        """
-        Optional micro-contrast + controlled unsharp.
-        Safe: if PIL missing, skip.
-        """
         dp = meta.get("detail_pass") or {}
         if not dp or not dp.get("enabled"):
             return image
@@ -446,15 +497,13 @@ class SD35Runtime:
         radius = float(dp.get("radius", 1.15))
         threshold = int(dp.get("threshold", 3))
 
-        # Mild local contrast boost
         try:
             image = ImageEnhance.Contrast(image).enhance(1.05 + 0.10 * min(max(amount, 0.0), 2.0))
         except Exception:
             pass
 
-        # Controlled sharpening
         try:
-            percent = int(120 + 120 * min(max(amount, 0.0), 2.0))  # 120..360
+            percent = int(120 + 120 * min(max(amount, 0.0), 2.0))
             image = image.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
         except Exception:
             pass
@@ -468,23 +517,17 @@ class SD35Runtime:
     # ------------------------------------------------------------------
 
     def _upscale_if_enabled(self, image: Any, meta: Dict[str, Any]) -> Any:
-        """
-        Deterministic upscale (PIL resize), no diffusion, no denoise.
-        meta["upscale"] expected:
-          { "enabled": bool, "factor": 2, "denoise": 0.0, "method": "lanczos" }
-        """
         up = meta.get("upscale") or {}
         if not isinstance(up, dict) or not up.get("enabled"):
             return image
 
-        # Enforce NO denoise
         up["denoise"] = 0.0
 
         factor = int(up.get("factor", 2))
         if factor < 2:
             factor = 2
         if factor > 4:
-            factor = 4  # safety
+            factor = 4
 
         method = str(up.get("method", "lanczos")).lower()
 
@@ -596,7 +639,6 @@ class SD35Runtime:
         # Optional deterministic upscale (no denoise)
         image = self._upscale_if_enabled(image, meta)
 
-        # Final output expected by system
         out_path = os.path.join(job_folder, "output.png")
         image.save(out_path)
 
@@ -654,7 +696,6 @@ class SD35Runtime:
         # Apply locked adapters (LyCORIS + GEO) to the main pipe context
         self._apply_locked_adapters(meta)
 
-        # Try to build an Img2Img pipeline
         try:
             from diffusers import StableDiffusion3Img2ImgPipeline  # type: ignore
         except Exception as exc:  # noqa: BLE001
@@ -683,7 +724,7 @@ class SD35Runtime:
         except Exception:
             pass
 
-        # Apply LyCORIS adapters to img_pipe too (same meta contract), run, then restore
+        # Apply LyCORIS adapters to img_pipe too, run, then restore
         old_pipe = self.pipe
         try:
             self.pipe = img_pipe
@@ -752,7 +793,6 @@ class SD35Runtime:
             return meta
 
         finally:
-            # restore/cleanup adapters on img_pipe then return runtime pipe
             try:
                 self._safe_unload_adapters()
             except Exception:
