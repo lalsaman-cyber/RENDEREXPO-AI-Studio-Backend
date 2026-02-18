@@ -63,3 +63,4 @@ tools/
 VOLUME_SNAPSHOT_*.txt
 openapi.json
 secrets/
+secrets/
