@@ -1,27 +1,47 @@
 # app/presets_sd35.py
 """
-RENDEREXPO AI STUDIO - SD3.5 Presets (Doc 18 locked logic + optional upscale switch)
+RENDEREXPO AI STUDIO - SD3.5 Presets
 
 Goals:
-- ONE centralized preset system that all routers can use.
+- ONE centralized preset system that all planner routers can use.
 - Presets lock: steps, CFG, LyCORIS PRO 2.1 multiplier, GEO multiplier, base resolution.
-- Denoise is ALWAYS 0.0 (no denoise anywhere in any shot).
 - Upscale is OPTIONAL:
     * preset default, OR
     * overridden per request via upscale_2x true/false.
+- This file is planner-side only.
+- Planner writes meta; GPU runtime executes meta.
 
-How to use in any router:
-1) Build meta dict (prompt, type, etc.)
-2) Call:
-       apply_preset_to_meta(meta, category=..., shot=..., upscale_2x=...)
-3) Save meta.json
-4) GPU runtime uses meta.json to run real inference later.
+IMPORTANT:
+- This file does NOT load models.
+- This file does NOT decide ports.
+- This file does NOT perform inference.
+- This file should not silently destroy img2img behavior.
+
+CRITICAL RULE:
+- Do NOT globally force denoise/strength to 0.0 here.
+- Text2img does not use denoise.
+- Img2img/reclad depends on strength, and that must remain router-controlled.
+- Only deterministic upscale uses denoise=0.0 because it is non-diffusion resize.
+
+Canonical profile names:
+- r1_wide_hero
+- r1_close_detail
+- luxury_interior_heavy_detail
+
+Backward-compatible category/shot aliases are also supported:
+- urban:wide
+- urban:close
+- suburban:wide
+- suburban:close
+- interior:wide
+- interior:close
+- wide_hero:wide
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Literal, Any
+from typing import Any, Dict, Literal, Optional
 
 
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
@@ -30,8 +50,9 @@ Shot = Literal["wide", "close"]
 
 @dataclass(frozen=True)
 class SD35Preset:
-    category: Category
-    shot: Shot
+    profile_name: str
+    category: str
+    shot: str
 
     # Core generation controls (LOCKED)
     width: int
@@ -50,130 +71,40 @@ class SD35Preset:
     # Upscale behavior (OPTIONAL)
     upscale_default: bool
     upscale_factor: int = 2
-
-    # Hard lock: NO denoise anywhere
-    denoise: float = 0.0
+    upscale_method: str = "lanczos"
 
 
 # ---------------------------------------------------------------------
-# LOCKED PRESETS (Doc 18)
-#
-# NOTE:
-# - "PRO" means PRO 2.1 (as you confirmed).
-# - Paths below are placeholders unless you already have real files:
-#     models/lycoris/RENDEREXPO_PRO21.safetensors
-#     models/geo/RENDEREXPO_GEO.safetensors
-#
-# If your actual files are named differently, update only the PATHS,
-# NOT the multipliers/steps/cfg unless Doc 18 says so.
+# LOCKED PRESET CONSTANTS
 # ---------------------------------------------------------------------
 
 DEFAULT_LYCORIS_PATH = "models/lycoris/RENDEREXPO_PRO21.safetensors"
 DEFAULT_GEO_PATH = "models/geo/RENDEREXPO_GEO.safetensors"
 
-# If Doc 18 has different multipliers per category, set them per preset key.
 DEFAULT_LYCORIS_MULT = 0.05
 DEFAULT_GEO_MULT = 0.010
 
-# Doc 18 locked steps/cfg targets:
-# - Wide/Hero: CFG 5.6, Steps 44–46 (lock 46)
-# - Close/Detail: CFG 6.0, Steps 46–50 (lock 48)
+# Locked Doc 18 / later production values
 WIDE_STEPS = 46
 WIDE_CFG = 5.6
+
 CLOSE_STEPS = 48
 CLOSE_CFG = 6.0
 
-# Base resolution (locked for now)
+HEAVY_INTERIOR_STEPS = 60
+HEAVY_INTERIOR_CFG = 6.0
+
 BASE_W = 1024
 BASE_H = 1024
 
-PRESETS: Dict[str, SD35Preset] = {
-    # URBAN
-    "urban:wide": SD35Preset(
-        category="urban",
-        shot="wide",
-        width=BASE_W,
-        height=BASE_H,
-        steps=WIDE_STEPS,
-        cfg=WIDE_CFG,
-        lycoris_path=DEFAULT_LYCORIS_PATH,
-        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
-        geo_path=DEFAULT_GEO_PATH,
-        geo_multiplier=DEFAULT_GEO_MULT,
-        upscale_default=True,
-    ),
-    "urban:close": SD35Preset(
-        category="urban",
-        shot="close",
-        width=BASE_W,
-        height=BASE_H,
-        steps=CLOSE_STEPS,
-        cfg=CLOSE_CFG,
-        lycoris_path=DEFAULT_LYCORIS_PATH,
-        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
-        geo_path=DEFAULT_GEO_PATH,
-        geo_multiplier=DEFAULT_GEO_MULT,
-        upscale_default=False,
-    ),
 
-    # SUBURBAN
-    "suburban:wide": SD35Preset(
-        category="suburban",
-        shot="wide",
-        width=BASE_W,
-        height=BASE_H,
-        steps=WIDE_STEPS,
-        cfg=WIDE_CFG,
-        lycoris_path=DEFAULT_LYCORIS_PATH,
-        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
-        geo_path=DEFAULT_GEO_PATH,
-        geo_multiplier=DEFAULT_GEO_MULT,
-        upscale_default=True,
-    ),
-    "suburban:close": SD35Preset(
-        category="suburban",
-        shot="close",
-        width=BASE_W,
-        height=BASE_H,
-        steps=CLOSE_STEPS,
-        cfg=CLOSE_CFG,
-        lycoris_path=DEFAULT_LYCORIS_PATH,
-        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
-        geo_path=DEFAULT_GEO_PATH,
-        geo_multiplier=DEFAULT_GEO_MULT,
-        upscale_default=False,
-    ),
+# ---------------------------------------------------------------------
+# CANONICAL PROFILES
+# ---------------------------------------------------------------------
 
-    # INTERIOR
-    "interior:wide": SD35Preset(
-        category="interior",
-        shot="wide",
-        width=BASE_W,
-        height=BASE_H,
-        steps=WIDE_STEPS,
-        cfg=WIDE_CFG,
-        lycoris_path=DEFAULT_LYCORIS_PATH,
-        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
-        geo_path=DEFAULT_GEO_PATH,
-        geo_multiplier=DEFAULT_GEO_MULT,
-        upscale_default=True,
-    ),
-    "interior:close": SD35Preset(
-        category="interior",
-        shot="close",
-        width=BASE_W,
-        height=BASE_H,
-        steps=CLOSE_STEPS,
-        cfg=CLOSE_CFG,
-        lycoris_path=DEFAULT_LYCORIS_PATH,
-        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
-        geo_path=DEFAULT_GEO_PATH,
-        geo_multiplier=DEFAULT_GEO_MULT,
-        upscale_default=False,
-    ),
-
-    # WIDE HERO (always wide behavior)
-    "wide_hero:wide": SD35Preset(
+PROFILES: Dict[str, SD35Preset] = {
+    "r1_wide_hero": SD35Preset(
+        profile_name="r1_wide_hero",
         category="wide_hero",
         shot="wide",
         width=BASE_W,
@@ -185,40 +116,121 @@ PRESETS: Dict[str, SD35Preset] = {
         geo_path=DEFAULT_GEO_PATH,
         geo_multiplier=DEFAULT_GEO_MULT,
         upscale_default=True,
+        upscale_factor=2,
+        upscale_method="lanczos",
+    ),
+    "r1_close_detail": SD35Preset(
+        profile_name="r1_close_detail",
+        category="urban",
+        shot="close",
+        width=BASE_W,
+        height=BASE_H,
+        steps=CLOSE_STEPS,
+        cfg=CLOSE_CFG,
+        lycoris_path=DEFAULT_LYCORIS_PATH,
+        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
+        geo_path=DEFAULT_GEO_PATH,
+        geo_multiplier=DEFAULT_GEO_MULT,
+        upscale_default=False,
+        upscale_factor=2,
+        upscale_method="lanczos",
+    ),
+    "luxury_interior_heavy_detail": SD35Preset(
+        profile_name="luxury_interior_heavy_detail",
+        category="interior",
+        shot="close",
+        width=BASE_W,
+        height=BASE_H,
+        steps=HEAVY_INTERIOR_STEPS,
+        cfg=HEAVY_INTERIOR_CFG,
+        lycoris_path=DEFAULT_LYCORIS_PATH,
+        lycoris_multiplier=DEFAULT_LYCORIS_MULT,
+        geo_path=DEFAULT_GEO_PATH,
+        geo_multiplier=DEFAULT_GEO_MULT,
+        upscale_default=True,
+        upscale_factor=2,
+        upscale_method="lanczos",
     ),
 }
 
 
-def resolve_preset(category: str, shot: str) -> SD35Preset:
-    key = f"{category}:{shot}"
-    if key not in PRESETS:
+# ---------------------------------------------------------------------
+# BACKWARD-COMPATIBLE ALIASES
+# ---------------------------------------------------------------------
+
+ALIASES: Dict[str, str] = {
+    # Wide behavior
+    "urban:wide": "r1_wide_hero",
+    "suburban:wide": "r1_wide_hero",
+    "interior:wide": "r1_wide_hero",
+    "wide_hero:wide": "r1_wide_hero",
+
+    # Close/detail behavior
+    "urban:close": "r1_close_detail",
+    "suburban:close": "r1_close_detail",
+    "interior:close": "r1_close_detail",
+}
+
+
+def resolve_preset(
+    category: Optional[str] = None,
+    shot: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> SD35Preset:
+    """
+    Resolve a preset by canonical profile name or by category/shot alias.
+
+    Preferred:
+        resolve_preset(profile="r1_wide_hero")
+
+    Backward compatible:
+        resolve_preset(category="urban", shot="wide")
+    """
+    if profile:
+        key = str(profile).strip()
+        if key in PROFILES:
+            return PROFILES[key]
         raise ValueError(
-            f"Unknown preset key '{key}'. Valid keys: {sorted(PRESETS.keys())}"
+            f"Unknown profile '{key}'. Valid profiles: {sorted(PROFILES.keys())}"
         )
-    return PRESETS[key]
+
+    if not category or not shot:
+        raise ValueError("Either 'profile' or both 'category' and 'shot' must be provided.")
+
+    alias = f"{category}:{shot}"
+    mapped = ALIASES.get(alias)
+    if not mapped:
+        raise ValueError(
+            f"Unknown preset alias '{alias}'. Valid aliases: {sorted(ALIASES.keys())}"
+        )
+
+    return PROFILES[mapped]
 
 
 def apply_preset_to_meta(
     meta: Dict[str, Any],
-    category: str,
-    shot: str,
+    category: Optional[str] = None,
+    shot: Optional[str] = None,
+    profile: Optional[str] = None,
     upscale_2x: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Mutates + returns meta.
 
-    Injects locked Doc 18 values into meta:
+    Injects locked values into meta:
     - width/height
     - num_inference_steps
     - guidance_scale
-    - denoise = 0.0
     - lora_config (LyCORIS PRO 2.1)
     - geo_config (GEO)
     - upscale config (enabled optional)
-    """
-    p = resolve_preset(category, shot)
 
-    # Upscale decision: default per preset unless explicitly overridden
+    IMPORTANT:
+    - This function does NOT overwrite img2img strength/denoise.
+    - Routers must preserve strength for reclad/img2img flows.
+    """
+    p = resolve_preset(category=category, shot=shot, profile=profile)
+
     upscale_enabled = p.upscale_default if upscale_2x is None else bool(upscale_2x)
 
     # ------------------------------------------------------------------
@@ -230,19 +242,7 @@ def apply_preset_to_meta(
     meta["guidance_scale"] = float(p.cfg)
 
     # ------------------------------------------------------------------
-    # HARD LOCK: NO denoise anywhere
-    # ------------------------------------------------------------------
-    meta["denoise"] = 0.0
-
-    # Also lock any known denoise fields commonly used elsewhere
-    # (safety: if other routers use these keys)
-    if "strength" in meta:
-        # strength is NOT denoise. Keep strength untouched.
-        pass
-
-    # ------------------------------------------------------------------
-    # LyCORIS (PRO 2.1) + GEO configs
-    # NOTE: runtime must actually apply geo_config too (we will wire it).
+    # Locked adapter configs
     # ------------------------------------------------------------------
     meta["lora_config"] = {
         "path": p.lycoris_path,
@@ -259,17 +259,19 @@ def apply_preset_to_meta(
     }
 
     # ------------------------------------------------------------------
-    # Upscale (OPTIONAL, deterministic: no diffusion denoise)
+    # Upscale (OPTIONAL, deterministic resize)
     # ------------------------------------------------------------------
     meta["upscale"] = {
         "enabled": bool(upscale_enabled),
         "factor": int(p.upscale_factor),
-        "denoise": 0.0,
-        "method": "lanczos",
+        "method": str(p.upscale_method),
     }
 
-    # Helpful for traceability
+    # ------------------------------------------------------------------
+    # Helpful traceability
+    # ------------------------------------------------------------------
     meta["preset"] = {
+        "profile_name": p.profile_name,
         "category": p.category,
         "shot": p.shot,
         "steps": p.steps,
@@ -278,7 +280,6 @@ def apply_preset_to_meta(
         "geo_multiplier": p.geo_multiplier,
         "upscale_default": p.upscale_default,
         "upscale_enabled": bool(upscale_enabled),
-        "denoise_locked": 0.0,
     }
 
     return meta

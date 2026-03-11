@@ -1,14 +1,14 @@
 # app/routers/mesh_from_image.py
 """
-RENDEREXPO AI STUDIO - Mesh From Image (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - Mesh From Image Router (Planner)
 
-Planner-side router (PC-first / POD-once):
+Planner-side router:
 - Creates job folder under outputs/YYYY-MM-DD/<job_id>/
 - Writes image.png + meta.json
 - Dispatches to GPU worker via HMAC-signed request (Option A)
 
-Why add /from-image-base64?
-- Wix/Velo multipart uploads are annoying and inconsistent.
+Why keep /from-image-base64?
+- Wix/Velo multipart uploads can be inconsistent.
 - JSON base64 is reliable, easy to sign, easy to send from Wix backend.
 
 Endpoints:
@@ -21,29 +21,33 @@ GPU worker writes:
 - preview.png (optional)
 - depth.png (optional)
 - meta.json updated by GPU worker
+
+Service split (LOCKED):
+- Planner = port 8012
+- GPU worker = port 8002
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import time
-import hmac
 import base64
-import hashlib
-import shutil
 import datetime
-from typing import Optional, Any, Dict, Tuple
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import time
+import uuid
+from typing import Any, Dict, Optional, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-router = APIRouter(prefix="/api/mesh", tags=["Mesh (REAL)"])
+router = APIRouter(prefix="/api/mesh", tags=["Mesh (Planner)"])
 
 # ---------------------------------------------------------------------------
-# HMAC constants (must match app/main.py)
+# HMAC constants (must match app/main.py / GPU worker)
 # ---------------------------------------------------------------------------
 
 HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
@@ -67,14 +71,21 @@ def _now_epoch() -> int:
 def _mesh_dispatch_url() -> str:
     """
     GPU dispatch endpoint (GPU worker service).
+
     Recommended:
-      MESH_GPU_DISPATCH_URL=http://127.0.0.1:8012/api/gpu/dispatch
+      MESH_GPU_DISPATCH_URL=http://127.0.0.1:8002/api/gpu/dispatch
     """
-    return os.getenv("MESH_GPU_DISPATCH_URL", "http://127.0.0.1:8012/api/gpu/dispatch").strip()
+    return os.getenv("MESH_GPU_DISPATCH_URL", "http://127.0.0.1:8002/api/gpu/dispatch").strip()
+
+
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
 
 
 def _abs(p: str) -> str:
-    return os.path.abspath(p)
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(_repo_root(), p))
 
 
 def _today_utc_str() -> str:
@@ -87,6 +98,13 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     job_id = uuid.uuid4().hex
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
+
+    try:
+        with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
+            f.write("mesh_from_image")
+    except Exception:
+        pass
+
     return folder
 
 
@@ -161,11 +179,8 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     url = _mesh_dispatch_url()
 
     payload = {
-        "job_type": "mesh_from_image",
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        # keep routing explicit/consistent with dispatcher
-        "pipeline_key": "mesh::from_image",
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -189,7 +204,7 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     }
 
     try:
-        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 60))
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
         if not (200 <= r.status_code < 300):
             raise RuntimeError(f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
         return r.json() if r.content else {"status": "ok"}
@@ -211,7 +226,6 @@ def _decode_base64_image(data_b64: str) -> Tuple[bytes, str]:
 
     inferred_mime = "application/octet-stream"
     if s.startswith("data:"):
-        # data:image/png;base64,AAAA
         try:
             header, b64 = s.split(",", 1)
             inferred_mime = header.split(";")[0].replace("data:", "").strip() or inferred_mime
@@ -227,7 +241,6 @@ def _decode_base64_image(data_b64: str) -> Tuple[bytes, str]:
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail=f"Image too large (>{MAX_IMAGE_BYTES} bytes)")
 
-    # very light sniffing (optional)
     if raw[:8] == b"\x89PNG\r\n\x1a\n":
         inferred_mime = "image/png"
     elif raw[:3] == b"\xff\xd8\xff":
@@ -280,7 +293,7 @@ async def mesh_from_image(
     target_faces: int = Form(250000, description="Target face count (approx)"),
     max_depth_m: float = Form(40.0, description="Clamp depth (meters)"),
     seed: Optional[int] = Form(None, description="Optional seed"),
-):
+) -> Dict[str, Any]:
     """
     Multipart upload (good for local testing).
     Wix should prefer /from-image-base64 (JSON).
@@ -375,7 +388,7 @@ async def mesh_from_image(
 
 
 @router.post("/from-image-base64")
-async def mesh_from_image_base64(req: MeshFromImageBase64Request):
+async def mesh_from_image_base64(req: MeshFromImageBase64Request) -> Dict[str, Any]:
     """
     JSON base64 (best for Wix).
     """

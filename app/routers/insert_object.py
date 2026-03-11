@@ -1,51 +1,50 @@
 # app/routers/insert_object.py
 """
-RENDEREXPO AI STUDIO - Insert Object (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - Insert Object Router (Planner -> GPU worker)
 
-GOAL (REAL, Wix-ready):
+GOAL:
 - Client uploads:
-    * product_image (required) — couch, lamp, table, etc.
-    * scene_image (required) — existing room / scene image
+    * product_image (required)
+    * scene_image (required)
     * floorplan_image (optional)
     * prompt / placement_hint (optional)
 - Create outputs/{YYYY-MM-DD}/{job_id}/
 - Save uploaded images
 - Write meta.json
-- DISPATCH to GPU worker immediately (HMAC-signed Option A via app.clients.gpu_client)
-- GPU worker writes (best effort, depending on pipeline availability):
+- Dispatch to GPU worker immediately
+- GPU worker writes best-effort outputs:
     - product_mask.png
     - product_rgba.png
     - composite_raw.png
-    - output.png (final)
+    - output.png
     - meta.json updated
 
-Doc 18 rule (critical):
-- If ANY SD3.5 stage exists (harmonize), we MUST lock presets:
-  steps, CFG, LyCORIS(PRO 2.1) multiplier, GEO multiplier, resolution,
-  NO denoise anywhere, upscale optional per request OR preset default.
+IMPORTANT:
+- Planner = port 8012
+- GPU worker = port 8002
+- No skeleton path here
 
-No skeletons. No planning-only mode.
+Preset rule:
+- Final SD3.5 harmonize stage uses locked preset logic via apply_preset_to_meta()
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
 import datetime
-from typing import Optional, Dict, Any, List, Literal, Tuple
+import json
+import os
+import shutil
+import uuid
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.presets_sd35 import apply_preset_to_meta
-
-# GPU dispatch (you will wire this later in app/clients/gpu_client.py)
-from app.clients.gpu_client import dispatch_insert_object  # noqa: F401
-
+from app.clients.gpu_client import dispatch_insert_object
 
 router = APIRouter(
     prefix="/api/insert-object",
-    tags=["Insert Object (REAL)"],
+    tags=["Insert Object"],
 )
 
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
@@ -68,7 +67,6 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
 
-    # marker file
     try:
         with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
             f.write("insert_object")
@@ -110,11 +108,16 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 
 def _validate_upload_is_png_jpg(upload: UploadFile, label: str) -> None:
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
-    if ct and ct not in ALLOWED_CT:
+    name = (upload.filename or "").lower().strip()
+
+    ok_ct = (not ct) or (ct in ALLOWED_CT)
+    ok_ext = (not name) or name.endswith((".png", ".jpg", ".jpeg"))
+
+    if not (ok_ct and ok_ext):
         raise HTTPException(status_code=400, detail=f"{label} must be PNG or JPG")
 
 
-async def _save_upload(upload: UploadFile, dst_path: str) -> None:
+async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
     try:
         try:
             upload.file.seek(0)
@@ -122,7 +125,7 @@ async def _save_upload(upload: UploadFile, dst_path: str) -> None:
             pass
 
         with open(dst_path, "wb") as out:
-            out.write(await upload.read())
+            shutil.copyfileobj(upload.file, out)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to save upload '{upload.filename}': {exc}") from exc
 
@@ -142,53 +145,40 @@ def _build_sd35_harmonize_meta(
     upscale_2x: Optional[bool],
     seed: Optional[int],
     negative_prompt: Optional[str] = None,
-    strength: float = 0.55,
+    strength: float = 0.22,
     input_image: str = "composite_raw.png",
     planned_output: str = "output.png",
 ) -> Dict[str, Any]:
     """
-    This is the REAL SD3.5 block the GPU worker will run at the end to harmonize.
-    Locked by Doc 18 via apply_preset_to_meta().
+    Final SD3.5 harmonize block executed later by GPU worker.
     """
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
-
         "type": "img2img",
-        "model_name": "sd3.5-large-pro-2.1",
-
+        "engine": "sd35_large_pro_v2_1",
+        "model_name": "sd35_large_pro_v2_1",
         "prompt": prompt or "",
         "negative_prompt": negative_prompt,
         "seed": final_seed,
-
         "category": category,
         "shot": shot,
-
-        # strength is allowed; denoise is always 0.0
         "strength": float(strength),
-        "denoise": 0.0,
-
         "input_image": input_image,
         "planned_output_image": planned_output,
-
         "mode_runtime": "gpu-dispatch",
         "status": "queued",
     }
 
     apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-
-    # Safety hard lock
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
-
+    meta["strength"] = float(strength)
     return meta
 
 
 # ---------------------------------------------------------------------------
-# REAL Route
+# Route
 # ---------------------------------------------------------------------------
 
 @router.post("/render")
@@ -196,23 +186,14 @@ async def insert_object_render(
     product_image: UploadFile = File(..., description="Product image (PNG/JPG)"),
     scene_image: UploadFile = File(..., description="Scene image (PNG/JPG)"),
     floorplan_image: Optional[UploadFile] = File(None, description="Optional floorplan (PNG/JPG)"),
-
     prompt: Optional[str] = Form(None, description="Optional style / harmonization prompt"),
     placement_hint: Optional[str] = Form(None, description="Optional placement hint"),
-
-    # Optional: upscale toggle for SD3.5 final harmonize (if omitted, preset default applies)
     upscale_2x: Optional[bool] = Form(None),
-
-    # Optional: seed for SD3.5 final harmonize
     seed: Optional[int] = Form(None),
-
-    # Optional: strength for final harmonize (controls preserve vs change)
-    strength: float = Form(0.55, description="0..1 (lower preserves more)"),
-
-    # You said you don't like choosing: we default category/shot to best for this pipeline
+    strength: float = Form(0.22, description="0..1 (lower preserves more)"),
     category: Optional[Category] = Form(None, description="Optional override. Default: interior"),
     shot: Optional[Shot] = Form(None, description="Optional override. Default: wide"),
-):
+) -> Dict[str, Any]:
     if not product_image.filename:
         raise HTTPException(status_code=400, detail="product_image has no filename.")
     if not scene_image.filename:
@@ -226,7 +207,6 @@ async def insert_object_render(
     if not (0.0 <= float(strength) <= 1.0):
         raise HTTPException(status_code=400, detail="strength must be between 0.0 and 1.0")
 
-    # Auto-best defaults (you are the pilot, I choose the knobs)
     final_category: Category = category or "interior"
     final_shot: Shot = shot or "wide"
 
@@ -238,21 +218,21 @@ async def insert_object_render(
     saved_files: Dict[str, str] = {}
 
     product_path = os.path.join(job_folder, "product.png")
-    await _save_upload(product_image, product_path)
+    await _save_upload_stream(product_image, product_path)
     saved_files["product_image"] = "product.png"
 
     scene_path = os.path.join(job_folder, "scene.png")
-    await _save_upload(scene_image, scene_path)
+    await _save_upload_stream(scene_image, scene_path)
     saved_files["scene_image"] = "scene.png"
 
     if floorplan_image is not None and floorplan_image.filename:
         floorplan_path = os.path.join(job_folder, "floorplan.png")
-        await _save_upload(floorplan_image, floorplan_path)
+        await _save_upload_stream(floorplan_image, floorplan_path)
         saved_files["floorplan_image"] = "floorplan.png"
 
     created_at = datetime.datetime.utcnow().isoformat()
 
-    # 3) Define REAL GPU pipeline stages (worker will execute them)
+    # 3) Define GPU pipeline stages
     pipeline: List[Dict[str, Any]] = [
         {
             "stage": "segment_product",
@@ -276,8 +256,7 @@ async def insert_object_render(
         },
     ]
 
-    # 4) Build SD3.5 final harmonize meta (Doc 18 locked)
-    # If user didn't provide a prompt, we still run harmonize with a safe default.
+    # 4) Build final harmonize meta
     sd35_prompt = (prompt or "").strip() or (
         "photorealistic interior scene, natural lighting, cohesive materials, consistent shadows, "
         "high-end design finish, realistic textures"
@@ -301,27 +280,19 @@ async def insert_object_render(
         "job_id": job_id,
         "created_at": created_at,
         "type": "insert_object",
-
         "status": "queued",
         "mode_runtime": "gpu-dispatch",
-
         "files": saved_files,
-
         "prompt": prompt,
         "placement_hint": placement_hint,
-
         "pipeline_key": "insert_object::render",
-
         "gpu_pipeline": pipeline,
-
-        # Doc 18 locked SD3.5 stage (final harmonize)
         "sd35": {
             "enabled": True,
             "category": final_category,
             "shot": final_shot,
             "meta": sd35_meta,
         },
-
         "outputs": {
             "product_mask": "product_mask.png",
             "product_rgba": "product_rgba.png",
@@ -329,7 +300,6 @@ async def insert_object_render(
             "final_image": "output.png",
             "meta": "meta.json",
         },
-
         "dispatch": {
             "job_type": "insert_object",
             "dispatched_at": None,
@@ -341,7 +311,7 @@ async def insert_object_render(
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder)
 
-    # 6) DISPATCH to GPU worker (REAL)
+    # 6) Dispatch to GPU worker
     ok, gpu_resp = dispatch_insert_object(job_folder=job_folder, meta=meta)
 
     if not ok:
@@ -371,7 +341,7 @@ async def insert_object_render(
 
     return {
         "status": "dispatched",
-        "message": "Insert-object job dispatched to GPU worker (REAL).",
+        "message": "Insert-object job dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,

@@ -6,6 +6,10 @@ CRITICAL:
 - Planner DISPATCHES to GPU worker (/api/gpu/dispatch) using HMAC Option A
 - GPU worker performs REAL SD3.5 execution and writes outputs into the job folder
 
+Service split (LOCKED):
+- Planner = port 8012
+- GPU worker = port 8002
+
 Wix-friendly:
 - /api/sd35/render-form        (prompt-only via multipart/form-data)
 - /api/sd35/render-from-image  (prompt+image via multipart/form-data)
@@ -14,24 +18,24 @@ JSON-friendly:
 - /api/sd35/render             (application/json)
 
 Env:
-- GPU_WORKER_URL default http://127.0.0.1:8012/api/gpu/dispatch
+- GPU_WORKER_URL default http://127.0.0.1:8002/api/gpu/dispatch
 - RENDEREXPO_HMAC_SECRET required (must match GPU worker)
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import time
-import hmac
 import hashlib
+import hmac
+import json
+import os
 import shutil
+import time
+import uuid
 from datetime import datetime
-from typing import Optional, Any, Dict, Literal, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Body
+from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 
 from app.presets_sd35 import apply_preset_to_meta
 
@@ -40,7 +44,7 @@ router = APIRouter(prefix="/api/sd35", tags=["sd35"])
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
 
-# HMAC (must match app/main.py)
+# HMAC (must match app/main.py and GPU worker auth)
 HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
 SIG_HEADER = "X-RENDEREXPO-SIGNATURE"
 TS_HEADER = "X-RENDEREXPO-TIMESTAMP"
@@ -55,12 +59,18 @@ def _now_epoch() -> int:
     return int(time.time())
 
 
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
+
+
 def _abs(rel_path: str) -> str:
-    return os.path.abspath(rel_path)
+    if os.path.isabs(rel_path):
+        return rel_path
+    return os.path.abspath(os.path.join(_repo_root(), rel_path))
 
 
 def _gpu_worker_url() -> str:
-    return os.getenv("GPU_WORKER_URL", "http://127.0.0.1:8012/api/gpu/dispatch").strip()
+    return os.getenv("GPU_WORKER_URL", "http://127.0.0.1:8002/api/gpu/dispatch").strip()
 
 
 def _today_utc_str() -> str:
@@ -70,14 +80,13 @@ def _today_utc_str() -> str:
 def _create_job_folder(job_type: str) -> str:
     """
     Create outputs/YYYY-MM-DD/JOBID/
-    Returns RELATIVE path (repo-relative).
+    Returns RELATIVE path rooted at the planner repo.
     """
     today = _today_utc_str()
     job_id = uuid.uuid4().hex
     base_dir = os.path.join("outputs", today, job_id)
     os.makedirs(base_dir, exist_ok=True)
 
-    # marker file (helpful for debugging)
     try:
         with open(os.path.join(base_dir, "job_type.txt"), "w", encoding="utf-8") as f:
             f.write(job_type)
@@ -134,7 +143,7 @@ def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
             pass
         with open(dst_path, "wb") as out:
             shutil.copyfileobj(upload.file, out)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to save upload '{upload.filename}': {exc}") from exc
 
 
@@ -152,10 +161,8 @@ def _dispatch_to_gpu(job_type: str, job_folder_rel: str, meta: Dict[str, Any]) -
     url = _gpu_worker_url()
 
     payload = {
-        "job_type": job_type,
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        "pipeline_key": f"sd35::{job_type}",
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -179,11 +186,11 @@ def _dispatch_to_gpu(job_type: str, job_folder_rel: str, meta: Dict[str, Any]) -
     }
 
     try:
-        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 180))
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
         if not (200 <= r.status_code < 300):
             raise RuntimeError(f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
         return r.json() if r.content else {"status": "ok"}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"GPU dispatch failed: {exc}") from exc
 
 
@@ -222,7 +229,6 @@ def _apply_override_to_meta(meta: Dict[str, Any], payload: Dict[str, Any]) -> No
     if ge is None:
         ge = payload.get("geo_multiplier")
 
-    # Store raw + resolved for transparency
     meta["override_received_raw"] = override
     meta["override_resolved"] = {
         "lycoris_multiplier": ly,
@@ -256,12 +262,76 @@ def _apply_override_to_meta(meta: Dict[str, Any], payload: Dict[str, Any]) -> No
     }
 
 
+def _validate_category_shot(category: str, shot: str) -> None:
+    if category not in ("urban", "suburban", "interior", "wide_hero"):
+        raise HTTPException(status_code=400, detail="Invalid category")
+    if shot not in ("wide", "close"):
+        raise HTTPException(status_code=400, detail="Invalid shot")
+
+
+def _base_meta(
+    *,
+    job_id: str,
+    job_type: str,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    category: str,
+    shot: str,
+    input_image: Optional[str] = None,
+    strength: Optional[float] = None,
+    style_preset: Optional[str] = None,
+    material_preset: Optional[str] = None,
+    lighting_preset: Optional[str] = None,
+) -> Dict[str, Any]:
+    pipeline_key = f"sd35::{job_type}"
+
+    meta: Dict[str, Any] = {
+        "job_id": job_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "type": "img2img" if job_type == "sd35_img2img" else "text2img",
+        "model_name": "sd35_large_pro_v2_1",
+        "engine": "sd35_large_pro_v2_1",
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "seed": int(seed),
+        "style_preset": style_preset,
+        "material_preset": material_preset,
+        "lighting_preset": lighting_preset,
+        "category": category,
+        "shot": shot,
+        "status": "queued",
+        "mode_runtime": "gpu-dispatch",
+        "pipeline_key": pipeline_key,
+        "outputs": {
+            "image": "output.png",
+            "meta": "meta.json",
+        },
+        "dispatch": {
+            "job_type": job_type,
+            "target": _gpu_worker_url(),
+            "dispatched_at": None,
+            "gpu_response": None,
+            "error": None,
+        },
+    }
+
+    if input_image is not None:
+        meta["input_image"] = input_image
+        meta["outputs"]["input"] = input_image
+
+    if strength is not None:
+        meta["strength"] = float(strength)
+
+    return meta
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @router.post("/render")
-async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
+async def sd35_render_json(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
     Text2Img (application/json):
     - Create job folder
@@ -272,18 +342,15 @@ async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="JSON payload must be an object/dict")
 
-    prompt = (payload.get("prompt") or "").strip()
+    prompt = str(payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Missing prompt")
 
-    negative_prompt = (payload.get("negative_prompt") or "").strip()
+    negative_prompt = str(payload.get("negative_prompt") or "").strip()
 
     category = payload.get("category")
     shot = payload.get("shot")
-    if category not in ("urban", "suburban", "interior", "wide_hero"):
-        raise HTTPException(status_code=400, detail="Invalid category")
-    if shot not in ("wide", "close"):
-        raise HTTPException(status_code=400, detail="Invalid shot")
+    _validate_category_shot(category, shot)
 
     upscale_2x = payload.get("upscale_2x")
     seed = payload.get("seed")
@@ -298,57 +365,24 @@ async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.utcnow().isoformat(),
-
-        "type": "text2img",
-        "model_name": "sd35_large_pro_v2_1",
-        "engine": "sd35_large_pro_v2_1",
-
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "seed": int(final_seed),
-
-        "style_preset": style_preset,
-        "material_preset": material_preset,
-        "lighting_preset": lighting_preset,
-
-        "category": category,
-        "shot": shot,
-
-        "denoise": 0.0,
-
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "pipeline_key": "sd35::sd35_text2img",
-
-        "outputs": {
-            "image": "output.png",
-            "meta": "meta.json",
-        },
-
-        "dispatch": {
-            "job_type": "sd35_text2img",
-            "target": _gpu_worker_url(),
-            "dispatched_at": None,
-            "gpu_response": None,
-            "error": None,
-        },
-    }
+    meta = _base_meta(
+        job_id=job_id,
+        job_type="sd35_text2img",
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        seed=int(final_seed),
+        category=category,
+        shot=shot,
+        style_preset=style_preset,
+        material_preset=material_preset,
+        lighting_preset=lighting_preset,
+    )
 
     try:
         apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
 
-    # Hard lock again (safety)
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
-
-    # STRICT override (supports 0.0)
     _apply_override_to_meta(meta, payload)
 
     meta_path = _save_meta(job_folder, meta)
@@ -372,7 +406,7 @@ async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
             "public_urls": public_urls,
             "gpu_response": gpu_resp,
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         try:
             meta["status"] = "gpu_error"
             meta["dispatch"]["error"] = {"detail": str(exc)}
@@ -386,7 +420,11 @@ async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
             "job_folder": job_folder,
             "meta_path": meta_path,
             "public_urls": public_urls,
-            "gpu_error": {"detail": str(exc), "url": _gpu_worker_url(), "job_folder_sent": _abs(job_folder)},
+            "gpu_error": {
+                "detail": str(exc),
+                "url": _gpu_worker_url(),
+                "job_folder_sent": _abs(job_folder),
+            },
         }
 
 
@@ -394,84 +432,49 @@ async def sd35_render_json(payload: Dict[str, Any] = Body(...)):
 async def sd35_render_form(
     prompt: str = Form(..., description="Main prompt for SD3.5"),
     negative_prompt: Optional[str] = Form(None),
-
     category: Category = Form(...),
     shot: Shot = Form(...),
-
     upscale_2x: Optional[bool] = Form(None),
     seed: Optional[int] = Form(None),
-
     style_preset: Optional[str] = Form(None),
     material_preset: Optional[str] = Form(None),
     lighting_preset: Optional[str] = Form(None),
-
-    # OPTIONAL override for Wix form route too
     lycoris_multiplier: Optional[float] = Form(None),
     geo_multiplier: Optional[float] = Form(None),
-):
+) -> Dict[str, Any]:
     """
-    Text2Img (multipart/form-data):
-    - Create job folder
-    - Write meta.json WITH locked presets
-    - Optional override for LyCORIS/GEO multipliers
-    - Dispatch to GPU worker -> REAL SD3.5
+    Text2Img (multipart/form-data).
     """
+    prompt_clean = (prompt or "").strip()
+    if not prompt_clean:
+        raise HTTPException(status_code=400, detail="Missing prompt")
+
+    _validate_category_shot(category, shot)
+
     job_folder = _create_job_folder(job_type="sd35_text2img")
     job_id = os.path.basename(job_folder)
     public_urls = _outputs_public_urls(job_folder)
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.utcnow().isoformat(),
-
-        "type": "text2img",
-        "model_name": "sd35_large_pro_v2_1",
-        "engine": "sd35_large_pro_v2_1",
-
-        "prompt": (prompt or "").strip(),
-        "negative_prompt": (negative_prompt or "").strip(),
-        "seed": int(final_seed),
-
-        "style_preset": style_preset,
-        "material_preset": material_preset,
-        "lighting_preset": lighting_preset,
-
-        "category": category,
-        "shot": shot,
-
-        "denoise": 0.0,
-
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "pipeline_key": "sd35::sd35_text2img",
-
-        "outputs": {
-            "image": "output.png",
-            "meta": "meta.json",
-        },
-
-        "dispatch": {
-            "job_type": "sd35_text2img",
-            "target": _gpu_worker_url(),
-            "dispatched_at": None,
-            "gpu_response": None,
-            "error": None,
-        },
-    }
+    meta = _base_meta(
+        job_id=job_id,
+        job_type="sd35_text2img",
+        prompt=prompt_clean,
+        negative_prompt=(negative_prompt or "").strip(),
+        seed=int(final_seed),
+        category=category,
+        shot=shot,
+        style_preset=style_preset,
+        material_preset=material_preset,
+        lighting_preset=lighting_preset,
+    )
 
     try:
         apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
 
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
-
-    # Apply override for form route too (top-level keys)
     payload_for_override = {
         "override": None,
         "lycoris_multiplier": lycoris_multiplier,
@@ -500,7 +503,7 @@ async def sd35_render_form(
             "public_urls": public_urls,
             "gpu_response": gpu_resp,
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         try:
             meta["status"] = "gpu_error"
             meta["dispatch"]["error"] = {"detail": str(exc)}
@@ -514,7 +517,11 @@ async def sd35_render_form(
             "job_folder": job_folder,
             "meta_path": meta_path,
             "public_urls": public_urls,
-            "gpu_error": {"detail": str(exc), "url": _gpu_worker_url(), "job_folder_sent": _abs(job_folder)},
+            "gpu_error": {
+                "detail": str(exc),
+                "url": _gpu_worker_url(),
+                "job_folder_sent": _abs(job_folder),
+            },
         }
 
 
@@ -523,29 +530,30 @@ async def sd35_render_from_image(
     image: UploadFile = File(..., description="Base image / sketch / clay render (PNG/JPG)"),
     prompt: str = Form(...),
     negative_prompt: Optional[str] = Form(None),
-
-    strength: float = Form(0.70, ge=0.0, le=1.0),
-
+    strength: float = Form(0.22, ge=0.0, le=1.0),
     category: Category = Form(...),
     shot: Shot = Form(...),
-
     upscale_2x: Optional[bool] = Form(None),
     seed: Optional[int] = Form(None),
-
-    # OPTIONAL override for img2img form route too
     lycoris_multiplier: Optional[float] = Form(None),
     geo_multiplier: Optional[float] = Form(None),
-):
+) -> Dict[str, Any]:
     """
     Img2Img (multipart/form-data):
     - Save input.png
     - Write meta.json WITH locked presets + strength
     - Optional override for LyCORIS/GEO multipliers
-    - Dispatch to GPU worker -> REAL SD3.5 Img2Img (requires GPU runtime support)
+    - Dispatch to GPU worker -> REAL SD3.5 Img2Img
     """
     if not image.filename:
         raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
     _ensure_image_type(image)
+
+    prompt_clean = (prompt or "").strip()
+    if not prompt_clean:
+        raise HTTPException(status_code=400, detail="Missing prompt")
+
+    _validate_category_shot(category, shot)
 
     job_folder = _create_job_folder(job_type="sd35_img2img")
     job_id = os.path.basename(job_folder)
@@ -556,54 +564,25 @@ async def sd35_render_from_image(
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.utcnow().isoformat(),
-
-        "type": "img2img",
-        "model_name": "sd35_large_pro_v2_1",
-        "engine": "sd35_large_pro_v2_1",
-
-        "prompt": (prompt or "").strip(),
-        "negative_prompt": (negative_prompt or "").strip(),
-        "seed": int(final_seed),
-
-        "strength": float(strength),
-        "input_image": "input.png",
-
-        "category": category,
-        "shot": shot,
-
-        "denoise": 0.0,
-
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "pipeline_key": "sd35::sd35_img2img",
-
-        "outputs": {
-            "input": "input.png",
-            "image": "output.png",
-            "meta": "meta.json",
-        },
-
-        "dispatch": {
-            "job_type": "sd35_img2img",
-            "target": _gpu_worker_url(),
-            "dispatched_at": None,
-            "gpu_response": None,
-            "error": None,
-        },
-    }
+    meta = _base_meta(
+        job_id=job_id,
+        job_type="sd35_img2img",
+        prompt=prompt_clean,
+        negative_prompt=(negative_prompt or "").strip(),
+        seed=int(final_seed),
+        category=category,
+        shot=shot,
+        input_image="input.png",
+        strength=float(strength),
+    )
 
     try:
         apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
 
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
+    # Preserve img2img strength; preset layer must not zero it out.
+    meta["strength"] = float(strength)
 
     payload_for_override = {
         "override": None,
@@ -634,7 +613,7 @@ async def sd35_render_from_image(
             "public_urls": public_urls,
             "gpu_response": gpu_resp,
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         try:
             meta["status"] = "gpu_error"
             meta["dispatch"]["error"] = {"detail": str(exc)}
@@ -649,5 +628,9 @@ async def sd35_render_from_image(
             "input_saved_as": input_path,
             "meta_path": meta_path,
             "public_urls": public_urls,
-            "gpu_error": {"detail": str(exc), "url": _gpu_worker_url(), "job_folder_sent": _abs(job_folder)},
+            "gpu_error": {
+                "detail": str(exc),
+                "url": _gpu_worker_url(),
+                "job_folder_sent": _abs(job_folder),
+            },
         }

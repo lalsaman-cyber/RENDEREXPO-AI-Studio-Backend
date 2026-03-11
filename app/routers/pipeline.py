@@ -1,41 +1,43 @@
 # app/routers/pipeline.py
 """
-Unified pipeline planner for RENDEREXPO AI STUDIO (planning-first + optional execution).
+Unified pipeline planner for RENDEREXPO AI STUDIO (planner-first + selective local execution).
 
-CRITICAL (Doc 18):
-- Any stage that uses SD3.5 MUST store the locked preset system:
-  steps, CFG, LyCORIS(PRO 2.1) multiplier, GEO multiplier, resolution,
-  NO denoise anywhere, upscale optional per request.
+IMPORTANT:
+- Planner = port 8012
+- GPU worker = port 8002
 
-This router provides:
-1) /plan  -> CPU-only planning; writes meta["pipeline_plan"] and injects resolved_sd35_meta blocks.
-2) /run   -> Executes supported stages NOW (REAL). Currently:
-           - vr      -> builds a real Three.js viewer + zip package under job_folder/vr/
-           - upscale -> deterministic upscaler (NO diffusion), writes output image + updates meta
+What this router does:
+1) /plan
+   - CPU-only planning
+   - writes meta["pipeline_plan"]
+   - injects resolved SD3.5 meta blocks using locked presets
 
-Notes:
-- We DO NOT run SD3.5 inference here (GPU runtime stays in GPU dispatch flows).
-- /run is incremental: we add real execution stage-by-stage.
+2) /run
+   - executes only supported local stages now
+   - currently:
+       - vr      -> builds a real Three.js viewer + zip package under job_folder/vr/
+       - upscale -> deterministic upscale only (Pillow Lanczos)
+
+What this router does NOT do:
+- no SD3.5 inference here
+- no GPU dispatch here
+- SD3.5 execution remains in the dedicated planner -> GPU worker flows
 """
 
 from __future__ import annotations
 
-import os
-import json
 import datetime
+import json
+import os
 from pathlib import Path
-from typing import List, Dict, Any, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-
-from PIL import Image  # deterministic upscale
+from PIL import Image
 
 from app.presets_sd35 import apply_preset_to_meta
-
-# REAL stage builders (implemented now)
 from app.services.vr_builder import build_vr_package
-
 
 router = APIRouter(
     prefix="/api/pipeline",
@@ -63,10 +65,7 @@ StageType = Literal[
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
 
-# stages that will use SD3.5 later
 SD35_STAGE_TYPES = {"text2img", "img2img", "controlnet"}
-
-# Engine identity (per your locked standard)
 SD35_ENGINE_NAME = "sd35_large_pro_v2_1"
 
 
@@ -75,31 +74,6 @@ SD35_ENGINE_NAME = "sd35_large_pro_v2_1"
 # ---------------------------------------------------------------------------
 
 class PipelineStage(BaseModel):
-    """
-    One step in a planned pipeline.
-
-    params is free-form, but for SD3.5 stages we support these keys:
-
-    Required for SD3.5 planning:
-      - category: urban/suburban/interior/wide_hero
-      - shot: wide/close
-
-    Optional:
-      - upscale_2x: true/false (if omitted, preset default)
-      - prompt / negative_prompt
-      - seed
-      - strength (img2img/controlnet only; NOT denoise)
-      - control_type / control_strength / conditioning_image (controlnet stage)
-      - input_image / planned_output_image
-
-    For UPSCALE (deterministic, real execution supported in /run):
-      - enabled: bool (default true)
-      - factor: 2 or 4 (default 2)
-      - method: "lanczos" (default)
-      - input_image: filename in job_folder (default auto)
-      - output_image: filename (default output_upscaled_2x.png)
-      - denoise: MUST be 0.0 (rejected otherwise)
-    """
     stage_type: StageType = Field(..., description="Type of stage in the pipeline.")
     params: Dict[str, Any] = Field(default_factory=dict, description="Free-form parameter dict for this stage.")
 
@@ -143,7 +117,8 @@ def _read_meta(job_folder: str) -> Dict[str, Any]:
     if not os.path.isfile(meta_file):
         return {}
     with open(meta_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
 
 
 def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
@@ -154,10 +129,6 @@ def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
 
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
-
-
-def _safe_bool(v: Any) -> bool:
-    return bool(v) is True
 
 
 def _safe_basename(name: str) -> str:
@@ -185,7 +156,7 @@ def _require_sd35_selectors(params: Dict[str, Any], idx: int, stage_type: str) -
             status_code=400,
             detail=(
                 f"Stage {idx} ({stage_type}) requires 'category' and 'shot' in params "
-                f"to apply Doc 18 locked presets."
+                "to apply locked presets."
             ),
         )
 
@@ -210,29 +181,19 @@ def _build_sd35_meta_for_stage(
 ) -> Dict[str, Any]:
     """
     Create a meta-like dict that the GPU runtime can execute later.
-    Enforces Doc 18 locks via apply_preset_to_meta().
     """
     prompt = params.get("prompt")
     negative_prompt = params.get("negative_prompt")
     seed = params.get("seed")
-
-    # Img2img/controlnet transform strength (NOT denoise)
-    strength = params.get("strength", 0.70)
+    strength = params.get("strength", 0.22)
 
     base: Dict[str, Any] = {
         "created_at": _now_iso(),
-
-        # Explicit identity
         "engine": SD35_ENGINE_NAME,
         "model_name": SD35_ENGINE_NAME,
-
         "category": category,
         "shot": shot,
         "seed": seed,
-
-        # Hard lock: no denoise anywhere
-        "denoise": 0.0,
-
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "status": "planned",
@@ -259,13 +220,10 @@ def _build_sd35_meta_for_stage(
     else:
         base["type"] = stage_type
 
-    # Apply Doc 18 preset locks (width/height/steps/CFG/LyCORIS/GEO + optional upscale block)
     apply_preset_to_meta(base, category=category, shot=shot, upscale_2x=upscale_2x)
 
-    # Safety: enforce denoise hard-lock again
-    base["denoise"] = 0.0
-    if isinstance(base.get("upscale"), dict):
-        base["upscale"]["denoise"] = 0.0
+    if stage_type in ("img2img", "controlnet"):
+        base["strength"] = float(strength)
 
     return base
 
@@ -280,10 +238,6 @@ def _detect_overrides(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _infer_date_and_job_id(job_folder: str) -> Tuple[str, str]:
-    """
-    job_folder is expected like: outputs/YYYY-MM-DD/<job_id>
-    Returns (date_str, job_id)
-    """
     p = Path(job_folder)
     job_id = p.name
     date_str = p.parent.name
@@ -302,7 +256,7 @@ def _open_image(path: str) -> Image.Image:
         img.load()
         return img
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Failed opening image: {exc}")
+        raise HTTPException(status_code=400, detail=f"Failed opening image: {exc}") from exc
 
 
 def _save_image(img: Image.Image, out_path: str) -> None:
@@ -314,18 +268,14 @@ def _save_image(img: Image.Image, out_path: str) -> None:
             rgb = img.convert("RGB")
             rgb.save(out_path, format="JPEG", quality=95, optimize=True)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Failed saving image: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed saving image: {exc}") from exc
 
 
-def _run_deterministic_upscale(
-    *,
-    job_folder: str,
-    params: Dict[str, Any],
-) -> Dict[str, Any]:
+def _run_deterministic_upscale(*, job_folder: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     REAL upscale execution (no GPU):
-    - deterministic resize only (Lanczos)
-    - NO diffusion, denoise must be 0.0
+    - deterministic resize only
+    - no diffusion
     """
     enabled = True if "enabled" not in params else bool(params.get("enabled"))
     factor = int(params.get("factor", 2))
@@ -335,7 +285,7 @@ def _run_deterministic_upscale(
     if denoise != 0.0:
         raise HTTPException(status_code=400, detail="Upscale denoise must be 0.0 (NO diffusion).")
     if method != "lanczos":
-        raise HTTPException(status_code=400, detail="Upscale method must be 'lanczos' (deterministic).")
+        raise HTTPException(status_code=400, detail="Upscale method must be 'lanczos'.")
     if factor not in (2, 4):
         raise HTTPException(status_code=400, detail="Upscale factor must be 2 or 4.")
 
@@ -347,7 +297,6 @@ def _run_deterministic_upscale(
             "note": "Upscale disabled by request.",
         }
 
-    # Resolve input image
     if params.get("input_image"):
         in_name = _ensure_png_jpg_name(str(params["input_image"]))
     else:
@@ -359,15 +308,11 @@ def _run_deterministic_upscale(
                 break
         in_name = found or "output.png"
 
-    # Resolve output image
     if params.get("output_image"):
         out_name = _ensure_png_jpg_name(str(params["output_image"]))
     else:
         ext = os.path.splitext(in_name)[1].lower()
-        if ext in (".jpg", ".jpeg"):
-            out_name = f"output_upscaled_{factor}x.jpg"
-        else:
-            out_name = f"output_upscaled_{factor}x.png"
+        out_name = f"output_upscaled_{factor}x.jpg" if ext in (".jpg", ".jpeg") else f"output_upscaled_{factor}x.png"
 
     in_path = os.path.join(job_folder, in_name)
     out_path = os.path.join(job_folder, out_name)
@@ -379,7 +324,7 @@ def _run_deterministic_upscale(
     try:
         up = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
     except Exception:
-        up = img.resize((new_w, new_h), resample=Image.LANCZOS)  # pillow backward compat
+        up = img.resize((new_w, new_h), resample=Image.LANCZOS)
 
     _save_image(up, out_path)
 
@@ -403,12 +348,12 @@ def _run_deterministic_upscale(
 # ---------------------------------------------------------------------------
 
 @router.post("/plan", response_model=PipelinePlanResponse)
-async def plan_pipeline(request: PipelinePlanRequest):
+async def plan_pipeline(request: PipelinePlanRequest) -> PipelinePlanResponse:
     """
     Planning-only.
     - writes meta["pipeline_plan"]
-    - injects resolved_sd35_meta for SD3.5 stages (Doc 18 locked)
-    - injects resolved_upscale_plan for upscale stages (denoise=0.0)
+    - injects resolved SD3.5 meta for SD3.5 stages
+    - injects deterministic upscale plan for upscale stages
     """
     job_folder = request.job_folder
     _ensure_job_folder(job_folder)
@@ -433,13 +378,12 @@ async def plan_pipeline(request: PipelinePlanRequest):
         overrides_applied = _detect_overrides(params)
         if overrides_applied:
             stage_entry["overrides_applied"] = {
-                "note": "These keys are preset-locked by Doc 18 and will be ignored/overridden.",
+                "note": "These keys are preset-locked and will be ignored or overridden.",
                 "attempted": overrides_applied,
             }
 
         if stage_type in SD35_STAGE_TYPES:
             category, shot, upscale_2x = _require_sd35_selectors(params, idx, stage_type)
-
             resolved_sd35_meta = _build_sd35_meta_for_stage(
                 stage_type=stage_type,
                 params=params,
@@ -447,12 +391,10 @@ async def plan_pipeline(request: PipelinePlanRequest):
                 shot=shot,
                 upscale_2x=upscale_2x,
             )
-
             stage_entry["resolved_sd35_meta"] = resolved_sd35_meta
-            stage_entry["doc18_locked"] = True
+            stage_entry["preset_locked"] = True
 
         elif stage_type in ("product", "product_insert"):
-            # Planning helper: only inject SD35 meta if caller asks for rerender/harmonize.
             rerender_flag = bool(params.get("rerender_with_sd35", False) or params.get("harmonize_with_sd35", False))
             if rerender_flag:
                 category, shot, upscale_2x = _require_sd35_selectors(params, idx, stage_type)
@@ -462,7 +404,7 @@ async def plan_pipeline(request: PipelinePlanRequest):
                         "prompt": params.get("prompt"),
                         "negative_prompt": params.get("negative_prompt"),
                         "seed": params.get("seed"),
-                        "strength": params.get("strength", 0.70),
+                        "strength": params.get("strength", 0.22),
                         "input_image": params.get("input_image", "product_insert_raw.png"),
                         "planned_output_image": params.get("planned_output_image", "product_insert_result.png"),
                         **params,
@@ -472,12 +414,11 @@ async def plan_pipeline(request: PipelinePlanRequest):
                     upscale_2x=upscale_2x,
                 )
                 stage_entry["resolved_sd35_meta"] = resolved_sd35_meta
-                stage_entry["doc18_locked"] = True
+                stage_entry["preset_locked"] = True
             else:
-                stage_entry["doc18_locked"] = False
+                stage_entry["preset_locked"] = False
 
         elif stage_type == "upscale":
-            # Deterministic upscale plan (NO diffusion)
             enabled = True if "enabled" not in params else bool(params.get("enabled"))
             factor = int(params.get("factor", 2))
             method = str(params.get("method", "lanczos")).lower().strip()
@@ -490,17 +431,8 @@ async def plan_pipeline(request: PipelinePlanRequest):
             if factor not in (2, 4):
                 raise HTTPException(status_code=400, detail=f"Stage {idx} (upscale) factor must be 2 or 4.")
 
-            # choose defaults (plan-only, file may not exist yet)
-            if params.get("input_image"):
-                in_name = _ensure_png_jpg_name(str(params["input_image"]))
-            else:
-                # planned default: output.png
-                in_name = "output.png"
-
-            if params.get("output_image"):
-                out_name = _ensure_png_jpg_name(str(params["output_image"]))
-            else:
-                out_name = f"output_upscaled_{factor}x.png"
+            in_name = _ensure_png_jpg_name(str(params["input_image"])) if params.get("input_image") else "output.png"
+            out_name = _ensure_png_jpg_name(str(params["output_image"])) if params.get("output_image") else f"output_upscaled_{factor}x.png"
 
             stage_entry["resolved_upscale_plan"] = {
                 "enabled": bool(enabled),
@@ -511,18 +443,18 @@ async def plan_pipeline(request: PipelinePlanRequest):
                 "output_image": out_name,
                 "planned_at": _now_iso(),
                 "mode": "plan-only",
-                "note": "Deterministic upscale only. NO diffusion. denoise=0.0 hard-locked.",
+                "note": "Deterministic upscale only. No diffusion.",
             }
-            stage_entry["doc18_locked"] = True  # denoise lock applies
+            stage_entry["preset_locked"] = True
 
         else:
-            stage_entry["doc18_locked"] = False
+            stage_entry["preset_locked"] = False
 
         resolved_stages.append(stage_entry)
 
     pipeline_plan = {
         "created_at": _now_iso(),
-        "planner": "pipeline_planner_v3_doc18_locked",
+        "planner": "pipeline_planner_locked",
         "stages": resolved_stages,
     }
 
@@ -534,7 +466,7 @@ async def plan_pipeline(request: PipelinePlanRequest):
 
     return PipelinePlanResponse(
         status="ok",
-        message="Pipeline planned. SD3.5 stages include Doc 18 locked resolved meta blocks. Upscale stages include deterministic denoise=0 plans.",
+        message="Pipeline planned. SD3.5 stages include locked resolved meta blocks. Upscale stages include deterministic plans.",
         job_folder=job_folder,
         pipeline=pipeline_plan,
         meta_path=_meta_path(job_folder),
@@ -542,19 +474,19 @@ async def plan_pipeline(request: PipelinePlanRequest):
 
 
 # ---------------------------------------------------------------------------
-# Route: RUN (REAL execution for supported stages)
+# Route: RUN
 # ---------------------------------------------------------------------------
 
 @router.post("/run", response_model=PipelineRunResponse)
-async def run_pipeline(request: PipelinePlanRequest):
+async def run_pipeline(request: PipelinePlanRequest) -> PipelineRunResponse:
     """
-    Execute supported pipeline stages now (REAL).
+    Execute supported stages now.
 
     Supported:
-    - vr: builds a navigable Three.js viewer + zip (no GPU).
-    - upscale: deterministic resize (Pillow Lanczos), writes upscaled file + meta updates.
+    - vr
+    - upscale
 
-    We DO NOT execute SD3.5 here. SD3.5 stages are still dispatched via GPU worker routes.
+    SD3.5 execution is not done here.
     """
     job_folder = request.job_folder
     _ensure_job_folder(job_folder)
@@ -571,7 +503,6 @@ async def run_pipeline(request: PipelinePlanRequest):
         params = stage.params or {}
 
         if stage_type == "vr":
-            # VR expects images already present in job folder as view_*.png
             view_files = sorted([p.name for p in Path(job_folder).glob("view_*.png")])
             if len(view_files) < 3:
                 iv = meta.get("input_views")
@@ -596,12 +527,11 @@ async def run_pipeline(request: PipelinePlanRequest):
                     plan_hint=plan_hint,
                 )
             except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=500, detail=f"VR build failed: {exc}")
+                raise HTTPException(status_code=500, detail=f"VR build failed: {exc}") from exc
 
             viewer_url = f"{public_base}/{built['viewer_rel']}"
             download_url = f"/api/vr/download/{date_str}/{job_id}"
 
-            results.setdefault("vr", {})
             results["vr"] = {
                 "viewer_url": viewer_url,
                 "download_url": download_url,
@@ -616,14 +546,12 @@ async def run_pipeline(request: PipelinePlanRequest):
         elif stage_type == "upscale":
             upscale_result = _run_deterministic_upscale(job_folder=job_folder, params=params)
 
-            # Update meta
             meta.setdefault("outputs", {})
             meta["upscale"] = upscale_result
+
             if upscale_result.get("enabled") is True:
                 out_name = str(upscale_result.get("output_image"))
                 meta["outputs"]["upscaled_image"] = out_name
-
-                results.setdefault("upscale", {})
                 results["upscale"] = {
                     "output_image": out_name,
                     "output_url": f"{public_base}/{out_name}",
@@ -632,7 +560,6 @@ async def run_pipeline(request: PipelinePlanRequest):
                     "method": upscale_result.get("method"),
                 }
             else:
-                results.setdefault("upscale", {})
                 results["upscale"] = {"enabled": False}
 
             meta["last_updated"] = _now_iso()

@@ -1,32 +1,31 @@
 # app/routers/floorplan.py
 
 """
-RENDEREXPO AI STUDIO - Floorplan Router (Planning, but production-real intent)
+RENDEREXPO AI STUDIO - Floorplan Router (Planning-first, production-real intent)
 
-CRITICAL (Doc 18):
-- Any endpoint that PLANS an SD3.5 render must store locked preset meta:
-  steps, CFG, LyCORIS(PRO 2.1) multiplier, GEO multiplier, resolution,
-  NO denoise anywhere, upscale optional per-request.
+Purpose:
+- Planning-only router for floorplan workflows
+- Creates job folders, saves files, writes meta.json
+- Embeds locked SD3.5 preset blocks for later REAL GPU execution
 
-This router is planning-first (no GPU dispatch here yet):
-- It creates job folders, saves files, writes meta.json
-- It embeds Doc 18 locked sd35_meta blocks so later GPU dispatch can run REAL inference
-
-Wix-friendly:
-- Returns stable public URLs assuming outputs/ is mounted at /outputs.
-- Enforces PNG/JPG only for uploads (global rule).
+IMPORTANT:
+- Planner = port 8012
+- GPU worker = port 8002
+- This router does NOT run inference
+- This router does NOT load SD3.5
+- Preset logic comes from app.presets_sd35.apply_preset_to_meta(...)
 """
 
 from __future__ import annotations
 
-import os
-import uuid
 import datetime
 import json
+import os
 import shutil
-from typing import Dict, Any, Optional, List, Literal, Tuple
+import uuid
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.presets_sd35 import apply_preset_to_meta
@@ -49,12 +48,19 @@ def _today_utc_str() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
+def _create_job_folder(base_outputs_dir: str = "outputs", job_type: str = "floorplan") -> str:
     """Create outputs/{YYYY-MM-DD}/{job_id}/ folder (UTC)."""
     today = _today_utc_str()
     job_id = uuid.uuid4().hex
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
+
+    try:
+        with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
+            f.write(job_type)
+    except Exception:
+        pass
+
     return folder
 
 
@@ -73,7 +79,8 @@ def _read_meta(job_folder: str) -> Dict[str, Any]:
     if not os.path.isfile(meta_file):
         return {}
     with open(meta_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
 
 
 def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
@@ -108,12 +115,10 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 
 
 def _ensure_png_jpg_only(upload: UploadFile) -> None:
-    # best-effort content-type check (not fully trusted)
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
 
-    # filename extension check
     name = (upload.filename or "").lower()
     if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
@@ -149,12 +154,8 @@ def _build_sd35_planned_meta(
     planned_output_image: str = "output.png",
 ) -> Dict[str, Any]:
     """
-    Build a SD3.5 planned meta dict using locked Doc 18 presets.
-    This is saved inside floorplan meta.json under planned fields.
-
-    IMPORTANT:
-    - PLANNING ONLY (no inference here).
-    - Preset knobs are owned by apply_preset_to_meta(); we do not alter them.
+    Build a SD3.5 planned meta dict using locked presets.
+    This is planning only and saved into floorplan meta.
     """
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
@@ -162,17 +163,13 @@ def _build_sd35_planned_meta(
         "job_type": job_type,
         "created_at": _utc_iso(),
         "type": "text2img" if input_image is None else "img2img",
-
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": final_seed,
         "category": category,
         "shot": shot,
-
-        "denoise": 0.0,  # hard lock
         "planned_output_image": planned_output_image,
     }
 
@@ -182,12 +179,6 @@ def _build_sd35_planned_meta(
         meta["strength"] = float(strength)
 
     apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-
-    # Safety lock again
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
-
     return meta
 
 
@@ -197,7 +188,7 @@ def _build_sd35_planned_meta(
 
 class FloorplanGenerateRequest(BaseModel):
     """
-    Prompt → top-down, clean 2D rendered floorplan planning (production intent).
+    Prompt → top-down, clean 2D rendered floorplan planning.
     """
     prompt: str = Field(
         ...,
@@ -209,7 +200,6 @@ class FloorplanGenerateRequest(BaseModel):
     width: int = Field(1024, ge=128, le=4096, description="Planned output width (pixels).")
     height: int = Field(1024, ge=128, le=4096, description="Planned output height (pixels).")
 
-    # Concept constraints (used by future layout solver + SD stage)
     wall_thickness: float = Field(0.2, ge=0.05, le=1.0, description="Wall thickness in meters (conceptual).")
     num_bedrooms: Optional[int] = Field(default=None, ge=0, le=20)
     num_bathrooms: Optional[int] = Field(default=None, ge=0, le=20)
@@ -218,9 +208,8 @@ class FloorplanGenerateRequest(BaseModel):
     include_corridor: bool = Field(True)
     notes: Optional[str] = Field(default=None, description="Extra constraints.")
 
-    # Doc 18 selectors for the planned SD3.5 floorplan render stage
-    category: Category = Field("interior", description="Doc 18 preset category")
-    shot: Shot = Field("wide", description="Doc 18 preset shot")
+    category: Category = Field("interior", description="Preset category")
+    shot: Shot = Field("wide", description="Preset shot")
     upscale_2x: Optional[bool] = Field(
         None,
         description="Optional override: true/false. If omitted, preset default applies.",
@@ -234,12 +223,12 @@ class FloorplanGenerateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.post("/upload")
-async def upload_floorplan(image: UploadFile = File(..., description="Floorplan image (PNG/JPG only)")):
+async def upload_floorplan(image: UploadFile = File(..., description="Floorplan image (PNG/JPG only)")) -> Dict[str, Any]:
     if not image.filename:
         raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
     _ensure_png_jpg_only(image)
 
-    job_folder = _create_job_folder()
+    job_folder = _create_job_folder(job_type="floorplan_upload")
     _ensure_folder_exists(job_folder)
 
     floorplan_path = os.path.join(job_folder, "floorplan.png")
@@ -262,8 +251,6 @@ async def upload_floorplan(image: UploadFile = File(..., description="Floorplan 
     meta["floorplan_image"] = "floorplan.png"
     meta.setdefault("cameras", [])
     meta.setdefault("planned_render", None)
-
-    # planning-first but production-real intent
     meta["mode_runtime"] = "planned-real"
     meta["status"] = "uploaded"
 
@@ -271,7 +258,7 @@ async def upload_floorplan(image: UploadFile = File(..., description="Floorplan 
 
     return {
         "status": "ok",
-        "message": "Floorplan uploaded (planning-first; ready for real pipeline).",
+        "message": "Floorplan uploaded.",
         "job_folder": job_folder,
         "meta_path": _meta_path(job_folder),
         "public_urls": _outputs_public_urls(job_folder),
@@ -291,7 +278,7 @@ async def set_camera(
     camera_x: float = Form(..., description="Camera X in floorplan coordinates"),
     camera_y: float = Form(..., description="Camera Y in floorplan coordinates"),
     rotation_deg: float = Form(..., description="Camera rotation in degrees"),
-):
+) -> Dict[str, Any]:
     _ensure_folder_exists(job_folder)
 
     meta = _read_meta(job_folder)
@@ -313,7 +300,7 @@ async def set_camera(
 
     return {
         "status": "ok",
-        "message": "Camera added to floorplan (planning-first).",
+        "message": "Camera added to floorplan.",
         "job_folder": job_folder,
         "camera": camera_info,
         "meta_path": _meta_path(job_folder),
@@ -330,13 +317,11 @@ async def plan_floorplan_render(
     job_folder: str = Form(..., description="Job folder returned by /floorplan/upload"),
     prompt: str = Form(..., description="Prompt for the planned render"),
     negative_prompt: Optional[str] = Form(None),
-
     category: Category = Form(...),
     shot: Shot = Form(...),
     upscale_2x: Optional[bool] = Form(None),
-
     seed: Optional[int] = Form(None),
-):
+) -> Dict[str, Any]:
     _ensure_folder_exists(job_folder)
 
     meta = _read_meta(job_folder)
@@ -379,7 +364,7 @@ async def plan_floorplan_render(
 
     return {
         "status": "ok",
-        "message": "Floorplan → SD3.5 render planned using locked Doc 18 presets (planning-first).",
+        "message": "Floorplan render planned using locked presets.",
         "job_folder": job_folder,
         "planned_render": planned_render,
         "meta_path": _meta_path(job_folder),
@@ -397,16 +382,15 @@ async def plan_floorplan_to_3d(
     floorplan: UploadFile = File(..., description="Floorplan image (PNG/JPG only)"),
     prompt: str = Form(..., description="High-level description"),
     negative_prompt: Optional[str] = Form(None),
-
     category: Category = Form("interior"),
     shot: Shot = Form("wide"),
     upscale_2x: Optional[bool] = Form(None),
-):
+) -> Dict[str, Any]:
     if not floorplan.filename:
         raise HTTPException(status_code=400, detail="Uploaded floorplan has no filename.")
     _ensure_png_jpg_only(floorplan)
 
-    job_folder = _create_job_folder()
+    job_folder = _create_job_folder(job_type="floorplan_to_3d")
     floorplan_path = os.path.join(job_folder, "floorplan.png")
     await _save_upload_stream(floorplan, floorplan_path)
 
@@ -441,7 +425,6 @@ async def plan_floorplan_to_3d(
         "type": "floorplan_to_3d",
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "floorplan": "floorplan.png",
         "prompt": prompt,
         "negative_prompt": negative_prompt,
@@ -460,7 +443,7 @@ async def plan_floorplan_to_3d(
 
     return {
         "status": "ok",
-        "message": "Floorplan → 3D pipeline planned (planning-first; Doc 18 presets embedded for view stage).",
+        "message": "Floorplan to 3D pipeline planned.",
         "job_folder": job_folder,
         "meta_path": _meta_path(job_folder),
         "public_urls": _outputs_public_urls(job_folder),
@@ -476,16 +459,13 @@ async def plan_floorplan_to_3d(
 async def plan_camera_view(
     job_folder: str = Form(..., description="Job folder returned by /floorplan/upload"),
     camera_id: str = Form(..., description="camera_id from /floorplan/set-camera"),
-
     prompt: str = Form(..., description="Prompt for the room view"),
     negative_prompt: Optional[str] = Form(None),
-
     category: Category = Form(...),
     shot: Shot = Form(...),
     upscale_2x: Optional[bool] = Form(None),
-
     seed: Optional[int] = Form(None),
-):
+) -> Dict[str, Any]:
     _ensure_folder_exists(job_folder)
 
     meta = _read_meta(job_folder)
@@ -540,7 +520,7 @@ async def plan_camera_view(
 
     return {
         "status": "ok",
-        "message": "Camera-based room view planned using locked Doc 18 presets (planning-first).",
+        "message": "Camera-based room view planned using locked presets.",
         "job_folder": job_folder,
         "camera_id": camera_id,
         "planned_view": planned_view,
@@ -551,20 +531,18 @@ async def plan_camera_view(
 
 
 # ---------------------------------------------------------------------------
-# 6) Generate floorplan from prompt (no upload) - upgraded to production-real intent
+# 6) Generate floorplan from prompt (planning)
 # ---------------------------------------------------------------------------
 
 @router.post("/generate-from-prompt")
-async def generate_floorplan_from_prompt(request: FloorplanGenerateRequest):
-    job_folder = _create_job_folder()
+async def generate_floorplan_from_prompt(request: FloorplanGenerateRequest) -> Dict[str, Any]:
+    job_folder = _create_job_folder(job_type="floorplan_generate")
     created = _utc_iso()
 
-    # planned artifacts (produced by later pipeline execution)
     planned_output_image = "floorplan_generated.png"
     planned_output_layout = "floorplan_layout.json"
     planned_output_materials = "floorplan_materials.json"
 
-    # This is the "render intent" that locks your requirements for later execution
     render_intent: Dict[str, Any] = {
         "view": "top_down",
         "projection": "orthographic",
@@ -589,7 +567,6 @@ async def generate_floorplan_from_prompt(request: FloorplanGenerateRequest):
         "notes": request.notes,
     }
 
-    # SD3.5 planned meta for the actual “render the 2D plan” stage later
     sd35_floorplan_meta = _build_sd35_planned_meta(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
@@ -628,7 +605,7 @@ async def generate_floorplan_from_prompt(request: FloorplanGenerateRequest):
         },
         {
             "stage": "sd35_render_topdown_floorplan",
-            "description": "Render the top-down 2D plan with SD3.5 using Doc 18 locked presets (future GPU).",
+            "description": "Render the top-down 2D plan with SD3.5 using locked presets (future GPU).",
             "inputs": [planned_output_layout, planned_output_materials],
             "outputs": [planned_output_image],
             "sd35_meta": sd35_floorplan_meta,
@@ -641,24 +618,18 @@ async def generate_floorplan_from_prompt(request: FloorplanGenerateRequest):
         "type": "floorplan_generate",
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "generator": "floorplan_prompt_v2_topdown_materialized",
         "prompt": request.prompt,
         "negative_prompt": request.negative_prompt,
-
         "render_intent": render_intent,
-
         "status": "planned",
         "mode_runtime": "planned-real",
-
         "planned_output_files": {
             "image": planned_output_image,
             "layout_json": planned_output_layout,
             "materials_json": planned_output_materials,
         },
         "planned_actions": planned_actions,
-
-        # Embed the locked SD3.5 execution block here
         "sd35_planned_stage": {
             "enabled": True,
             "sd35_meta": sd35_floorplan_meta,
@@ -672,7 +643,7 @@ async def generate_floorplan_from_prompt(request: FloorplanGenerateRequest):
 
     return {
         "status": "ok",
-        "message": "Top-down floorplan generation planned (production intent; Doc 18 locked SD3.5 meta embedded).",
+        "message": "Top-down floorplan generation planned with locked SD3.5 meta embedded.",
         "job_folder": job_folder,
         "meta_path": _meta_path(job_folder),
         "public_urls": {

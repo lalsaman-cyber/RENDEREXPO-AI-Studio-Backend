@@ -1,48 +1,41 @@
 # app/routers/product.py
 
 """
-Product insertion planning endpoints (NO AI yet; planning-first, real file I/O).
+RENDEREXPO AI STUDIO - Product Insertion Router (Planning-first)
 
-What this does NOW (real):
+What this does now:
 - Accepts:
-    * room_image (required)  — the base room / space image
+    * room_image (required)   — the base room / space image
     * object_image (required) — the product image (couch, lamp, table, etc.)
     * placement_prompt (required) — where/how to place it
     * style_hint (optional) — a label to enrich the prompt
     * mode (insert_only | insert_and_rerender)
-    * if insert_and_rerender: Doc 18 selectors (category, shot) + optional upscale_2x + seed
+    * if insert_and_rerender: preset selectors (category, shot) + optional upscale_2x + seed
 - Creates outputs/{YYYY-MM-DD}/{job_id}/
 - Saves:
     * room.png
     * object.png
-- Writes meta.json describing the future pipeline steps
-- If rerender is enabled, also writes a Doc 18 preset-locked SD3.5 "rerender meta block"
-  that a future GPU stage can execute.
+- Writes meta.json describing future pipeline steps
+- If rerender is enabled, also writes a preset-locked SD3.5 rerender meta block
+  that a future GPU stage can execute
 
-CRITICAL (Doc 18):
-- If mode includes SD3.5 re-render, we MUST store locked preset parameters in meta:
-  steps, CFG, LyCORIS(PRO 2.1) multiplier, GEO multiplier, resolution,
-  NO denoise anywhere, upscale optional per request.
-- Diffusion denoise is hard-locked to 0.0.
-- PNG/JPG only for uploads (global rule).
-
-What this does NOT do YET:
-- No segmentation (SAM / etc.)
-- No depth or pose estimation
-- No compositing
-- No GPU dispatch
+IMPORTANT:
+- Planner = port 8012
+- GPU worker = port 8002
+- No GPU dispatch here yet
+- No AI execution here yet
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import shutil
 import datetime
-from typing import Optional, Dict, Any, List, Literal, Tuple
+import json
+import os
+import shutil
+import uuid
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.presets_sd35 import apply_preset_to_meta
 
@@ -73,7 +66,6 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
 
-    # marker file (best-effort)
     try:
         with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
             f.write("product_insertion")
@@ -115,12 +107,10 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 
 
 def _ensure_png_jpg_only(upload: UploadFile) -> None:
-    # best-effort content-type check (not fully trusted)
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
 
-    # filename extension check
     name = (upload.filename or "").lower()
     if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
@@ -159,53 +149,36 @@ def _build_sd35_rerender_meta(
     negative_prompt: Optional[str] = None,
     planned_output_image: str = "room_with_object_final.png",
     input_image: str = "room_with_object_raw.png",
-    strength: float = 0.70,
+    strength: float = 0.22,
 ) -> Dict[str, Any]:
     """
-    Build a Doc 18 preset-locked SD3.5 img2img meta block for a future GPU rerender/harmonize stage.
+    Build a preset-locked SD3.5 img2img meta block for a future GPU rerender stage.
+
     IMPORTANT:
     - "strength" is allowed and is NOT diffusion denoise.
-    - diffusion denoise is hard-locked to 0.0.
     """
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
     meta: Dict[str, Any] = {
         "job_id": None,  # filled by caller
         "created_at": _utc_iso(),
-
         "type": "img2img",
-
-        # Explicit identity: SD3.5 Large PRO 2.1
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": final_seed,
-
         "category": category,
         "shot": shot,
-
-        # Hard lock: no denoise anywhere
-        "denoise": 0.0,
-
-        # Img2Img transform knob (NOT denoise)
         "strength": float(strength),
-
-        # Stage IO
         "input_image": input_image,
         "planned_output_image": planned_output_image,
-
         "status": "planned",
         "mode_runtime": "planned-gpu-dispatch",
     }
 
     apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-
-    # Safety lock again
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
+    meta["strength"] = float(strength)
 
     return meta
 
@@ -233,27 +206,25 @@ async def plan_product_insertion(
         "insert_and_rerender",
         description="insert_only OR insert_and_rerender",
     ),
-
-    # --- Doc 18 preset selectors for rerender stage (only used if mode includes rerender)
     category: Optional[Category] = Form(
         None,
-        description="Doc 18 preset category for rerender stage (required if insert_and_rerender).",
+        description="Preset category for rerender stage (required if insert_and_rerender).",
     ),
     shot: Optional[Shot] = Form(
         None,
-        description="Doc 18 preset shot for rerender stage (required if insert_and_rerender).",
+        description="Preset shot for rerender stage (required if insert_and_rerender).",
     ),
     upscale_2x: Optional[bool] = Form(
         None,
-        description="Optional override for upscale during rerender stage (true/false).",
+        description="Optional override for upscale during rerender stage.",
     ),
     seed: Optional[int] = Form(
         None,
         description="Optional seed for rerender stage. If omitted, generated.",
     ),
-):
+) -> Dict[str, Any]:
     """
-    Planning-first product insertion job (real file saves + meta.json; no AI/GPU yet).
+    Planning-first product insertion job.
 
     Creates:
       outputs/{date}/{job_id}/
@@ -261,7 +232,6 @@ async def plan_product_insertion(
         object.png
         meta.json
     """
-    # global rule: PNG/JPG only
     if not room_image.filename or not object_image.filename:
         raise HTTPException(status_code=400, detail="room_image and object_image must have filenames.")
     _ensure_png_jpg_only(room_image)
@@ -273,24 +243,23 @@ async def plan_product_insertion(
             detail="mode must be 'insert_only' or 'insert_and_rerender'.",
         )
 
-    if mode == "insert_and_rerender":
-        if category is None or shot is None:
-            raise HTTPException(
-                status_code=400,
-                detail="category and shot are required when mode='insert_and_rerender'.",
-            )
+    if mode == "insert_and_rerender" and (category is None or shot is None):
+        raise HTTPException(
+            status_code=400,
+            detail="category and shot are required when mode='insert_and_rerender'.",
+        )
 
     # 1) Create job folder + job_id
     job_folder = _create_job_folder()
     job_id = os.path.basename(job_folder)
 
-    # 2) Save uploads (normalized names)
+    # 2) Save uploads
     room_rel = "room.png"
     object_rel = "object.png"
     await _save_upload_stream(room_image, os.path.join(job_folder, room_rel))
     await _save_upload_stream(object_image, os.path.join(job_folder, object_rel))
 
-    # 3) Build planned pipeline actions (conceptual; future GPU stages)
+    # 3) Build planned pipeline actions
     created_at = _utc_iso()
 
     planned_actions: List[Dict[str, Any]] = [
@@ -326,7 +295,7 @@ async def plan_product_insertion(
         },
     ]
 
-    # 4) Optional: add SD3.5 rerender/harmonize stage plan (Doc 18 locked)
+    # 4) Optional rerender stage
     sd35_rerender_meta: Optional[Dict[str, Any]] = None
 
     if mode == "insert_and_rerender":
@@ -335,11 +304,10 @@ async def plan_product_insertion(
                 "stage": "sd35_rerender",
                 "inputs": ["room_with_object_raw.png"],
                 "outputs": ["room_with_object_final.png"],
-                "description": "Run SD3.5 img2img to harmonize lighting/materials using Doc 18 locked presets (future GPU).",
+                "description": "Run SD3.5 img2img to harmonize lighting/materials using locked presets (future GPU).",
             }
         )
 
-        # combine style_hint + placement_prompt into the SD3.5 prompt
         combined_prompt = (style_hint + ", " if style_hint else "") + placement_prompt
 
         sd35_rerender_meta = _build_sd35_rerender_meta(
@@ -351,7 +319,7 @@ async def plan_product_insertion(
             negative_prompt=None,
             input_image="room_with_object_raw.png",
             planned_output_image="room_with_object_final.png",
-            strength=0.70,
+            strength=0.22,
         )
         sd35_rerender_meta["job_id"] = job_id
 
@@ -360,27 +328,18 @@ async def plan_product_insertion(
         "job_id": job_id,
         "created_at": created_at,
         "type": "product_insertion",
-
-        # Explicit identity: SD3.5 Large PRO 2.1 (even though we do not run it here)
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "status": "planned",
         "mode_runtime": "planning-only",
         "pipeline": "product_insertion_v1",
-
         "files": {
             "room_image": room_rel,
             "object_image": object_rel,
         },
-
         "placement_prompt": placement_prompt,
         "style_hint": style_hint,
         "mode": mode,
-
-        # Global hard-lock
-        "denoise": 0.0,
-
         "planned_outputs": {
             "mask": "object_mask.png",
             "rgba": "object_rgba.png",
@@ -389,24 +348,22 @@ async def plan_product_insertion(
             "composite_raw": "room_with_object_raw.png",
             "final": "room_with_object_final.png",
         },
-
         "planned_actions": planned_actions,
-        "sd35_rerender": {"enabled": bool(sd35_rerender_meta is not None), "meta": sd35_rerender_meta},
+        "sd35_rerender": {
+            "enabled": bool(sd35_rerender_meta is not None),
+            "meta": sd35_rerender_meta,
+        },
     }
 
-    # ensure sd35_rerender meta uses denoise=0.0 even if something upstream changes
     if isinstance(meta.get("sd35_rerender"), dict) and isinstance(meta["sd35_rerender"].get("meta"), dict):
-        meta["sd35_rerender"]["meta"]["denoise"] = 0.0
-        if isinstance(meta["sd35_rerender"]["meta"].get("upscale"), dict):
-            meta["sd35_rerender"]["meta"]["upscale"]["denoise"] = 0.0
+        meta["sd35_rerender"]["meta"]["strength"] = float(meta["sd35_rerender"]["meta"].get("strength", 0.22))
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder)
 
-    # 6) Return
     return {
         "status": "ok",
-        "message": "Product insertion job planned (planning-only; files saved; no AI/GPU executed).",
+        "message": "Product insertion job planned.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,

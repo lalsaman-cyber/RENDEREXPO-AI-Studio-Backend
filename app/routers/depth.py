@@ -1,31 +1,36 @@
 # app/routers/depth.py
 """
-RENDEREXPO AI STUDIO - Depth Maps (MiDaS skeleton)
+RENDEREXPO AI STUDIO - Depth Maps Router (Planning only)
 
-PLANNING ONLY (NO GPU, NO inference).
+PLANNING ONLY:
+- No GPU
+- No inference
+- No SD3.5 loading
+- No diffusion
 
-Doc 18 compatibility (important for system consistency):
-- This router MUST NOT introduce diffusion denoise (denoise is ALWAYS 0.0).
-- It MAY accept preset selectors (category/shot) so downstream SD3.5 stages
-  can reuse the same locked preset context.
-
-What it does:
+Purpose:
 - creates outputs/YYYY-MM-DD/<job_id>/
 - saves input image (input.png)
 - writes meta.json with a depth_plan section
-- optional: attaches Doc 18 preset context via apply_preset_to_meta()
+- can optionally attach locked SD3.5 preset context for downstream stages
+
+IMPORTANT:
+- Planner = port 8012
+- GPU worker = port 8002
+- This router must NOT introduce diffusion denoise.
+- This router may store preset context so downstream SD3.5 stages stay aligned.
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import shutil
 import datetime
-from typing import Optional, Dict, Any, Literal, Tuple
+import json
+import os
+import shutil
+import uuid
+from typing import Any, Dict, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.presets_sd35 import apply_preset_to_meta
 
@@ -34,7 +39,7 @@ router = APIRouter(prefix="/api/depth", tags=["Depth Maps (Planning Only)"])
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
 
-ALLOWED_BACKENDS = {"midas", "zoedepth", "leres"}  # planning labels only
+ALLOWED_BACKENDS = {"midas", "zoedepth", "leres"}
 ALLOWED_OUTPUT_FORMATS = {"png", "exr", "npy"}
 
 
@@ -56,7 +61,6 @@ def _create_job_folder(job_type: str) -> str:
     folder = os.path.join("outputs", today, job_id)
     os.makedirs(folder, exist_ok=True)
 
-    # marker for easy inspection
     try:
         with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
             f.write(job_type)
@@ -101,12 +105,10 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 
 
 def _ensure_png_jpg_only(upload: UploadFile) -> None:
-    # best-effort content-type check (not fully trusted)
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
 
-    # filename extension check
     name = (upload.filename or "").lower()
     if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
@@ -135,22 +137,18 @@ async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
 @router.post("/plan")
 async def plan_depth_map(
     image: UploadFile = File(..., description="Input image to compute depth map from (planning only)."),
-
-    # Optional preset context for downstream SD3.5 usage
     category: Optional[Category] = Form(
         None,
-        description="Optional Doc 18 preset category context for downstream SD3.5 stages.",
+        description="Optional preset category context for downstream SD3.5 stages.",
     ),
     shot: Optional[Shot] = Form(
         None,
-        description="Optional Doc 18 preset shot context for downstream SD3.5 stages.",
+        description="Optional preset shot context for downstream SD3.5 stages.",
     ),
     upscale_2x: Optional[bool] = Form(
         None,
-        description="Optional: store upscale intent (still optional; denoise always 0.0).",
+        description="Optional: store upscale intent for downstream stages.",
     ),
-
-    # Planning knobs for depth
     depth_backend: str = Form(
         "midas",
         description="Planned depth backend label (planning only). Allowed: midas/zoedepth/leres",
@@ -159,9 +157,9 @@ async def plan_depth_map(
         "png",
         description="Planned output format for depth (planning only). Allowed: png/exr/npy",
     ),
-):
+) -> Dict[str, Any]:
     """
-    Plan a depth map job (planning-only).
+    Plan a depth map job (planning only).
 
     Creates:
     - outputs/YYYY-MM-DD/<job_id>/
@@ -187,7 +185,7 @@ async def plan_depth_map(
             detail=f"output_format must be one of {sorted(ALLOWED_OUTPUT_FORMATS)}",
         )
 
-    # If they pass only one selector, refuse (prevents half-attached preset context)
+    # Avoid half-attached preset context
     if (category is None) ^ (shot is None):
         raise HTTPException(
             status_code=400,
@@ -207,24 +205,16 @@ async def plan_depth_map(
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": _utc_iso(),
-
         "type": "depth_plan",
         "status": "planned",
         "mode_runtime": "plan-only",
-
-        # Engine identity (NO SDXL)
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "inputs": {
             "image": "input.png",
             "content_type": getattr(image, "content_type", None),
             "original_filename": image.filename,
         },
-
-        # Hard lock: no denoise anywhere
-        "denoise": 0.0,
-
         "depth_plan": {
             "backend": depth_backend_norm,
             "output_format": output_format_norm,
@@ -233,45 +223,36 @@ async def plan_depth_map(
             "note": "Planning only. No depth inference executed here.",
             "planned_at": _utc_iso(),
         },
-
         "outputs": {
             "depth": planned_depth_name,
             "vis": planned_vis_name,
             "meta": "meta.json",
         },
-
         "runtime_notes": {
             "gpu_required_later": True,
             "inference_not_implemented_here": True,
         },
     }
 
-    # Optional: attach Doc 18 preset context (for downstream SD3.5 stages)
+    # Optional: attach preset context for downstream SD3.5 stages
     if category is not None and shot is not None:
         meta["preset_context"] = {
             "category": category,
             "shot": shot,
             "upscale_2x": upscale_2x,
-            "doc": "Doc 18",
             "note": "Preset context stored for downstream SD3.5 stages. Depth itself does not use steps/CFG.",
         }
 
-        # Apply locked preset logic so downstream stages get consistent preset data
         try:
             apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
-        # Safety re-lock
-        meta["denoise"] = 0.0
-        if isinstance(meta.get("upscale"), dict):
-            meta["upscale"]["denoise"] = 0.0
-
     _write_meta(job_folder, meta)
 
     return {
         "status": "ok",
-        "message": "Depth map planned (planning-only).",
+        "message": "Depth map planned (planning only).",
         "job_folder": job_folder,
         "input_saved_as": input_path,
         "meta_path": _meta_path(job_folder),

@@ -1,63 +1,50 @@
 # app/routers/sketch.py
 """
-app/routers/sketch.py
+RENDEREXPO AI STUDIO - Sketch Realtime Router (Planner -> GPU worker)
 
-RENDEREXPO AI STUDIO - Sketch Realtime (REAL execution, session storage)
-
-WHAT THIS DOES (your Wix “two screens” flow):
+WHAT THIS DOES:
 - Client draws on Wix canvas + types a prompt.
 - Wix sends frames (PNG/JPG) + prompt to this API.
 - This router:
   1) Stores frames in a session folder (for history + audit)
   2) Creates a real SD3.5 img2img job folder (outputs/YYYY-MM-DD/<job_id>/)
-  3) Writes a real meta.json with Doc 18 locked presets via apply_preset_to_meta()
-  4) Dispatches to your GPU runtime endpoint (HTTP) and returns output URLs
+  3) Writes a real meta.json with locked presets via apply_preset_to_meta()
+  4) Dispatches to the GPU worker and returns output URLs
 
 NO SKELETON:
-- If GPU dispatch is not configured, we fail fast with HTTP 503 (not “plan-only”).
+- If GPU dispatch is not configured, this fails fast.
 
-CRITICAL (Doc 18):
-- Any SD3.5 stage MUST store locked preset parameters:
-  steps, CFG, LyCORIS(PRO 2.1) multiplier, GEO multiplier, resolution,
-  NO denoise anywhere, upscale optional per-request.
+LOCKED SERVICE SPLIT:
+- Planner = port 8012
+- GPU worker = port 8002
 
-REQUIRED RUNTIME CONFIG (env vars):
+REQUIRED RUNTIME CONFIG:
 - RENDEREXPO_GPU_DISPATCH_URL
-    Example: "http://127.0.0.1:8000/api/sd35/img2img"
-    (This must be your real GPU/runtime endpoint that executes an img2img job.)
+    Example: "http://127.0.0.1:8002/api/gpu/dispatch"
 - Optional:
   - RENDEREXPO_GPU_TIMEOUT_SECONDS (default 90)
-  - RENDEREXPO_GPU_POLL_SECONDS (default 0.5)  # if your runtime is async and returns a status_url
-  - RENDEREXPO_OUTPUTS_MOUNT (default "/outputs")  # where outputs/ is served publicly
+  - RENDEREXPO_GPU_POLL_SECONDS (default 0.5)
+  - RENDEREXPO_OUTPUTS_MOUNT (default "/outputs")
 
-RUNTIME CONTRACT (expected from GPU endpoint):
-Option A (SYNC):
-- Returns JSON including either:
-    {"status":"ok","output_image":"output.png"} OR {"status":"ok","output_path":".../output.png"}
-
-Option B (ASYNC + polling):
-- Returns JSON including:
-    {"status":"queued","status_url":"http://.../api/jobs/<id>/status"}
-- Status URL returns:
-    {"status":"running"} or {"status":"ok","output_image":"output.png"} or {"status":"error","detail":"..."}
-
-If your runtime differs, adjust _dispatch_to_gpu() mapping at the bottom.
+DISPATCH CONTRACT:
+- Planner sends:
+    {"job_folder":"ABSOLUTE_PATH","meta":{...}}
+- GPU worker reads meta and writes output.png into the same folder.
 """
 
 from __future__ import annotations
 
-import os
-import io
+import datetime
 import json
-import uuid
+import os
 import shutil
 import time
-import datetime
-import urllib.request
 import urllib.error
-from typing import Optional, Any, Dict, Literal, Tuple
+import urllib.request
+import uuid
+from typing import Any, Dict, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.presets_sd35 import apply_preset_to_meta
@@ -84,8 +71,8 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return v
 
 
-GPU_DISPATCH_URL = _env("RENDEREXPO_GPU_DISPATCH_URL")  # REQUIRED for realtime
-OUTPUTS_MOUNT = _env("RENDEREXPO_OUTPUTS_MOUNT", "/outputs")  # public mount path
+GPU_DISPATCH_URL = _env("RENDEREXPO_GPU_DISPATCH_URL")
+OUTPUTS_MOUNT = _env("RENDEREXPO_OUTPUTS_MOUNT", "/outputs")
 GPU_TIMEOUT_SECONDS = float(_env("RENDEREXPO_GPU_TIMEOUT_SECONDS", "90") or "90")
 GPU_POLL_SECONDS = float(_env("RENDEREXPO_GPU_POLL_SECONDS", "0.5") or "0.5")
 
@@ -102,6 +89,16 @@ def _today_utc_str() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
 
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
+
+
+def _abs_repo_path(rel_path: str) -> str:
+    if os.path.isabs(rel_path):
+        return rel_path
+    return os.path.abspath(os.path.join(_repo_root(), rel_path))
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -113,7 +110,8 @@ def _write_json(path: str, data: Dict[str, Any]) -> None:
 
 def _read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
 
 
 def _ensure_png_jpg_only(upload: UploadFile) -> None:
@@ -126,7 +124,6 @@ def _ensure_png_jpg_only(upload: UploadFile) -> None:
 
 
 def _session_root(session_id: str) -> str:
-    # outputs/YYYY-MM-DD/sessions/<session_id>/
     return os.path.join("outputs", _today_utc_str(), "sessions", session_id)
 
 
@@ -201,14 +198,14 @@ def _require_gpu_dispatch() -> str:
             status_code=503,
             detail=(
                 "Sketch realtime requires GPU dispatch. "
-                "Set env var RENDEREXPO_GPU_DISPATCH_URL to your real img2img runtime endpoint."
+                "Set env var RENDEREXPO_GPU_DISPATCH_URL to your real GPU worker dispatch endpoint."
             ),
         )
     return GPU_DISPATCH_URL
 
 
 def _http_post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=data,
@@ -241,30 +238,33 @@ def _http_get_json(url: str, timeout_s: float) -> Dict[str, Any]:
 
 def _dispatch_to_gpu(job_folder: str, timeout_s: float) -> Dict[str, Any]:
     """
-    Dispatch the SD3.5 img2img job to your GPU/runtime endpoint.
-
-    EXPECTED:
-    - The runtime reads job_folder/meta.json and runs the job, writing output.png into the same folder.
+    Dispatch the SD3.5 img2img job to the GPU worker.
 
     We send:
-      {"job_folder": "...", "meta_path": ".../meta.json"}
+      {"job_folder": "ABSOLUTE_PATH", "meta": {...}}
 
-    If runtime is SYNC: returns {"status":"ok", ...}
-    If runtime is ASYNC: returns {"status":"queued","status_url":"..."} and we poll until ok/error.
+    Sync success:
+      {"status":"ok", ...}
+
+    Async success:
+      {"status":"queued","status_url":"..."} then poll until ok/error.
     """
     url = _require_gpu_dispatch()
     meta_path = os.path.join(job_folder, "meta.json")
+    meta = _read_json(meta_path)
 
     start = time.time()
-    first = _http_post_json(url, {"job_folder": job_folder, "meta_path": meta_path}, timeout_s=timeout_s)
+    first = _http_post_json(
+        url,
+        {"job_folder": _abs_repo_path(job_folder), "meta": meta},
+        timeout_s=timeout_s,
+    )
 
     status = (first.get("status") or "").lower().strip()
 
-    # Sync success
     if status in ("ok", "success", "completed"):
         return {"dispatch_mode": "sync", "runtime_response": first}
 
-    # Async polling
     status_url = first.get("status_url")
     if status_url:
         while True:
@@ -278,7 +278,6 @@ def _dispatch_to_gpu(job_folder: str, timeout_s: float) -> Dict[str, Any]:
                 raise HTTPException(status_code=500, detail=f"GPU job failed: {s.get('detail') or s}")
             time.sleep(GPU_POLL_SECONDS)
 
-    # Unknown response
     raise HTTPException(status_code=502, detail=f"GPU dispatch returned unexpected payload: {first}")
 
 
@@ -303,7 +302,7 @@ class StartSketchSessionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.post("/start-session")
-async def start_sketch_session(request: StartSketchSessionRequest):
+async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, Any]:
     """
     Start a sketch session and store locked preset selectors.
     """
@@ -317,22 +316,16 @@ async def start_sketch_session(request: StartSketchSessionRequest):
         "created_at": _utc_iso(),
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "category": request.category,
         "shot": request.shot,
         "seed": seed,
         "notes": request.notes,
-        "upscale_2x": request.upscale_2x,  # optional session-level override
-
-        # Hard lock: NO denoise anywhere
-        "denoise": 0.0,
-
+        "upscale_2x": request.upscale_2x,
         "last_frame_index": -1,
         "last_frame_filename": None,
         "status": "active",
     }
 
-    # Store preset-applied knobs for visibility
     preset_probe: Dict[str, Any] = {
         "type": "img2img",
         "engine": "sd35_large_pro_v2_1",
@@ -340,16 +333,17 @@ async def start_sketch_session(request: StartSketchSessionRequest):
         "category": request.category,
         "shot": request.shot,
         "seed": seed,
-        "denoise": 0.0,
         "prompt": "probe",
         "planned_output_image": "output.png",
         "status": "planned",
         "mode": "probe",
     }
-    apply_preset_to_meta(preset_probe, category=request.category, shot=request.shot, upscale_2x=request.upscale_2x)
-    preset_probe["denoise"] = 0.0
-    if isinstance(preset_probe.get("upscale"), dict):
-        preset_probe["upscale"]["denoise"] = 0.0
+    apply_preset_to_meta(
+        preset_probe,
+        category=request.category,
+        shot=request.shot,
+        upscale_2x=request.upscale_2x,
+    )
 
     session_meta["preset"] = preset_probe.get("preset", {})
     session_meta["locked_generation_controls"] = {
@@ -360,14 +354,13 @@ async def start_sketch_session(request: StartSketchSessionRequest):
         "lora_config": preset_probe.get("lora_config"),
         "geo_config": preset_probe.get("geo_config"),
         "upscale": preset_probe.get("upscale"),
-        "denoise": 0.0,
     }
 
     _write_json(_session_meta_path(session_id), session_meta)
 
     return {
         "status": "ok",
-        "message": "Sketch session created. Doc 18 presets are locked for this session.",
+        "message": "Sketch session created. Presets are locked for this session.",
         "session_id": session_id,
         "session_folder": root,
         "session_meta_path": _session_meta_path(session_id),
@@ -378,34 +371,21 @@ async def start_sketch_session(request: StartSketchSessionRequest):
 
 @router.post("/upload-frame")
 async def upload_sketch_frame(
-    # Frame upload
     image: UploadFile = File(..., description="Sketch frame image (PNG/JPG only)"),
-
-    # Required session pointer
     session_id: str = Form(..., description="Session ID from /start-session"),
-
-    # Required for REALTIME generation
     prompt: str = Form(..., description="Prompt used to generate the right-side image in realtime."),
     negative_prompt: Optional[str] = Form(None, description="Optional negative prompt"),
-
-    # Img2img transform strength (NOT denoise)
-    strength: float = Form(0.70, ge=0.0, le=1.0, description="Img2img transform strength (NOT denoise)."),
-
-    # Optional per-frame overrides (otherwise session defaults apply)
+    strength: float = Form(0.22, ge=0.0, le=1.0, description="Img2img transform strength"),
     category: Optional[Category] = Form(None, description="Optional override category"),
     shot: Optional[Shot] = Form(None, description="Optional override shot"),
     upscale_2x: Optional[bool] = Form(None, description="Optional override upscale"),
     seed: Optional[int] = Form(None, description="Optional override seed"),
-):
+) -> Dict[str, Any]:
     """
     REALTIME:
     - Stores the sketch frame in the session
     - Creates a real SD3.5 img2img job folder + meta.json
-    - Dispatches to GPU runtime and returns output URL
-
-    This is the backend for your Wix two-panel UI:
-      Left panel: sketch canvas -> frame upload
-      Right panel: generated output.png -> returned URL
+    - Dispatches to GPU worker and returns output URL
     """
     if not image.filename:
         raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
@@ -420,14 +400,12 @@ async def upload_sketch_frame(
 
     session_meta = _read_json(meta_path)
 
-    # Resolve selectors
     use_category: Category = category or session_meta["category"]
     use_shot: Shot = shot or session_meta["shot"]
     use_seed = seed if seed is not None else session_meta.get("seed")
     if use_seed is None:
         use_seed = int(uuid.uuid4().int % 1_000_000_000)
 
-    # Resolve upscale override (frame override > session override > preset default)
     if upscale_2x is None:
         upscale_override = session_meta.get("upscale_2x", None)
     else:
@@ -456,7 +434,6 @@ async def upload_sketch_frame(
         "category": use_category,
         "shot": use_shot,
         "seed": use_seed,
-        "denoise": 0.0,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "strength": float(strength),
@@ -464,11 +441,10 @@ async def upload_sketch_frame(
     frame_meta_path = os.path.join(frames_dir, f"frame_{next_idx:05d}.json")
     _write_json(frame_meta_path, frame_meta)
 
-    # 2) Create REAL job folder for GPU runtime
+    # 2) Create REAL job folder for GPU worker
     job_folder = _create_job_folder(job_type="sketch_img2img_realtime")
     job_id = os.path.basename(job_folder)
 
-    # Stage input as input.png
     job_input = os.path.join(job_folder, "input.png")
     try:
         with open(frame_path, "rb") as src, open(job_input, "wb") as dst:
@@ -476,51 +452,40 @@ async def upload_sketch_frame(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to stage input.png for job: {exc}") from exc
 
-    # 3) Write REAL meta.json for the runtime to execute
+    # 3) Write REAL meta.json for the GPU worker to execute
     job_meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": _utc_iso(),
-
         "type": "img2img",
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": use_seed,
-
         "strength": float(strength),
         "input_image": "input.png",
         "planned_output_image": "output.png",
-
-        # Doc 18 selectors
         "category": use_category,
         "shot": use_shot,
-
-        # Hard lock: NO denoise anywhere
-        "denoise": 0.0,
-
-        # Link back to session/frame
         "source": {
             "feature": "sketch",
             "session_id": session_id,
             "frame_index": next_idx,
             "frame_filename": frame_name,
         },
-
         "status": "queued",
         "mode": "realtime",
     }
 
     apply_preset_to_meta(job_meta, category=use_category, shot=use_shot, upscale_2x=upscale_override)
-    job_meta["denoise"] = 0.0
-    if isinstance(job_meta.get("upscale"), dict):
-        job_meta["upscale"]["denoise"] = 0.0
+
+    # Preserve the actual img2img strength after preset application.
+    job_meta["strength"] = float(strength)
 
     job_meta_path = os.path.join(job_folder, "meta.json")
     _write_json(job_meta_path, job_meta)
 
-    # 4) Dispatch to GPU runtime (REAL) and wait for completion
+    # 4) Dispatch to GPU worker and wait for completion
     dispatch_result = _dispatch_to_gpu(job_folder=job_folder, timeout_s=GPU_TIMEOUT_SECONDS)
 
     # 5) Return stable public URLs for Wix UI
@@ -533,11 +498,9 @@ async def upload_sketch_frame(
         "frame_index": next_idx,
         "frame_path": frame_path,
         "frame_meta_path": frame_meta_path,
-
         "job_id": job_id,
         "job_folder": job_folder,
         "job_meta_path": job_meta_path,
-
         "public_urls": public,
         "dispatch": dispatch_result,
         "category_used": use_category,

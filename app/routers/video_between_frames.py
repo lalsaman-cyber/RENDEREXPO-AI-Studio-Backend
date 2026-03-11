@@ -1,13 +1,13 @@
 # app/routers/video_between_frames.py
 """
-RENDEREXPO AI STUDIO - Video Between Frames (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - Video Between Frames Router (Planner)
 
 GOAL:
 - Client uploads TWO images (PNG/JPG):
     - first_frame (start)
     - last_frame  (end)
-- Create a job folder, save both images, write meta.json
-- DISPATCH to GPU dispatcher so this is REAL
+- Planner creates a job folder, saves both images, writes meta.json
+- Planner dispatches to GPU worker so this is REAL
 
 Output:
 - video_between.mp4 (primary)
@@ -15,9 +15,14 @@ Output:
 - viewer/index.html (optional)
 - meta.json updated by GPU worker
 
+Service split (LOCKED):
+- Planner = port 8012
+- GPU worker = port 8002
+
 Dispatch:
 - job_type: "video_between_frames"
 - GPU endpoint: VIDEO_GPU_DISPATCH_URL
+  default: http://127.0.0.1:8002/api/gpu/dispatch
 
 SECURITY (Option A):
 - GPU dispatch is HMAC-signed using RENDEREXPO_HMAC_SECRET
@@ -31,20 +36,20 @@ SECURITY (Option A):
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import time
-import hmac
-import hashlib
-import shutil
 import datetime
-from typing import Optional, Any, Dict, Tuple
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import time
+import uuid
+from typing import Any, Dict, Optional, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-router = APIRouter(prefix="/api/video", tags=["Video (REAL)"])
+router = APIRouter(prefix="/api/video", tags=["Video (Planner)"])
 
 HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
 SIG_HEADER = "X-RENDEREXPO-SIGNATURE"
@@ -57,11 +62,17 @@ def _now_epoch() -> int:
 
 
 def _gpu_dispatch_url() -> str:
-    return os.getenv("VIDEO_GPU_DISPATCH_URL", "http://127.0.0.1:8012/api/gpu/dispatch").strip()
+    return os.getenv("VIDEO_GPU_DISPATCH_URL", "http://127.0.0.1:8002/api/gpu/dispatch").strip()
+
+
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
 
 
 def _abs(p: str) -> str:
-    return os.path.abspath(p)
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(_repo_root(), p))
 
 
 def _today_utc_str() -> str:
@@ -73,6 +84,13 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     job_id = uuid.uuid4().hex
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
+
+    try:
+        with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
+            f.write("video_between_frames")
+    except Exception:
+        pass
+
     return folder
 
 
@@ -108,6 +126,7 @@ def _ensure_image_type(upload: UploadFile) -> None:
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
+
     name = (upload.filename or "").lower().strip()
     if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
@@ -135,10 +154,8 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     url = _gpu_dispatch_url()
 
     payload = {
-        "job_type": "video_between_frames",
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        "pipeline_key": "video::between_frames",
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -162,7 +179,7 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     }
 
     try:
-        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 60))
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
         if not (200 <= r.status_code < 300):
             raise RuntimeError(f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
         return r.json() if r.content else {"status": "ok"}
@@ -174,17 +191,16 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
 async def video_between_frames(
     first_frame: UploadFile = File(..., description="Start image (PNG/JPG)"),
     last_frame: UploadFile = File(..., description="End image (PNG/JPG)"),
-
     prompt: Optional[str] = Form(None, description="Optional prompt to guide transition style"),
     negative_prompt: Optional[str] = Form(None, description="Optional negative prompt"),
-
     duration_seconds: float = Form(4.0, description="Target duration (seconds). 2.0..10.0"),
     fps: int = Form(24, description="FPS. 12..60"),
     motion_strength: float = Form(0.8, description="0..1 general motion amount"),
     seed: Optional[int] = Form(None, description="Optional seed"),
-):
+) -> Dict[str, Any]:
     if not first_frame.filename or not last_frame.filename:
         raise HTTPException(status_code=400, detail="Both uploaded images must have filenames.")
+
     _ensure_image_type(first_frame)
     _ensure_image_type(last_frame)
 
@@ -211,12 +227,9 @@ async def video_between_frames(
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
         "type": "video_between_frames",
-
         "status": "queued",
         "mode_runtime": "gpu-dispatch",
-
         "pipeline_key": "video::between_frames",
-
         "inputs": {
             "first_frame": "first.png",
             "last_frame": "last.png",
@@ -224,25 +237,21 @@ async def video_between_frames(
             "last_content_type": getattr(last_frame, "content_type", None),
             "source": "upload",
         },
-
         "guidance": {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
         },
-
         "video_runtime": {
             "duration_seconds": float(duration_seconds),
             "fps": int(fps),
             "motion_strength": float(motion_strength),
             "seed": seed,
         },
-
         "outputs": {
             "video_between": "video_between.mp4",
             "frames_dir": "frames/",
             "viewer_dir": "viewer/",
         },
-
         "dispatch": {
             "job_type": "video_between_frames",
             "target": _gpu_dispatch_url(),

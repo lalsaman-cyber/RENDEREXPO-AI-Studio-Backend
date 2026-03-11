@@ -1,7 +1,7 @@
 # app/routers/upscale.py
 
 """
-RENDEREXPO AI STUDIO - Upscale (REAL execution + optional planning)
+RENDEREXPO AI STUDIO - Upscale Router (Planner-side, deterministic)
 
 What it does:
 - Upscale an existing image inside a job folder (usually output.png) by 2x or 4x
@@ -19,19 +19,29 @@ Inputs supported:
 Security:
 - Prevent path traversal (only basename)
 - Only PNG/JPG allowed
+
+Architecture:
+- Planner = port 8012
+- GPU worker = port 8002
+- Root = /workspace-data/RENDEREXPO-AI-Studio-Backend
+
+IMPORTANT:
+- This route is planner-side only.
+- It does NOT load SD3.5.
+- It does NOT use GPU.
+- It does NOT use diffusion.
 """
 
 from __future__ import annotations
 
-import os
-import json
 import datetime
-from typing import Optional, Dict, Any, Tuple
+import json
+import os
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-
-from PIL import Image  # pillow
+from PIL import Image
 
 
 router = APIRouter(prefix="/api/upscale", tags=["Upscale"])
@@ -55,7 +65,8 @@ def _read_meta(job_folder: str) -> Dict[str, Any]:
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed reading meta.json: {exc}")
 
@@ -69,10 +80,6 @@ def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
         raise HTTPException(status_code=500, detail=f"Failed writing meta.json: {exc}")
 
 
-def _date_dir(date_str: str) -> str:
-    return os.path.join("outputs", date_str)
-
-
 def _find_job_folder_by_id(job_id: str) -> Optional[Tuple[str, str]]:
     """
     Find outputs/<date_str>/<job_id> by scanning outputs/*/<job_id>.
@@ -82,7 +89,6 @@ def _find_job_folder_by_id(job_id: str) -> Optional[Tuple[str, str]]:
     if not os.path.isdir(outputs_dir):
         return None
 
-    # date folders are "YYYY-MM-DD" so lexical sort works
     for date_str in sorted(os.listdir(outputs_dir), reverse=True):
         date_path = os.path.join(outputs_dir, date_str)
         if not os.path.isdir(date_path):
@@ -112,7 +118,6 @@ def _resolve_job_folder(
         if not os.path.isdir(jf):
             raise HTTPException(status_code=404, detail=f"Job folder not found: {jf}")
 
-        # best-effort parse: outputs/YYYY-MM-DD/<job_id>
         parts = os.path.normpath(jf).split(os.sep)
         if len(parts) >= 3 and parts[-3] == "outputs":
             return parts[-2], parts[-1], jf
@@ -162,7 +167,6 @@ def _save_image(img: Image.Image, out_path: str) -> None:
         if ext == ".png":
             img.save(out_path, format="PNG", optimize=True)
         else:
-            # JPEG
             rgb = img.convert("RGB")
             rgb.save(out_path, format="JPEG", quality=95, optimize=True)
     except Exception as exc:  # noqa: BLE001
@@ -188,9 +192,7 @@ class UpscalePlanRequest(BaseModel):
 
     enabled: bool = Field(True, description="If false, writes an explicit disabled plan")
     factor: int = Field(2, ge=2, le=4, description="Upscale factor (2 or 4)")
-    method: str = Field("lanczos", description="Deterministic upscale method (no diffusion). Only 'lanczos' supported now.")
-
-    denoise: float = Field(0.0, description="MUST stay 0.0. Any non-zero value will be rejected.")
+    method: str = Field("lanczos", description="Deterministic upscale method. Only 'lanczos' supported.")
 
     input_image: Optional[str] = Field(None, description="Image filename in job folder (default auto-detect)")
     output_image: Optional[str] = Field(None, description="Output filename (default: output_upscaled_2x.png)")
@@ -208,11 +210,8 @@ class UpscaleRunRequest(UpscalePlanRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/plan")
-def plan_upscale(req: UpscalePlanRequest):
+def plan_upscale(req: UpscalePlanRequest) -> Dict[str, Any]:
     date_str, job_id, job_folder = _resolve_job_folder(req.job_folder, req.date_str, req.job_id, req.by_id)
-
-    if float(req.denoise) != 0.0:
-        raise HTTPException(status_code=400, detail="denoise must be 0.0 (NO diffusion upscale).")
 
     if req.method.lower().strip() != "lanczos":
         raise HTTPException(status_code=400, detail="Only method='lanczos' is supported for deterministic upscale.")
@@ -232,9 +231,8 @@ def plan_upscale(req: UpscalePlanRequest):
         elif os.path.isfile(os.path.join(job_folder, "input.png")):
             in_name = "input.png"
         else:
-            in_name = "output.png"  # planned default
+            in_name = "output.png"
 
-    # default output
     if req.output_image:
         out_name = _safe_image_name(req.output_image)
     else:
@@ -244,12 +242,11 @@ def plan_upscale(req: UpscalePlanRequest):
         "enabled": bool(req.enabled),
         "factor": int(req.factor),
         "method": "lanczos",
-        "denoise": 0.0,
         "input_image": in_name,
         "output_image": out_name,
         "planned_at": _now_iso(),
         "mode": "plan-only",
-        "note": "Deterministic upscale only. NO diffusion. denoise=0.0 hard-locked.",
+        "note": "Deterministic upscale only. NO diffusion.",
     }
 
     meta.setdefault("job_id", os.path.basename(job_folder))
@@ -261,7 +258,7 @@ def plan_upscale(req: UpscalePlanRequest):
 
     return {
         "status": "ok",
-        "message": "Upscale planned. (No diffusion. denoise=0.0 locked.)",
+        "message": "Upscale planned.",
         "job_folder": job_folder,
         "meta_path": _meta_path(job_folder),
         "upscale_plan": plan,
@@ -270,7 +267,7 @@ def plan_upscale(req: UpscalePlanRequest):
 
 
 @router.post("/run")
-def run_upscale(req: UpscaleRunRequest):
+def run_upscale(req: UpscaleRunRequest) -> Dict[str, Any]:
     """
     REAL upscale execution (no GPU required):
     - reads input image from job folder
@@ -280,21 +277,16 @@ def run_upscale(req: UpscaleRunRequest):
     """
     date_str, job_id, job_folder = _resolve_job_folder(req.job_folder, req.date_str, req.job_id, req.by_id)
 
-    if float(req.denoise) != 0.0:
-        raise HTTPException(status_code=400, detail="denoise must be 0.0 (NO diffusion upscale).")
-
     if req.method.lower().strip() != "lanczos":
         raise HTTPException(status_code=400, detail="Only method='lanczos' is supported for deterministic upscale.")
 
     if req.enabled is False:
-        # still persist a "disabled" run record
         meta = _read_meta(job_folder)
         meta.setdefault("job_id", os.path.basename(job_folder))
         meta.setdefault("type", meta.get("type", "unknown"))
         meta["upscale"] = {
             "enabled": False,
             "ran_at": _now_iso(),
-            "denoise": 0.0,
             "note": "Upscale disabled by request.",
         }
         meta["last_updated"] = _now_iso()
@@ -308,11 +300,9 @@ def run_upscale(req: UpscaleRunRequest):
             "upscale": meta["upscale"],
         }
 
-    # input
     if req.input_image:
         in_name = _safe_image_name(req.input_image)
     else:
-        # best available
         candidates = ["output.png", "output.jpg", "output.jpeg", "input.png", "input.jpg", "input.jpeg"]
         found = None
         for c in candidates:
@@ -321,11 +311,9 @@ def run_upscale(req: UpscaleRunRequest):
                 break
         in_name = found or "output.png"
 
-    # output
     if req.output_image:
         out_name = _safe_image_name(req.output_image)
     else:
-        # keep same extension as input if it was jpg/jpeg, otherwise png
         ext = os.path.splitext(in_name)[1].lower()
         if ext in (".jpg", ".jpeg"):
             out_name = f"output_upscaled_{int(req.factor)}x.jpg"
@@ -345,12 +333,10 @@ def run_upscale(req: UpscaleRunRequest):
     try:
         up = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
     except Exception:
-        # backward compat for older pillow
         up = img.resize((new_w, new_h), resample=Image.LANCZOS)
 
     _save_image(up, out_path)
 
-    # update meta
     meta = _read_meta(job_folder)
     meta.setdefault("job_id", os.path.basename(job_folder))
     meta.setdefault("type", meta.get("type", "unknown"))
@@ -359,7 +345,6 @@ def run_upscale(req: UpscaleRunRequest):
         "enabled": True,
         "factor": factor,
         "method": "lanczos",
-        "denoise": 0.0,
         "input_image": in_name,
         "output_image": out_name,
         "input_size": {"width": w, "height": h},
@@ -386,8 +371,6 @@ def run_upscale(req: UpscaleRunRequest):
     }
 
 
-# Optional backward compatibility:
-# Old code used POST "" as the plan endpoint. Keep it alive.
 @router.post("")
-def plan_upscale_compat(req: UpscalePlanRequest):
+def plan_upscale_compat(req: UpscalePlanRequest) -> Dict[str, Any]:
     return plan_upscale(req)

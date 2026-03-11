@@ -2,11 +2,15 @@
 """
 LOCAL-ONLY FastAPI app for RENDEREXPO AI STUDIO.
 
-IMPORTANT (UPDATED):
+IMPORTANT:
 - This API is INTERNAL (for Wix backend proxy + your own testing).
 - It should NOT be exposed directly to end users.
 - It does NOT load SD3.5 directly (planner/orchestrator role).
 - It MUST enforce HMAC auth on ALL endpoints except /api/health.
+
+LOCKED SERVICE MAP:
+- Planner API  -> 8012
+- GPU worker   -> 8002
 
 HMAC SECURITY (LOCKED):
 - Sign RAW request body bytes
@@ -24,39 +28,42 @@ SECRET:
 - Environment variable required:
     RENDEREXPO_HMAC_SECRET
 
-NOTE (IMPORTANT):
+IMPORTANT:
 - This is the PLANNER service.
-- It should NOT expose the GPU worker's /api/gpu/dispatch route.
-  That route belongs to the GPU worker service running separately (port 8012).
+- It must NOT expose the GPU worker's /api/gpu/dispatch route.
+- That route belongs to the separate GPU worker service.
 """
 
+import hashlib
+import hmac
 import os
 import time
-import hmac
-import hashlib
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.routers import (
-    plan,
-    text2img,
-    img2img,
-    jobs,
-    depth,
+    cad,
     controlnet,
-    upscale,
-    vr,
-    moodboard,
-    product,
+    depth,
     floorplan,
+    img2img,
+    insert_object,
+    jobs,
+    mesh_from_image,
+    moodboard,
+    pipeline,
+    plan,
+    product,
+    product_insert,
     sketch,
+    text2img,
+    upscale,
     video_between_frames,
     video_from_image,
-    cad,               # CAD router (REAL via GPU dispatch)
-    mesh_from_image,   # Mesh-from-image router (REAL via GPU dispatch)
+    vr,
 )
 
 # ---------------------------------------------------------------------------
@@ -69,16 +76,10 @@ SIG_HEADER = "X-RENDEREXPO-SIGNATURE"
 TS_HEADER = "X-RENDEREXPO-TIMESTAMP"
 NONCE_HEADER = "X-RENDEREXPO-NONCE"
 
-# Timestamp acceptance window (±30s locked)
 TS_WINDOW_SECONDS = 30
-
-# Nonce cache TTL (a little longer than TS window)
 NONCE_TTL_SECONDS = 90
 
-# Only health is open (everything else requires HMAC)
 OPEN_PATHS = {"/api/health"}
-
-# Static outputs must be open (Wix <img src="/outputs/..."> cannot send headers)
 OPEN_PREFIXES = ("/outputs/",)
 
 
@@ -104,8 +105,7 @@ def _compute_signature(secret: str, timestamp: str, nonce: str, body: bytes) -> 
     """
     prefix = f"{timestamp}\n{nonce}\n".encode("utf-8")
     msg = prefix + (body or b"")
-    digest = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    return digest
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 
 def _constant_time_equal(a: str, b: str) -> bool:
@@ -119,7 +119,7 @@ app = FastAPI(
         "This is NOT client-facing. Wix UI will be client-facing. "
         "All endpoints (except /api/health) require HMAC authentication."
     ),
-    version="0.2.0",
+    version="0.2.1",
 )
 
 # Serve outputs so /outputs/... URLs work
@@ -138,7 +138,7 @@ async def _startup_check_secret() -> None:
     if not secret or len(secret.strip()) < 32:
         raise RuntimeError(
             f"Missing or too-short {HMAC_SECRET_ENV}. "
-            f"Set a strong secret (64+ chars) before running the API."
+            "Set a strong secret (64+ chars recommended) before running the API."
         )
 
 
@@ -149,16 +149,13 @@ async def hmac_auth_middleware(request: Request, call_next):
     """
     path = request.url.path
 
-    # Allow open endpoints/prefixes unauthenticated
     if path in OPEN_PATHS or any(path.startswith(p) for p in OPEN_PREFIXES):
         return await call_next(request)
 
-    # Read headers
     provided_sig = request.headers.get(SIG_HEADER, "")
     ts = request.headers.get(TS_HEADER, "")
     nonce = request.headers.get(NONCE_HEADER, "")
 
-    # Missing auth headers
     if not provided_sig or not ts or not nonce:
         return JSONResponse(
             status_code=401,
@@ -168,7 +165,6 @@ async def hmac_auth_middleware(request: Request, call_next):
             },
         )
 
-    # Validate timestamp format
     try:
         ts_int = int(ts)
     except Exception:
@@ -177,7 +173,6 @@ async def hmac_auth_middleware(request: Request, call_next):
             content={"error": "timestamp_invalid", "detail": "Timestamp must be unix epoch seconds (int)."},
         )
 
-    # Validate timestamp window ±30s
     now = _now_epoch()
     if abs(now - ts_int) > TS_WINDOW_SECONDS:
         return JSONResponse(
@@ -188,7 +183,6 @@ async def hmac_auth_middleware(request: Request, call_next):
             },
         )
 
-    # Purge old nonces and enforce replay protection
     _purge_expired_nonces(_NONCE_CACHE)
     if nonce in _NONCE_CACHE:
         return JSONResponse(
@@ -196,13 +190,11 @@ async def hmac_auth_middleware(request: Request, call_next):
             content={"error": "nonce_reused", "detail": "Nonce has already been used within the allowed window."},
         )
 
-    # Read raw body bytes exactly as sent
     body = await request.body()
 
-    # Preserve body for downstream handlers (safety in some middleware stacks)
+    # Preserve body for downstream handlers
     request._body = body  # type: ignore[attr-defined]
 
-    # Compute expected signature
     secret = os.getenv(HMAC_SECRET_ENV, "")
     expected_sig = _compute_signature(secret=secret, timestamp=ts, nonce=nonce, body=body)
 
@@ -212,7 +204,6 @@ async def hmac_auth_middleware(request: Request, call_next):
             content={"error": "invalid_signature", "detail": "Signature verification failed."},
         )
 
-    # Mark nonce as used (store with TTL)
     _NONCE_CACHE[nonce] = now + NONCE_TTL_SECONDS
 
     return await call_next(request)
@@ -232,23 +223,21 @@ app.include_router(upscale.router)
 app.include_router(vr.router)
 app.include_router(moodboard.router)
 app.include_router(product.router)
+app.include_router(product_insert.router)
+app.include_router(insert_object.router)
 app.include_router(floorplan.router)
 app.include_router(sketch.router)
+app.include_router(pipeline.router)
 
-# CAD router (REAL via GPU dispatch)
+# REAL via GPU dispatch
 app.include_router(cad.router)
-
-# Mesh router (REAL via GPU dispatch)
 app.include_router(mesh_from_image.router)
-
-# VIDEO routers (REAL via GPU dispatch)
 app.include_router(video_between_frames.router)
 app.include_router(video_from_image.router)
 
 # IMPORTANT:
 # Do NOT include the GPU worker router here.
-# The GPU worker service (port 8012) hosts /api/gpu/dispatch.
-# app.include_router(gpu_dispatch_router)
+# The GPU worker service hosts /api/gpu/dispatch separately.
 
 
 # ---------------------------------------------------------------------------
@@ -329,9 +318,11 @@ def _list_directory_contents(path: str, max_items: int = 200) -> Dict[str, Any]:
 async def root():
     """
     Simple welcome endpoint.
-    NOTE: This endpoint is protected by HMAC (per locked policy).
+    NOTE: This endpoint is protected by HMAC.
     """
-    return {"message": "RENDEREXPO AI STUDIO - PLANNER API (HMAC protected). Use /api/health for unauthenticated health."}
+    return {
+        "message": "RENDEREXPO AI STUDIO - PLANNER API (HMAC protected). Use /api/health for unauthenticated health."
+    }
 
 
 @app.get("/api/health")

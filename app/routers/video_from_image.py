@@ -1,11 +1,11 @@
 # app/routers/video_from_image.py
 """
-RENDEREXPO AI STUDIO - Video From Image (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - Video From Image Router (Planner)
 
 GOAL:
 - Client uploads ONE image (PNG/JPG)
-- Create a job folder, save image.png, write meta.json
-- DISPATCH to GPU dispatcher so this is REAL
+- Planner creates a job folder, saves image.png, writes meta.json
+- Planner dispatches to GPU worker so this is REAL
 
 Output (GPU worker writes):
 - video_from_image.mp4 (primary)
@@ -13,9 +13,14 @@ Output (GPU worker writes):
 - viewer/index.html (optional)
 - meta.json updated by GPU worker
 
+Service split (LOCKED):
+- Planner = port 8012
+- GPU worker = port 8002
+
 Dispatch:
 - job_type: "video_from_image"
-- GPU endpoint: VIDEO_GPU_DISPATCH_URL (default http://127.0.0.1:8012/api/gpu/dispatch)
+- GPU endpoint: VIDEO_GPU_DISPATCH_URL
+  default: http://127.0.0.1:8002/api/gpu/dispatch
 
 SECURITY (Option A):
 - GPU dispatch is HMAC-signed using the SAME secret: RENDEREXPO_HMAC_SECRET
@@ -29,20 +34,20 @@ SECURITY (Option A):
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import time
-import hmac
-import hashlib
-import shutil
 import datetime
-from typing import Optional, Any, Dict, Tuple
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import time
+import uuid
+from typing import Any, Dict, Optional, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-router = APIRouter(prefix="/api/video", tags=["Video (REAL)"])
+router = APIRouter(prefix="/api/video", tags=["Video (Planner)"])
 
 HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
 SIG_HEADER = "X-RENDEREXPO-SIGNATURE"
@@ -55,11 +60,17 @@ def _now_epoch() -> int:
 
 
 def _gpu_dispatch_url() -> str:
-    return os.getenv("VIDEO_GPU_DISPATCH_URL", "http://127.0.0.1:8012/api/gpu/dispatch").strip()
+    return os.getenv("VIDEO_GPU_DISPATCH_URL", "http://127.0.0.1:8002/api/gpu/dispatch").strip()
+
+
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
 
 
 def _abs(p: str) -> str:
-    return os.path.abspath(p)
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(_repo_root(), p))
 
 
 def _today_utc_str() -> str:
@@ -71,6 +82,13 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     job_id = uuid.uuid4().hex
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
+
+    try:
+        with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
+            f.write("video_from_image")
+    except Exception:
+        pass
+
     return folder
 
 
@@ -84,7 +102,12 @@ def _parse_job_path(job_folder: str) -> Tuple[Optional[str], Optional[str]]:
 def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
     date_str, job_id = _parse_job_path(job_folder)
     if not date_str or not job_id:
-        return {"video_url": None, "meta_url": None, "viewer_url": None, "input_url": None}
+        return {
+            "video_url": None,
+            "meta_url": None,
+            "viewer_url": None,
+            "input_url": None,
+        }
 
     base = f"/outputs/{date_str}/{job_id}"
     return {
@@ -96,10 +119,10 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 
 
 def _ensure_image_type(upload: UploadFile) -> None:
-    # Wix uploads PNG/JPG
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
+
     name = (upload.filename or "").lower().strip()
     if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
@@ -125,16 +148,14 @@ def _compute_signature(secret: str, timestamp: str, nonce: str, body: bytes) -> 
 
 def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Dispatch to GPU handler (HMAC signed, Option A).
+    Dispatch to GPU worker (HMAC signed, Option A).
     Signs the exact raw bytes sent.
     """
     url = _gpu_dispatch_url()
 
     payload = {
-        "job_type": "video_from_image",
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        "pipeline_key": "video::from_image",
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -158,8 +179,7 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     }
 
     try:
-        # 20s is tight on real deployments; accept + enqueue should still succeed, but networking can spike.
-        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 60))
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
         if not (200 <= r.status_code < 300):
             raise RuntimeError(f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
         return r.json() if r.content else {"status": "ok"}
@@ -170,16 +190,14 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
 @router.post("/from-image")
 async def video_from_image(
     image: UploadFile = File(..., description="Single input image (PNG/JPG)"),
-
     prompt: Optional[str] = Form(None, description="Optional prompt to guide motion/style"),
     negative_prompt: Optional[str] = Form(None, description="Optional negative prompt"),
-
     duration_seconds: float = Form(4.0, description="Target duration (seconds). 2.0..10.0"),
     fps: int = Form(24, description="FPS. 12..60"),
     motion: str = Form("cinematic", description="Motion preset hint (cinematic, dolly, orbit, handheld, etc)"),
     motion_strength: float = Form(0.8, description="0..1 general motion amount"),
     seed: Optional[int] = Form(None, description="Optional seed"),
-):
+) -> Dict[str, Any]:
     if not image.filename:
         raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
     _ensure_image_type(image)
@@ -202,28 +220,23 @@ async def video_from_image(
     img_path = os.path.join(job_folder, "image.png")
     await _save_upload_stream(image, img_path)
 
-    # 3) Meta (GPU will update status + outputs)
+    # 3) Meta (GPU worker updates status + outputs later)
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
         "type": "video_from_image",
-
         "status": "queued",
         "mode_runtime": "gpu-dispatch",
-
         "pipeline_key": "video::from_image",
-
         "inputs": {
             "image": "image.png",
             "content_type": getattr(image, "content_type", None),
             "source": "upload",
         },
-
         "guidance": {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
         },
-
         "video_runtime": {
             "duration_seconds": float(duration_seconds),
             "fps": int(fps),
@@ -231,13 +244,11 @@ async def video_from_image(
             "motion_strength": float(motion_strength),
             "seed": seed,
         },
-
         "outputs": {
             "video_from_image": "video_from_image.mp4",
             "frames_dir": "frames/",
             "viewer_dir": "viewer/",
         },
-
         "dispatch": {
             "job_type": "video_from_image",
             "target": _gpu_dispatch_url(),

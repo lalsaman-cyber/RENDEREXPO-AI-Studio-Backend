@@ -1,57 +1,132 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-import torch
-from PIL import Image
+from runtime.sd35_runtime import SD35Runtime
 
-
-# --------------------------
-# Locked presets (Doc 19+)
-# --------------------------
+# -------------------------------------------------------------------
+# Locked profiles (Doc 19+)
+# -------------------------------------------------------------------
+# These are compatibility defaults only.
+# Planner/routers remain the real source of truth and should write
+# steps / cfg / width / height / upscale into meta/payload explicitly.
 PROFILES = {
     "r1_wide_hero": {
         "cfg": 5.6,
         "steps": 46,
         "width": 1024,
         "height": 1024,
-        "upscale": True,
-        "upscale_denoise": 0.25,
+        "upscale": {
+            "enabled": True,
+            "factor": 2,
+            "method": "lanczos",
+        },
     },
     "r1_close_detail": {
         "cfg": 6.0,
         "steps": 48,
         "width": 1024,
         "height": 1024,
-        "upscale": False,
-        "upscale_denoise": 0.25,
+        "upscale": {
+            "enabled": False,
+            "factor": 2,
+            "method": "lanczos",
+        },
     },
     "luxury_interior_heavy_detail": {
         "cfg": 6.0,
         "steps": 60,
         "width": 1024,
         "height": 1024,
-        "upscale": True,
-        "upscale_denoise": 0.0,
+        "upscale": {
+            "enabled": True,
+            "factor": 2,
+            "method": "lanczos",
+        },
     },
 }
 
+# -------------------------------------------------------------------
+# Shared runtime ownership
+# -------------------------------------------------------------------
+# IMPORTANT:
+# - We do NOT load a separate diffusers pipeline here.
+# - We use SD35Runtime as the single real execution engine.
+# - This avoids duplicate model ownership / duplicate VRAM occupancy.
+# - gpu_entry.py may inject its runtime via set_runtime(runtime).
+# - If no runtime is injected, we lazily create one here as a compatibility fallback.
+# -------------------------------------------------------------------
 
-def _device_and_dtype() -> Tuple[torch.device, torch.dtype]:
-    if torch.cuda.is_available():
-        return torch.device("cuda"), torch.bfloat16  # locked default
-    return torch.device("cpu"), torch.float32
+_INJECTED_RUNTIME: Optional[SD35Runtime] = None
+_FALLBACK_RUNTIME: Optional[SD35Runtime] = None
 
 
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
+def set_runtime(runtime: SD35Runtime) -> None:
+    """
+    Allow the GPU worker entrypoint to inject the already-owned runtime.
+    This is the preferred path for commercial stability.
+    """
+    global _INJECTED_RUNTIME
+    _INJECTED_RUNTIME = runtime
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
         return default
-    return v.strip()
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw if raw else default
+
+
+def _runtime_enabled() -> bool:
+    requested_mode = _env_str("SD35_RUNTIME_MODE", "lazy").lower()
+    run_real = _env_flag("RUN_REAL_SD35", False)
+    return run_real and requested_mode in {"lazy", "real"}
+
+
+def _get_runtime() -> SD35Runtime:
+    """
+    Return the injected runtime if available; otherwise lazy-create
+    a compatibility fallback runtime.
+
+    This function must not eagerly preload on import.
+    """
+    global _FALLBACK_RUNTIME
+
+    if _INJECTED_RUNTIME is not None:
+        return _INJECTED_RUNTIME
+
+    if not _runtime_enabled():
+        raise RuntimeError(
+            "SD35 runtime is disabled. "
+            "Enable RUN_REAL_SD35=1 and set SD35_RUNTIME_MODE to lazy or real."
+        )
+
+    if _FALLBACK_RUNTIME is None:
+        device = _env_str("SD35_DEVICE", "cuda")
+        _FALLBACK_RUNTIME = SD35Runtime(mode="real", device=device)
+
+    if not _FALLBACK_RUNTIME.is_loaded:
+        _FALLBACK_RUNTIME.load()
+
+    if not _FALLBACK_RUNTIME.is_loaded:
+        raise RuntimeError("Fallback SD35Runtime failed to load in real mode.")
+
+    return _FALLBACK_RUNTIME
+
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 
 def _preset(profile: str) -> Dict[str, Any]:
     p = PROFILES.get(profile)
@@ -61,6 +136,10 @@ def _preset(profile: str) -> Dict[str, Any]:
 
 
 def _job_folder_from_payload(payload: Dict[str, Any]) -> str:
+    """
+    payload.job_folder must be an ABSOLUTE path under the planner/GPU
+    contract. We do not accept relative paths here.
+    """
     job_folder = payload.get("job_folder")
     if not job_folder or not isinstance(job_folder, str) or not os.path.isabs(job_folder):
         raise RuntimeError("payload.job_folder must be an ABSOLUTE path (provided by planner/dispatch).")
@@ -69,204 +148,123 @@ def _job_folder_from_payload(payload: Dict[str, Any]) -> str:
     return job_folder
 
 
-def _enforce_locked_multipliers(payload: Dict[str, Any]) -> Tuple[float, float, Optional[str], Optional[str]]:
+def _merge_profile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Respect PRO 2.1 + locked multipliers:
-      PRO default 0.05
-      GEO default 0.010
-    Allow only safe bands to prevent sabotage / instability.
+    Merge profile defaults into the execution meta only when fields
+    are missing. Planner values always win.
     """
-    pro_w = float(payload.get("pro_weight", 0.05))
-    geo_w = float(payload.get("geo_weight", 0.010))
-
-    if not (0.0 < pro_w <= 0.20):
-        raise RuntimeError(f"Invalid PRO multiplier: {pro_w}. Allowed: (0, 0.20].")
-    if not (0.0 <= geo_w <= 0.05):
-        raise RuntimeError(f"Invalid GEO multiplier: {geo_w}. Allowed: [0, 0.05].")
-
-    pro_ckpt = payload.get("pro_ckpt") or _env("RENDEREXPO_PRO_CKPT")
-    geo_ckpt = payload.get("geo_ckpt") or _env("RENDEREXPO_GEO_CKPT")
-
-    return pro_w, geo_w, pro_ckpt, geo_ckpt
-
-
-@lru_cache(maxsize=1)
-def _load_pipe_txt2img():
-    """
-    Loads once per GPU worker (8012). Critical for performance.
-    """
-    model_id = _env("RENDEREXPO_SD35_MODEL_ID")
-    if not model_id:
-        raise RuntimeError("Missing env RENDEREXPO_SD35_MODEL_ID (SD3.5 model id/path)")
-
-    try:
-        from diffusers import StableDiffusion3Pipeline
-    except Exception as e:
-        raise RuntimeError(f"diffusers StableDiffusion3Pipeline import failed: {e}")
-
-    device, dtype = _device_and_dtype()
-    pipe = StableDiffusion3Pipeline.from_pretrained(model_id, torch_dtype=dtype, variant=None).to(device)
-
-    pipe.set_progress_bar_config(disable=True)
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
-
-    return pipe
-
-
-def _apply_adapters(pipe, payload: Dict[str, Any]) -> None:
-    """
-    Apply PRO + GEO adapters (LyCORIS/LoRA) respecting locked multipliers.
-    If adapter paths are missing, we still produce REAL SD3.5 outputs.
-    """
-    pro_w, geo_w, pro_ckpt, geo_ckpt = _enforce_locked_multipliers(payload)
-
-    adapters = []
-    weights = []
-
-    if pro_ckpt:
-        adapters.append(("pro", pro_ckpt))
-        weights.append(pro_w)
-    if geo_ckpt and geo_w > 0:
-        adapters.append(("geo", geo_ckpt))
-        weights.append(geo_w)
-
-    if not adapters:
-        return
-
-    for name, ckpt in adapters:
-        try:
-            pipe.load_lora_weights(ckpt, adapter_name=name)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load adapter '{name}' from '{ckpt}': {e}")
-
-    try:
-        pipe.set_adapters([n for (n, _) in adapters], adapter_weights=weights)
-    except Exception:
-        # Older diffusers fallback
-        for (name, _), w in zip(adapters, weights):
-            try:
-                pipe.set_adapters([name], adapter_weights=[w])
-            except Exception:
-                pass
-
-
-def run_sd35_txt2img(job: Any, payload: Dict[str, Any]) -> str:
-    """
-    DISPATCH-CONTRACT:
-      - payload.job_folder (ABSOLUTE) is the target directory
-      - returns a STRING path to a REAL PNG inside job_folder
-
-    NOTE:
-      We do NOT write meta.json here. Dispatch owns meta writing.
-    """
-    job_folder = _job_folder_from_payload(payload)
-
+    merged = dict(payload)
     profile = str(payload.get("profile") or "r1_wide_hero").strip()
     p = _preset(profile)
 
-    prompt = str(payload.get("prompt") or "").strip()
-    if not prompt:
-        raise ValueError("Missing 'prompt' for sd35_txt2img")
+    merged.setdefault("guidance_scale", p["cfg"])
+    merged.setdefault("num_inference_steps", p["steps"])
+    merged.setdefault("width", p["width"])
+    merged.setdefault("height", p["height"])
 
-    negative = str(payload.get("negative_prompt") or "").strip() or None
+    if "upscale" not in merged and isinstance(p.get("upscale"), dict):
+        merged["upscale"] = dict(p["upscale"])
 
-    width = int(payload.get("width") or p["width"])
-    height = int(payload.get("height") or p["height"])
-    steps = int(payload.get("steps") or p["steps"])
-    cfg = float(payload.get("cfg") or p["cfg"])
-
-    seed_raw = payload.get("seed")
-    seed = int(seed_raw) if seed_raw not in (None, "", 0) else None
-
-    pipe = _load_pipe_txt2img()
-    _apply_adapters(pipe, payload)
-
-    device, _dtype = _device_and_dtype()
-    generator = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
-
-    out = pipe(
-        prompt=prompt,
-        negative_prompt=negative,
-        width=width,
-        height=height,
-        guidance_scale=cfg,
-        num_inference_steps=steps,
-        generator=generator,
-    ).images[0]
-
-    out_path = os.path.join(job_folder, "output.png")
-    out.save(out_path)
-
-    return out_path
+    return merged
 
 
-def run_sd35_img2img(job: Any, payload: Dict[str, Any]) -> str:
+def _normalize_input_image(job_folder: str, payload: Dict[str, Any]) -> str:
     """
-    DISPATCH-CONTRACT:
-      - payload.job_folder (ABSOLUTE) is the target directory
-      - payload.input_image must exist
-      - returns a STRING path to a REAL PNG inside job_folder
+    Ensure img2img input_image resolves correctly.
     """
-    job_folder = _job_folder_from_payload(payload)
-
     inp = payload.get("input_image")
     if not inp:
         raise ValueError("Missing 'input_image' for sd35_img2img")
 
     inp_path = Path(str(inp))
+    if not inp_path.is_absolute():
+        inp_path = Path(job_folder) / inp_path
+
     if not inp_path.exists():
         raise FileNotFoundError(f"input_image not found: {inp_path}")
 
-    prompt = str(payload.get("prompt") or "").strip()
+    return str(inp_path)
+
+
+def _build_runtime_meta_for_text2img(job_folder: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    meta = _merge_profile_defaults(payload)
+
+    prompt = str(meta.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("Missing 'prompt' for sd35_txt2img")
+
+    meta["type"] = "text2img"
+    meta["job_folder"] = job_folder
+    meta["prompt"] = prompt
+
+    negative = str(meta.get("negative_prompt") or "").strip()
+    if negative:
+        meta["negative_prompt"] = negative
+
+    return meta
+
+
+def _build_runtime_meta_for_img2img(job_folder: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    meta = _merge_profile_defaults(payload)
+
+    prompt = str(meta.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("Missing 'prompt' for sd35_img2img")
 
-    negative = str(payload.get("negative_prompt") or "").strip() or None
+    input_path = _normalize_input_image(job_folder, meta)
 
-    # Safe defaults (Doc behavior)
-    denoise = float(payload.get("denoise", 0.14))
-    steps = int(payload.get("steps") or 26)
-    cfg = float(payload.get("cfg") or 6.0)
+    meta["type"] = "img2img"
+    meta["job_folder"] = job_folder
+    meta["prompt"] = prompt
+    meta["input_image"] = input_path
 
-    seed_raw = payload.get("seed")
-    seed = int(seed_raw) if seed_raw not in (None, "", 0) else None
+    negative = str(meta.get("negative_prompt") or "").strip()
+    if negative:
+        meta["negative_prompt"] = negative
 
-    try:
-        from diffusers import StableDiffusion3Img2ImgPipeline
-    except Exception as e:
-        raise RuntimeError(f"diffusers StableDiffusion3Img2ImgPipeline import failed: {e}")
+    # Support legacy callers that pass denoise instead of strength.
+    if "strength" not in meta and "denoise" in meta:
+        try:
+            meta["strength"] = float(meta["denoise"])
+        except Exception:
+            pass
 
-    model_id = _env("RENDEREXPO_SD35_MODEL_ID")
-    if not model_id:
-        raise RuntimeError("Missing env RENDEREXPO_SD35_MODEL_ID (SD3.5 model id/path)")
+    return meta
 
-    device, dtype = _device_and_dtype()
-    pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)
-    pipe.set_progress_bar_config(disable=True)
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
 
-    _apply_adapters(pipe, payload)
+# -------------------------------------------------------------------
+# Public execution functions
+# -------------------------------------------------------------------
 
-    image = Image.open(inp_path).convert("RGB")
-    generator = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+def run_sd35_txt2img(job: Any, payload: Dict[str, Any]) -> str:
+    """
+    DISPATCH CONTRACT:
+      - payload.job_folder (ABSOLUTE) is the target directory
+      - returns a STRING path to a REAL PNG inside job_folder
 
-    out = pipe(
-        prompt=prompt,
-        negative_prompt=negative,
-        image=image,
-        strength=denoise,
-        guidance_scale=cfg,
-        num_inference_steps=steps,
-        generator=generator,
-    ).images[0]
+    NOTE:
+      We do NOT write meta.json here. Dispatch/worker orchestration owns meta writing.
+    """
+    job_folder = _job_folder_from_payload(payload)
+    runtime = _get_runtime()
+    meta = _build_runtime_meta_for_text2img(job_folder, payload)
 
-    out_path = os.path.join(job_folder, "refine.png")
-    out.save(out_path)
+    result_meta = runtime.generate_text2img(job_folder, meta)
+    out_name = str(result_meta.get("output_image") or "output.png")
+    return os.path.join(job_folder, out_name)
 
-    return out_path
+
+def run_sd35_img2img(job: Any, payload: Dict[str, Any]) -> str:
+    """
+    DISPATCH CONTRACT:
+      - payload.job_folder (ABSOLUTE) is the target directory
+      - payload.input_image must exist
+      - returns a STRING path to a REAL PNG inside job_folder
+    """
+    job_folder = _job_folder_from_payload(payload)
+    runtime = _get_runtime()
+    meta = _build_runtime_meta_for_img2img(job_folder, payload)
+
+    result_meta = runtime.generate_img2img(job_folder, meta)
+    out_name = str(result_meta.get("output_image") or "output.png")
+    return os.path.join(job_folder, out_name)

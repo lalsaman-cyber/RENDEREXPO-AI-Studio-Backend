@@ -1,70 +1,69 @@
 # app/routers/img2img.py
 """
-RENDEREXPO AI STUDIO - SD3.5 Img2Img Router (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - SD3.5 Img2Img Router (Planner)
 
 GOAL:
 - Client uploads ONE image + prompt
-- Create job folder, save input.png, write meta.json
-- DISPATCH to GPU worker (HMAC-signed Option A via app.clients.gpu_client)
-- GPU worker writes:
-    - output.png (primary)
-    - meta.json updated
+- Planner creates job folder, saves input.png, writes meta.json
+- Planner dispatches to GPU worker through app.clients.gpu_client
+- GPU worker performs REAL img2img / inpaint execution and writes:
+    - output.png
+    - updated meta.json
 
 Also supports:
 - from-job: re-edit an existing image from a prior job (JSON)
 - inpaint: upload image + mask to edit only selected area (multipart)
 
-CRITICAL (Doc 18 lock):
-- Presets must be applied for ALL categories/shots:
+LOCKED ARCHITECTURE:
+- Planner = port 8012
+- GPU worker = port 8002
+- Root = /workspace-data/RENDEREXPO-AI-Studio-Backend
+
+IMPORTANT:
+- Presets must be applied for all categories/shots:
     * locked steps + CFG
     * LyCORIS PRO 2.1 multiplier + path
     * GEO multiplier + path
     * resolution
-    * NO denoise anywhere (denoise=0.0)
-- Upscale is OPTIONAL:
-    * preset default, OR
-    * overridden per request via upscale_2x true/false.
-
-NOTES:
-- "strength" is allowed and is NOT diffusion denoise. It controls how much we preserve the input image.
-- Diffusion denoise remains hard-locked to 0.0.
+    * optional upscale defaults
+- Img2img strength MUST be preserved.
+- Do NOT globally force denoise/strength to 0.0 here.
+- Planner writes meta; GPU runtime executes meta.
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import shutil
 import datetime
-from typing import Optional, Dict, Any, Literal, Tuple
+import json
+import os
+import shutil
+import uuid
+from typing import Any, Dict, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.clients.gpu_client import dispatch_sd35_img2img, dispatch_sd35_inpaint
 from app.core.lora_registry import get_lora_profile, get_refiner_profile
 from app.presets_sd35 import apply_preset_to_meta
 
-# GPU dispatch (same pattern used by text2img)
-from app.clients.gpu_client import dispatch_sd35_img2img, dispatch_sd35_inpaint
-
-router = APIRouter(prefix="/api/sd35", tags=["SD3.5 Img2Img (REAL)"])
+router = APIRouter(prefix="/api/sd35", tags=["SD3.5 Img2Img (Planner)"])
 
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
+
+ALLOWED_CT = {"image/png", "image/jpeg", "image/jpg"}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-ALLOWED_CT = {"image/png", "image/jpeg", "image/jpg"}
-
 def _today_utc_str() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
+def _create_job_folder(base_outputs_dir: str = "outputs", job_type: str = "sd35_img2img") -> str:
     """
     Create outputs/{YYYY-MM-DD}/{job_id}/ and return its path.
     """
@@ -73,10 +72,9 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
 
-    # marker file
     try:
         with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
-            f.write("sd35_img2img")
+            f.write(job_type)
     except Exception:
         pass
 
@@ -92,30 +90,36 @@ def _parse_job_path(job_folder: str) -> Tuple[Optional[str], Optional[str]]:
 
 def _outputs_public_urls(job_folder: str, has_mask: bool = False) -> Dict[str, Optional[str]]:
     """
-    Stable URLs assuming FastAPI mounts outputs/ at /outputs.
+    Stable URLs assuming planner mounts outputs/ at /outputs.
     """
     date_str, job_id = _parse_job_path(job_folder)
     if not date_str or not job_id:
-        return {"image_url": None, "meta_url": None, "input_url": None, "mask_url": None}
+        return {
+            "image_url": None,
+            "meta_url": None,
+            "input_url": None,
+            "mask_url": None,
+        }
 
     base = f"/outputs/{date_str}/{job_id}"
     return {
         "image_url": f"{base}/output.png",
         "meta_url": f"{base}/meta.json",
         "input_url": f"{base}/input.png",
-        "mask_url": (f"{base}/mask.png" if has_mask else None),
+        "mask_url": f"{base}/mask.png" if has_mask else None,
     }
 
 
 def _validate_upload_is_png_jpg(upload: UploadFile, label: str) -> None:
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
-    # content-type isn't perfect security, but it's a clean UX gate
     if ct and ct not in ALLOWED_CT:
         raise HTTPException(status_code=400, detail=f"{label} must be PNG or JPG")
 
 
 async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
-    """Save UploadFile without reading everything into RAM."""
+    """
+    Save UploadFile without reading everything into RAM.
+    """
     try:
         try:
             upload.file.seek(0)
@@ -172,6 +176,92 @@ def _validate_strength(strength: float) -> None:
         raise HTTPException(status_code=400, detail="strength must be between 0.0 and 1.0")
 
 
+def _resolve_optional_profiles(
+    lora_profile: Optional[str],
+    refiner_profile: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Optional / legacy metadata only.
+    These must not override locked preset multipliers.
+    """
+    resolved_lora_profile: Optional[Dict[str, Any]] = None
+    if lora_profile:
+        resolved_lora_profile = get_lora_profile(lora_profile)
+        if resolved_lora_profile is None:
+            raise HTTPException(status_code=400, detail=f"Unknown lora_profile: '{lora_profile}'")
+
+    resolved_refiner_profile: Optional[Dict[str, Any]] = None
+    if refiner_profile:
+        resolved_refiner_profile = get_refiner_profile(refiner_profile)
+        if resolved_refiner_profile is None:
+            raise HTTPException(status_code=400, detail=f"Unknown refiner_profile: '{refiner_profile}'")
+
+    return resolved_lora_profile, resolved_refiner_profile
+
+
+def _base_meta(
+    *,
+    job_id: str,
+    job_type: str,
+    prompt: str,
+    negative_prompt: Optional[str],
+    seed: int,
+    category: str,
+    shot: str,
+    strength: Optional[float] = None,
+    input_image_name: Optional[str] = None,
+    mask_image_name: Optional[str] = None,
+    style_preset: Optional[str] = None,
+    material_preset: Optional[str] = None,
+    lighting_preset: Optional[str] = None,
+    lora_profile: Optional[str] = None,
+    lora_profile_resolved: Optional[Dict[str, Any]] = None,
+    refiner_profile: Optional[str] = None,
+    refiner_profile_resolved: Optional[Dict[str, Any]] = None,
+    source_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "job_id": job_id,
+        "created_at": datetime.datetime.utcnow().isoformat(),
+        "type": job_type,
+        "model_name": "sd35_large_pro_v2_1",
+        "engine": "sd35_large_pro_v2_1",
+        "status": "queued",
+        "mode_runtime": "gpu-dispatch",
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "seed": seed,
+        "planned_output_image": "output.png",
+        "category": category,
+        "shot": shot,
+        "style_preset": style_preset,
+        "material_preset": material_preset,
+        "lighting_preset": lighting_preset,
+        "optional_profiles": {
+            "lora_profile": lora_profile,
+            "lora_profile_resolved": lora_profile_resolved,
+            "refiner_profile": refiner_profile,
+            "refiner_profile_resolved": refiner_profile_resolved,
+        },
+        "pipeline_key": f"sd35::{'sd35_inpaint' if job_type == 'inpaint' else 'sd35_img2img'}",
+    }
+
+    if strength is not None:
+        meta["strength"] = float(strength)
+
+    inputs: Dict[str, Any] = {}
+    if input_image_name is not None:
+        inputs["input_image"] = input_image_name
+    if mask_image_name is not None:
+        inputs["mask_image"] = mask_image_name
+    if source_info:
+        inputs.update(source_info)
+    if inputs:
+        meta["inputs"] = inputs
+
+    return meta
+
+
 # ---------------------------------------------------------------------------
 # JSON model for from-job re-edit
 # ---------------------------------------------------------------------------
@@ -185,8 +275,8 @@ class Img2ImgFromJobRequest(BaseModel):
 
     strength: float = Field(default=0.55, ge=0.0, le=1.0, description="How much to change vs preserve input (0..1).")
 
-    category: Category = Field(..., description="Doc 18 preset category.")
-    shot: Shot = Field(..., description="Doc 18 preset shot.")
+    category: Category = Field(..., description="Preset category.")
+    shot: Shot = Field(..., description="Preset shot.")
 
     upscale_2x: Optional[bool] = Field(default=None)
     seed: Optional[int] = Field(default=None)
@@ -208,41 +298,30 @@ async def sd35_img2img_render(
     image: UploadFile = File(..., description="Input image (render, wireframe, B/W, previous output, etc.)"),
     prompt: str = Form(...),
     negative_prompt: Optional[str] = Form(None),
-
-    strength: float = Form(0.55, description="0..1 (lower preserves more)"),
-
+    strength: float = Form(0.22, description="0..1 (lower preserves more)"),
     category: Category = Form(...),
     shot: Shot = Form(...),
-
-    # Optional override (if omitted, preset default is used)
     upscale_2x: Optional[bool] = Form(None),
-
     seed: Optional[int] = Form(None),
-
     style_preset: Optional[str] = Form(None),
     material_preset: Optional[str] = Form(None),
     lighting_preset: Optional[str] = Form(None),
-
     lora_profile: Optional[str] = Form(None),
     refiner_profile: Optional[str] = Form(None),
-):
+) -> Dict[str, Any]:
     _validate_strength(float(strength))
     _validate_upload_is_png_jpg(image, "image")
 
-    # Optional profiles stored only (must not override Doc 18 multipliers)
-    resolved_lora_profile: Optional[Dict[str, Any]] = None
-    if lora_profile:
-        resolved_lora_profile = get_lora_profile(lora_profile)
-        if resolved_lora_profile is None:
-            raise HTTPException(status_code=400, detail=f"Unknown lora_profile: '{lora_profile}'")
+    prompt_clean = (prompt or "").strip()
+    if not prompt_clean:
+        raise HTTPException(status_code=400, detail="prompt is required")
 
-    resolved_refiner_profile: Optional[Dict[str, Any]] = None
-    if refiner_profile:
-        resolved_refiner_profile = get_refiner_profile(refiner_profile)
-        if resolved_refiner_profile is None:
-            raise HTTPException(status_code=400, detail=f"Unknown refiner_profile: '{refiner_profile}'")
+    resolved_lora_profile, resolved_refiner_profile = _resolve_optional_profiles(
+        lora_profile=lora_profile,
+        refiner_profile=refiner_profile,
+    )
 
-    job_folder = _create_job_folder()
+    job_folder = _create_job_folder(job_type="sd35_img2img")
     job_id = os.path.basename(job_folder)
 
     input_path = os.path.join(job_folder, "input.png")
@@ -250,56 +329,36 @@ async def sd35_img2img_render(
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.datetime.utcnow().isoformat(),
-
-        "type": "img2img",
-        "model_name": "sd3.5-large-pro-2.1",
-
-        # REAL semantics
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "seed": final_seed,
-
-        "strength": float(strength),
-
-        "inputs": {
-            "input_image": "input.png",
+    meta = _base_meta(
+        job_id=job_id,
+        job_type="img2img",
+        prompt=prompt_clean,
+        negative_prompt=negative_prompt,
+        seed=int(final_seed),
+        category=category,
+        shot=shot,
+        strength=float(strength),
+        input_image_name="input.png",
+        style_preset=style_preset,
+        material_preset=material_preset,
+        lighting_preset=lighting_preset,
+        lora_profile=lora_profile,
+        lora_profile_resolved=resolved_lora_profile,
+        refiner_profile=refiner_profile,
+        refiner_profile_resolved=resolved_refiner_profile,
+        source_info={
             "content_type": getattr(image, "content_type", None),
             "source": "upload",
         },
-
-        "planned_output_image": "output.png",
-
-        "category": category,
-        "shot": shot,
-
-        "denoise": 0.0,
-
-        "style_preset": style_preset,
-        "material_preset": material_preset,
-        "lighting_preset": lighting_preset,
-
-        "optional_profiles": {
-            "lora_profile": lora_profile,
-            "lora_profile_resolved": resolved_lora_profile,
-            "refiner_profile": refiner_profile,
-            "refiner_profile_resolved": resolved_refiner_profile,
-        },
-    }
+    )
 
     try:
         apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
+    # Preserve true img2img strength explicitly after preset application.
+    meta["strength"] = float(strength)
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder, has_mask=False)
@@ -332,7 +391,7 @@ async def sd35_img2img_render(
 
     return {
         "status": "dispatched",
-        "message": "Img2Img job dispatched to GPU worker (Doc 18 locked presets).",
+        "message": "Img2Img job dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,
@@ -348,7 +407,7 @@ async def sd35_img2img_render(
 # ---------------------------------------------------------------------------
 
 @router.post("/img2img/from-job/render")
-async def sd35_img2img_from_job(req: Img2ImgFromJobRequest):
+async def sd35_img2img_from_job(req: Img2ImgFromJobRequest) -> Dict[str, Any]:
     source_job_id = (req.source_job_id or "").strip()
     if not source_job_id:
         raise HTTPException(status_code=400, detail="source_job_id is required")
@@ -364,19 +423,12 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest):
 
     _validate_strength(float(req.strength))
 
-    resolved_lora_profile: Optional[Dict[str, Any]] = None
-    if req.lora_profile:
-        resolved_lora_profile = get_lora_profile(req.lora_profile)
-        if resolved_lora_profile is None:
-            raise HTTPException(status_code=400, detail=f"Unknown lora_profile: '{req.lora_profile}'")
+    resolved_lora_profile, resolved_refiner_profile = _resolve_optional_profiles(
+        lora_profile=req.lora_profile,
+        refiner_profile=req.refiner_profile,
+    )
 
-    resolved_refiner_profile: Optional[Dict[str, Any]] = None
-    if req.refiner_profile:
-        resolved_refiner_profile = get_refiner_profile(req.refiner_profile)
-        if resolved_refiner_profile is None:
-            raise HTTPException(status_code=400, detail=f"Unknown refiner_profile: '{req.refiner_profile}'")
-
-    job_folder = _create_job_folder()
+    job_folder = _create_job_folder(job_type="sd35_img2img")
     job_id = os.path.basename(job_folder)
 
     dst_img = os.path.join(job_folder, "input.png")
@@ -387,56 +439,36 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest):
 
     final_seed = req.seed if req.seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.datetime.utcnow().isoformat(),
-
-        "type": "img2img",
-        "model_name": "sd3.5-large-pro-2.1",
-
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "prompt": req.prompt,
-        "negative_prompt": req.negative_prompt,
-        "seed": final_seed,
-
-        "strength": float(req.strength),
-
-        "inputs": {
-            "input_image": "input.png",
+    meta = _base_meta(
+        job_id=job_id,
+        job_type="img2img",
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        seed=int(final_seed),
+        category=req.category,
+        shot=req.shot,
+        strength=float(req.strength),
+        input_image_name="input.png",
+        style_preset=req.style_preset,
+        material_preset=req.material_preset,
+        lighting_preset=req.lighting_preset,
+        lora_profile=req.lora_profile,
+        lora_profile_resolved=resolved_lora_profile,
+        refiner_profile=req.refiner_profile,
+        refiner_profile_resolved=resolved_refiner_profile,
+        source_info={
             "source": "job_reference",
             "source_job_id": source_job_id,
             "source_image_path": safe_rel,
         },
-
-        "planned_output_image": "output.png",
-
-        "category": req.category,
-        "shot": req.shot,
-
-        "denoise": 0.0,
-
-        "style_preset": req.style_preset,
-        "material_preset": req.material_preset,
-        "lighting_preset": req.lighting_preset,
-
-        "optional_profiles": {
-            "lora_profile": req.lora_profile,
-            "lora_profile_resolved": resolved_lora_profile,
-            "refiner_profile": req.refiner_profile,
-            "refiner_profile_resolved": resolved_refiner_profile,
-        },
-    }
+    )
 
     try:
         apply_preset_to_meta(meta, category=req.category, shot=req.shot, upscale_2x=req.upscale_2x)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
+    meta["strength"] = float(req.strength)
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder, has_mask=False)
@@ -468,7 +500,7 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest):
 
     return {
         "status": "dispatched",
-        "message": "Img2Img (from-job) dispatched to GPU worker (Doc 18 locked presets).",
+        "message": "Img2Img (from-job) dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,
@@ -485,23 +517,23 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest):
 async def sd35_inpaint_render(
     image: UploadFile = File(..., description="Input image"),
     mask: UploadFile = File(..., description="Mask image (white = edit, black = keep)"),
-
     prompt: str = Form(...),
     negative_prompt: Optional[str] = Form(None),
-
-    strength: float = Form(0.55, description="0..1 (lower preserves more)"),
-
+    strength: float = Form(0.22, description="0..1 (lower preserves more)"),
     category: Category = Form(...),
     shot: Shot = Form(...),
     upscale_2x: Optional[bool] = Form(None),
-
     seed: Optional[int] = Form(None),
-):
+) -> Dict[str, Any]:
     _validate_strength(float(strength))
     _validate_upload_is_png_jpg(image, "image")
     _validate_upload_is_png_jpg(mask, "mask")
 
-    job_folder = _create_job_folder()
+    prompt_clean = (prompt or "").strip()
+    if not prompt_clean:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    job_folder = _create_job_folder(job_type="sd35_inpaint")
     job_id = os.path.basename(job_folder)
 
     input_path = os.path.join(job_folder, "input.png")
@@ -511,44 +543,26 @@ async def sd35_inpaint_render(
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.datetime.utcnow().isoformat(),
-
-        "type": "inpaint",
-        "model_name": "sd3.5-large-pro-2.1",
-
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "seed": final_seed,
-
-        "strength": float(strength),
-
-        "inputs": {
-            "input_image": "input.png",
-            "mask_image": "mask.png",
-            "source": "upload",
-        },
-
-        "planned_output_image": "output.png",
-
-        "category": category,
-        "shot": shot,
-
-        "denoise": 0.0,
-    }
+    meta = _base_meta(
+        job_id=job_id,
+        job_type="inpaint",
+        prompt=prompt_clean,
+        negative_prompt=negative_prompt,
+        seed=int(final_seed),
+        category=category,
+        shot=shot,
+        strength=float(strength),
+        input_image_name="input.png",
+        mask_image_name="mask.png",
+        source_info={"source": "upload"},
+    )
 
     try:
         apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
+    meta["strength"] = float(strength)
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder, has_mask=True)
@@ -580,7 +594,7 @@ async def sd35_inpaint_render(
 
     return {
         "status": "dispatched",
-        "message": "Inpaint job dispatched to GPU worker (Doc 18 locked presets).",
+        "message": "Inpaint job dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,

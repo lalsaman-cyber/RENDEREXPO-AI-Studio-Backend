@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import json
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query, Path
+from fastapi import APIRouter, HTTPException, Path, Query
 from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/api/jobs", tags=["Jobs"])
@@ -21,6 +21,12 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # ---------------------------------------------------------------------------
 
 def _outputs_dir() -> str:
+    """
+    Planner-side outputs root.
+    Must remain repo-relative so it maps to:
+      /workspace-data/RENDEREXPO-AI-Studio-Backend/outputs
+    when the service runs from the correct root.
+    """
     return "outputs"
 
 
@@ -71,7 +77,6 @@ def _resolve_job_folder(date_str: str, job_id: str) -> str:
     if os.path.isdir(canonical):
         return canonical
 
-    # Fallback: scan date folder for matching name
     if not os.path.isdir(base_dir):
         raise HTTPException(status_code=404, detail="Job folder not found.")
 
@@ -99,7 +104,6 @@ def _find_job_folder_by_id(job_id: str) -> Optional[Tuple[str, str]]:
     if not os.path.isdir(outputs_dir):
         return None
 
-    # date folders are YYYY-MM-DD, lexical sort works (newest first)
     for date_str in sorted(os.listdir(outputs_dir), reverse=True):
         if not DATE_RE.match(date_str):
             continue
@@ -156,7 +160,7 @@ def _serve_image_from_job(job_folder: str, name: str):
 
 
 def _public_job_base(date_str: str, job_id: str) -> str:
-    # assumes you mount outputs/ at /outputs
+    # assumes planner mounts outputs/ at /outputs
     return f"/outputs/{date_str}/{job_id}"
 
 
@@ -281,6 +285,7 @@ async def list_jobs_for_date(
             "status": meta.get("status"),
             "category": meta.get("category"),
             "shot": meta.get("shot"),
+            "pipeline_key": meta.get("pipeline_key"),
         }
 
         jobs.append(

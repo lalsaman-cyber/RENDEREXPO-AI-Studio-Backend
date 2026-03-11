@@ -1,34 +1,38 @@
 # app/routers/controlnet.py
 """
-RENDEREXPO AI STUDIO - ControlNet Planning Router (NO GPU)
+RENDEREXPO AI STUDIO - ControlNet Planning Router (Planner only)
 
-CRITICAL (Doc 18):
-- ControlNet planning MUST inherit the SAME locked SD3.5 presets:
-  steps, CFG, LyCORIS(PRO 2.1), GEO multipliers, resolution
-- NO denoise anywhere
-- Upscale remains optional and stored for downstream stages
-- This router is PLANNING ONLY (no inference, no GPU)
+PLANNING ONLY:
+- No GPU
+- No inference
+- No SD3.5 loading
+- No diffusion
 
 Purpose:
 - Accept a conditioning image (sketch, lineart, depth, canny, etc.)
 - Store a ControlNet plan + locked preset context in meta.json
-- Allow downstream SD3.5 stages to reuse EXACT preset logic
+- Allow downstream SD3.5 stages to reuse exact preset logic
+
+IMPORTANT:
+- Planner = port 8012
+- GPU worker = port 8002
+- Preset logic comes from app.presets_sd35.apply_preset_to_meta(...)
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import shutil
 import datetime
-from typing import Optional, Dict, Any, Literal, Tuple
+import json
+import os
+import shutil
+import uuid
+from typing import Any, Dict, Literal, Optional, Tuple
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.presets_sd35 import apply_preset_to_meta
 
-router = APIRouter(prefix="/api/controlnet", tags=["ControlNet Planning (NO GPU)"])
+router = APIRouter(prefix="/api/controlnet", tags=["ControlNet Planning"])
 
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
@@ -90,12 +94,10 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 
 
 def _ensure_png_jpg_only(upload: UploadFile) -> None:
-    # best-effort content-type check (not fully trusted)
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     if ct and ct not in ("image/png", "image/jpeg", "image/jpg"):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are supported.")
 
-    # filename extension check
     name = (upload.filename or "").lower()
     if name and not (name.endswith(".png") or name.endswith(".jpg") or name.endswith(".jpeg")):
         raise HTTPException(status_code=400, detail="Only .png, .jpg, .jpeg are supported.")
@@ -124,10 +126,9 @@ async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
 @router.post("/plan")
 async def plan_controlnet_job(
     image: UploadFile = File(..., description="Conditioning image for ControlNet (PNG/JPG only)"),
-
     control_type: ControlType = Form(
         ...,
-        description="Type of ControlNet conditioning (canny, depth, lineart, etc.)",
+        description="Type of ControlNet conditioning (canny, depth, lineart, scribble, normal)",
     ),
     control_strength: float = Form(
         1.0,
@@ -135,19 +136,15 @@ async def plan_controlnet_job(
         le=2.0,
         description="ControlNet influence strength (planning only).",
     ),
-
-    # LOCKED PRESET SELECTORS (Doc 18)
     category: Category = Form(..., description="urban/suburban/interior/wide_hero"),
     shot: Shot = Form(..., description="wide/close"),
-
-    # Optional per-request upscale override
     upscale_2x: Optional[bool] = Form(
         None,
         description="Optional override: true/false. If omitted, preset default is used.",
     ),
-):
+) -> Dict[str, Any]:
     """
-    Plan a ControlNet conditioning job (NO GPU).
+    Plan a ControlNet conditioning job (planning only).
 
     Output:
     - outputs/YYYY-MM-DD/<job_id>/
@@ -168,44 +165,29 @@ async def plan_controlnet_job(
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
-
         "type": "controlnet_plan",
         "status": "planned",
         "mode_runtime": "plan-only",
-
-        # Engine identity (NO SDXL)
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
-
-        # Preset selectors (Doc 18)
         "category": category,
         "shot": shot,
-
-        # Hard lock
-        "denoise": 0.0,
-
-        # Inputs contract
         "inputs": {
             "control_image": "control_input.png",
             "content_type": getattr(image, "content_type", None),
         },
-
-        # ControlNet planning block
         "controlnet": {
             "control_type": control_type,
             "control_strength": float(control_strength),
             "input_image": "control_input.png",
-            "note": "Planning only. ControlNet will be applied during SD3.5 inference.",
+            "note": "Planning only. ControlNet will be applied during downstream SD3.5 inference.",
         },
-
-        # Outputs contract (planning artifact only)
         "outputs": {
             "control_input": "control_input.png",
             "meta": "meta.json",
         },
     }
 
-    # Apply locked Doc 18 preset logic (DO NOT CHANGE multipliers here)
     try:
         apply_preset_to_meta(
             meta,
@@ -216,16 +198,11 @@ async def plan_controlnet_job(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}")
 
-    # Safety re-lock
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
-
     _write_meta(job_folder, meta)
 
     return {
         "status": "ok",
-        "message": "ControlNet job planned with locked Doc 18 presets (NO GPU).",
+        "message": "ControlNet job planned with locked presets (planning only).",
         "job_folder": job_folder,
         "meta_path": _meta_path(job_folder),
         "public_urls": _outputs_public_urls(job_folder),

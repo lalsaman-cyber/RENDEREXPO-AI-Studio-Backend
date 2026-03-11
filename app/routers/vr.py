@@ -1,52 +1,50 @@
 # app/routers/vr.py
 """
-RENDEREXPO AI STUDIO - VR Reconstruction (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - VR Reconstruction Router (Planner)
 
 GOAL:
 - User uploads 3+ images of the same space.
-- Create a job folder, save images, write meta.json.
-- Dispatch to GPU dispatcher so this is REAL, not skeleton.
+- Planner creates a job folder, saves images, writes meta.json.
+- Planner dispatches to GPU worker so this is REAL, not skeleton.
 
 3 VR modes -> MUST route to 3 DIFFERENT REAL pipelines on GPU:
 - gaussian_splat
 - nerf
 - mesh
 
-CRITICAL (Doc 18):
+CRITICAL:
 - If ANY VR pipeline step uses SD3.5 (texture fill, relight, harmonize, inpaint),
   it MUST use the SAME locked preset system.
-- denoise hard-locked to 0.0 everywhere.
-
-This router (Planner):
-- Writes sd35_preset block in meta using apply_preset_to_meta()
-- Dispatches to GPU worker dispatch handler using HMAC Option A
+- This router writes an sd35_preset block in meta using apply_preset_to_meta().
+- Planner = port 8012
+- GPU worker = port 8002
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import time
-import hmac
-import hashlib
-import shutil
 import datetime
-from typing import List, Optional, Any, Dict, Literal, Tuple
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import time
+import uuid
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.presets_sd35 import apply_preset_to_meta
 
-router = APIRouter(prefix="/api/vr", tags=["VR (REAL)"])
+router = APIRouter(prefix="/api/vr", tags=["VR (Planner)"])
 
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
 VRMode = Literal["gaussian_splat", "nerf", "mesh"]
 
 # ---------------------------------------------------------------------------
-# HMAC (must match app/main.py)
+# HMAC (must match app/main.py / GPU worker)
 # ---------------------------------------------------------------------------
 
 HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
@@ -68,13 +66,19 @@ def _gpu_dispatch_url() -> str:
     GPU dispatch endpoint.
 
     Recommended:
-      VR_GPU_DISPATCH_URL=http://127.0.0.1:8012/api/gpu/dispatch
+      VR_GPU_DISPATCH_URL=http://127.0.0.1:8002/api/gpu/dispatch
     """
-    return os.getenv("VR_GPU_DISPATCH_URL", "http://127.0.0.1:8012/api/gpu/dispatch").strip()
+    return os.getenv("VR_GPU_DISPATCH_URL", "http://127.0.0.1:8002/api/gpu/dispatch").strip()
+
+
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
 
 
 def _abs(p: str) -> str:
-    return os.path.abspath(p)
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(_repo_root(), p))
 
 
 def _today_utc_str() -> str:
@@ -87,6 +91,13 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     job_id = uuid.uuid4().hex
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
+
+    try:
+        with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
+            f.write("vr_reconstruct")
+    except Exception:
+        pass
+
     return folder
 
 
@@ -134,11 +145,8 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     url = _gpu_dispatch_url()
 
     payload = {
-        "job_type": "vr_reconstruct",
-        "vr_mode": meta.get("vr_mode"),
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        "pipeline_key": f"vr::{meta.get('vr_mode')}",
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -162,8 +170,7 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     }
 
     try:
-        # Dispatch should ACK quickly, but allow a bit more headroom.
-        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 60))
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
         if not (200 <= r.status_code < 300):
             raise RuntimeError(f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
         return r.json() if r.content else {"status": "ok"}
@@ -203,7 +210,6 @@ def _detect_ext(upload: UploadFile) -> str:
     if ct == "image/png" or name.endswith(".png"):
         return ".png"
 
-    # If missing/odd, reject (VR pipelines assume real images)
     raise HTTPException(status_code=400, detail="Only PNG and JPG are supported for VR images.")
 
 
@@ -211,7 +217,6 @@ def _validate_upload_is_png_jpg(upload: UploadFile) -> None:
     ct = (getattr(upload, "content_type", "") or "").lower().strip()
     name = (upload.filename or "").lower().strip()
 
-    # Accept if either content-type or extension looks correct
     ok_ct = (not ct) or (ct in ("image/png", "image/jpeg", "image/jpg"))
     ok_ext = (not name) or name.endswith((".png", ".jpg", ".jpeg"))
     if not (ok_ct and ok_ext):
@@ -268,7 +273,7 @@ async def _build_vr_job(
             }
         )
 
-    # 3) SD3.5 preset block (Doc 18 locked)
+    # 3) SD3.5 preset block for any downstream SD3.5-assisted stage
     sd35_preset: Dict[str, Any] = {
         "type": "sd35_preset_block",
         "model_name": "sd35_large_pro_v2_1",
@@ -276,17 +281,11 @@ async def _build_vr_job(
         "category": use_category,
         "shot": use_shot,
         "seed": use_seed,
-        "denoise": 0.0,
     }
 
     apply_preset_to_meta(sd35_preset, category=use_category, shot=use_shot, upscale_2x=upscale_2x)
 
-    # Hard lock: no denoise anywhere
-    sd35_preset["denoise"] = 0.0
-    if isinstance(sd35_preset.get("upscale"), dict):
-        sd35_preset["upscale"]["denoise"] = 0.0
-
-    # 4) Outputs contract (mode-specific) — unchanged
+    # 4) Outputs contract (mode-specific)
     outputs: Dict[str, Any] = {
         "viewer_dir": "viewer/",
         "preview_video": "preview.mp4" if preview_video else None,
@@ -305,29 +304,19 @@ async def _build_vr_job(
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
         "type": "vr_reconstruct",
-
         "status": "queued",
         "mode_runtime": "gpu-dispatch",
-
         "vr_mode": vr_mode,
-
         "prompt": prompt,
         "plan_hint": plan_hint,
-
         "input_views": saved_views,
-
         "vr_runtime": {
             "max_resolution": int(max_resolution),
             "preview_video": bool(preview_video),
         },
-
         "sd35_preset": sd35_preset,
-
-        # global hard lock
-        "denoise": 0.0,
-
         "outputs": outputs,
-
+        "pipeline_key": f"vr::{vr_mode}",
         "dispatch": {
             "target": _gpu_dispatch_url(),
             "pipeline_key": f"vr::{vr_mode}",
@@ -364,18 +353,15 @@ async def _build_vr_job(
 async def reconstruct_vr(
     images: List[UploadFile] = File(..., description="At least 3 images of the same space."),
     vr_mode: str = Form("gaussian_splat", description="gaussian_splat | nerf | mesh"),
-
     prompt: Optional[str] = Form(None),
     plan_hint: Optional[str] = Form(None),
-
     category: Optional[Category] = Form(None),
     shot: Optional[Shot] = Form(None),
     upscale_2x: Optional[bool] = Form(None),
     seed: Optional[int] = Form(None),
-
     max_resolution: int = Form(1600),
     preview_video: bool = Form(True),
-):
+) -> Dict[str, Any]:
     vr_mode_typed: VRMode = _validate_vr_mode(vr_mode)
 
     built = await _build_vr_job(
@@ -398,7 +384,6 @@ async def reconstruct_vr(
     try:
         gpu_resp = _dispatch_to_gpu(job_folder, meta)
 
-        # update meta after dispatch
         try:
             meta["status"] = "dispatched"
             meta["dispatch"]["dispatched_at"] = datetime.datetime.utcnow().isoformat()
@@ -429,7 +414,6 @@ async def reconstruct_vr(
         }
 
     except Exception as exc:  # noqa: BLE001
-        # persist failure state
         try:
             meta["status"] = "gpu_error"
             meta["dispatch"]["error"] = {"detail": str(exc)}
@@ -463,17 +447,14 @@ async def plan_vr_reconstruction(
     images: List[UploadFile] = File(...),
     prompt: Optional[str] = Form(None),
     plan_hint: Optional[str] = Form(None),
-
     category: Optional[Category] = Form(None),
     shot: Optional[Shot] = Form(None),
     upscale_2x: Optional[bool] = Form(None),
     seed: Optional[int] = Form(None),
-
     max_resolution: int = Form(1600),
     preview_video: bool = Form(True),
     vr_mode: str = Form("gaussian_splat"),
-):
-    # You said: no skeletons / all real. This endpoint is intentionally blocked.
+) -> Dict[str, Any]:
     if (os.getenv("ENABLE_VR_PLAN_ROUTE") or "").strip().lower() not in ("1", "true", "yes"):
         raise HTTPException(status_code=404, detail="Not found.")
 

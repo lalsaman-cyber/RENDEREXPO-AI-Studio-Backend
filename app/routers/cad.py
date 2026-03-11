@@ -1,10 +1,10 @@
 # app/routers/cad.py
 """
-RENDEREXPO AI STUDIO - CAD From Image (REAL via GPU dispatch)
+RENDEREXPO AI STUDIO - CAD From Image Router (Planner)
 
 GOAL (Wix-ready):
 - Planner creates job folder, writes input.png, writes meta.json
-- Planner DISPATCHES to GPU worker (HMAC-signed Option A)
+- Planner dispatches to GPU worker (HMAC-signed Option A)
 - GPU worker writes:
     - output.dxf (required)
     - output.dwg (best-effort)
@@ -15,52 +15,47 @@ Endpoints:
 1) POST /api/cad/from-image
    - multipart upload (BEST default for Wix: normal upload)
 2) POST /api/cad/from-image-base64
-   - JSON upload (image as text) (kept as backup if Wix JSON-only)
+   - JSON upload (image as text) (backup if Wix JSON-only)
 3) POST /api/cad/from-job
    - JSON: reference an image from a prior job
 4) POST /api/cad/from-job-base64
    - Alias name for Wix consistency (same behavior as /from-job)
+
+Service split (LOCKED):
+- Planner = port 8012
+- GPU worker = port 8002
 
 Security:
 - Planner is HMAC protected globally (middleware in app/main.py)
 - Dispatch to GPU worker is HMAC signed (Option A) using RENDEREXPO_HMAC_SECRET
 
 Notes:
-- Planner runs on PC (port 8002)
-- GPU worker runs on POD (port 8012) reachable via CAD_GPU_DISPATCH_URL (or VIDEO_GPU_DISPATCH_URL fallback)
 - job_folder is sent as an ABSOLUTE path; GPU worker must be able to read/write it
   (shared volume / same filesystem view).
-
-UPDATE IN THIS VERSION:
-- Adds strict input validation (units, semantic level, numeric ranges).
-- Prevents path traversal on from-job via _safe_relpath().
-- Adds lightweight job_type.txt marker.
-- Keeps HMAC signing EXACT raw bytes (stable json separators).
-- Keeps BOTH multipart and base64 routes (since you said keep base64 as backup).
 """
 
 from __future__ import annotations
 
-import os
-import uuid
-import json
-import time
-import hmac
-import hashlib
-import shutil
-import datetime
 import base64
 import binascii
-from typing import Optional, Any, Dict, Tuple, Literal
+import datetime
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import time
+import uuid
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-router = APIRouter(prefix="/api/cad", tags=["CAD (REAL)"])
+router = APIRouter(prefix="/api/cad", tags=["CAD (Planner)"])
 
 # ---------------------------------------------------------------------------
-# HMAC constants (must match app/main.py)
+# HMAC constants (must match app/main.py and GPU worker)
 # ---------------------------------------------------------------------------
 
 HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
@@ -105,14 +100,12 @@ class CadFromImageBase64Request(BaseModel):
     - Send image_base64 as:
         - pure base64 OR
         - data URL like "data:image/png;base64,...."
-    - PNG/JPG only (locked by user)
+    - PNG/JPG only.
     """
     image_base64: str = Field(..., description="Base64 or data URL (PNG/JPG only)")
 
     scale_mode: ScaleMode = Field(default="two_point")
-    scale_reference_distance: Optional[float] = Field(
-        default=None, description="Real distance between points, in unit", gt=0.0
-    )
+    scale_reference_distance: Optional[float] = Field(default=None, gt=0.0)
     scale_reference_unit: ScaleUnit = Field(default="m")
 
     scale_point_1: Optional[Point] = None
@@ -155,7 +148,6 @@ def _now_epoch() -> int:
 def _gpu_dispatch_url() -> str:
     """
     CAD dispatch endpoint.
-    Uses same GPU dispatch service as VR/Video.
 
     Priority:
       CAD_GPU_DISPATCH_URL
@@ -164,12 +156,18 @@ def _gpu_dispatch_url() -> str:
     """
     return os.getenv(
         "CAD_GPU_DISPATCH_URL",
-        os.getenv("VIDEO_GPU_DISPATCH_URL", "http://127.0.0.1:8012/api/gpu/dispatch"),
+        os.getenv("VIDEO_GPU_DISPATCH_URL", "http://127.0.0.1:8002/api/gpu/dispatch"),
     ).strip()
 
 
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
+
+
 def _abs(p: str) -> str:
-    return os.path.abspath(p)
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(_repo_root(), p))
 
 
 def _today_utc_str() -> str:
@@ -182,7 +180,6 @@ def _create_job_folder(base_outputs_dir: str = "outputs") -> str:
     folder = os.path.join(base_outputs_dir, today, job_id)
     os.makedirs(folder, exist_ok=True)
 
-    # marker file
     try:
         with open(os.path.join(folder, "job_type.txt"), "w", encoding="utf-8") as f:
             f.write("cad_from_image")
@@ -239,10 +236,8 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     """
     url = _gpu_dispatch_url()
     payload = {
-        "job_type": "cad_from_image",
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
-        "pipeline_key": "cad::from_image",
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -266,7 +261,7 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     }
 
     try:
-        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 60))
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
         if not (200 <= r.status_code < 300):
             raise RuntimeError(f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
         return r.json() if r.content else {"status": "ok"}
@@ -290,13 +285,12 @@ def _validate_scale_two_point(distance: Optional[float], p1: Optional[Point], p2
 def _decode_base64_image_png_jpg_only(image_base64: str) -> Tuple[bytes, str]:
     """
     Returns: (image_bytes, ext) where ext in {"png","jpg"}
-    Enforces PNG/JPG only based on magic bytes, NOT on claimed MIME.
+    Enforces PNG/JPG only based on magic bytes.
     """
     s = (image_base64 or "").strip()
     if not s:
         raise HTTPException(status_code=400, detail="image_base64 is required")
 
-    # Accept data URL
     if s.startswith("data:"):
         try:
             _, b64 = s.split(",", 1)
@@ -304,7 +298,6 @@ def _decode_base64_image_png_jpg_only(image_base64: str) -> Tuple[bytes, str]:
             raise HTTPException(status_code=400, detail="Invalid data URL format for image_base64")
         s = b64.strip()
 
-    # Fix spaces (common with form encoders)
     s = s.replace(" ", "+")
 
     try:
@@ -312,11 +305,9 @@ def _decode_base64_image_png_jpg_only(image_base64: str) -> Tuple[bytes, str]:
     except (binascii.Error, ValueError):
         raise HTTPException(status_code=400, detail="Invalid base64 image payload")
 
-    # PNG magic
     if len(raw) >= 8 and raw[:8] == b"\x89PNG\r\n\x1a\n":
         return raw, "png"
 
-    # JPEG magic
     if len(raw) >= 3 and raw[:3] == b"\xff\xd8\xff":
         return raw, "jpg"
 
@@ -378,11 +369,43 @@ def _normalize_semantic_level(level: str) -> SemanticLevel:
 def _ensure_png_jpg_upload(image: UploadFile) -> None:
     """
     Best-effort enforcement: PNG/JPG only.
-    (We trust GPU worker can do deeper validation if desired.)
     """
     ct = (getattr(image, "content_type", "") or "").lower().strip()
     if ct and ("png" not in ct and "jpeg" not in ct and "jpg" not in ct):
         raise HTTPException(status_code=400, detail="Only PNG and JPG are allowed")
+
+
+def _base_meta(
+    *,
+    job_id: str,
+    inputs: Dict[str, Any],
+    scaling: Dict[str, Any],
+    semantics: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "created_at": datetime.datetime.utcnow().isoformat(),
+        "type": "cad_from_image",
+        "status": "queued",
+        "mode_runtime": "gpu-dispatch",
+        "inputs": inputs,
+        "scaling": scaling,
+        "semantics": semantics,
+        "outputs": {
+            "preview": "lines_preview.png",
+            "dxf": "output.dxf",
+            "dwg": "output.dwg",
+            "meta": "meta.json",
+        },
+        "pipeline_key": "cad::from_image",
+        "dispatch": {
+            "job_type": "cad_from_image",
+            "target": _gpu_dispatch_url(),
+            "dispatched_at": None,
+            "gpu_response": None,
+            "error": None,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -392,22 +415,17 @@ def _ensure_png_jpg_upload(image: UploadFile) -> None:
 @router.post("/from-image")
 async def cad_from_image(
     image: UploadFile = File(..., description="PNG/JPG render/image to extract CAD linework from"),
-
-    # Scaling
     scale_mode: str = Form("two_point", description="two_point | door_height_fallback"),
     scale_reference_distance: Optional[float] = Form(None, description="Real distance between points (in unit)"),
     scale_reference_unit: str = Form("m", description="m|cm|mm|ft"),
-
     scale_point_1_x: Optional[float] = Form(None, description="0..1 normalized"),
     scale_point_1_y: Optional[float] = Form(None, description="0..1 normalized"),
     scale_point_2_x: Optional[float] = Form(None, description="0..1 normalized"),
     scale_point_2_y: Optional[float] = Form(None, description="0..1 normalized"),
-
     fallback_door_height: float = Form(2.10, description="Door height used if fallback triggered"),
-
     semantic_level: str = Form("architectural", description="basic|architectural"),
     layer_profile: str = Form("standard", description="layer profile name"),
-):
+) -> Dict[str, Any]:
     _ensure_png_jpg_upload(image)
 
     scale_mode_clean = (scale_mode or "").strip() or "two_point"
@@ -433,63 +451,37 @@ async def cad_from_image(
         p2 = Point(x=float(scale_point_2_x), y=float(scale_point_2_y))
         _validate_scale_two_point(scale_reference_distance, p1, p2)
 
-    # 1) Create job folder
     job_folder = _create_job_folder()
     job_id = os.path.basename(job_folder)
 
-    # 2) Save input image (GPU expects input.png)
     img_path = os.path.join(job_folder, "input.png")
     await _save_upload_stream(image, img_path)
 
-    # 3) Meta for GPU
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.datetime.utcnow().isoformat(),
-        "type": "cad_from_image",
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "inputs": {
+    meta = _base_meta(
+        job_id=job_id,
+        inputs={
             "image": "input.png",
             "content_type": getattr(image, "content_type", None),
             "filename": getattr(image, "filename", None),
             "source": "upload",
         },
-
-        "scaling": {
+        scaling={
             "mode": scale_mode_clean,
             "distance": float(scale_reference_distance) if scale_reference_distance is not None else None,
             "unit": unit_clean,
             "points": (
                 [{"x": p1.x, "y": p1.y}, {"x": p2.x, "y": p2.y}]
-                if scale_mode_clean == "two_point" and p1 and p2 else None
+                if scale_mode_clean == "two_point" and p1 and p2
+                else None
             ),
             "fallback_door_height": float(fallback_door_height),
             "no_dimensions": True,
         },
-
-        "semantics": {
+        semantics={
             "level": semantic_clean,
             "layer_profile": layer_profile,
         },
-
-        "outputs": {
-            "preview": "lines_preview.png",
-            "dxf": "output.dxf",
-            "dwg": "output.dwg",
-            "meta": "meta.json",
-        },
-
-        "pipeline_key": "cad::from_image",
-
-        "dispatch": {
-            "job_type": "cad_from_image",
-            "target": _gpu_dispatch_url(),
-            "dispatched_at": None,
-            "gpu_response": None,
-            "error": None,
-        },
-    }
+    )
 
     meta_path = os.path.join(job_folder, "meta.json")
     try:
@@ -547,7 +539,7 @@ async def cad_from_image(
 # ---------------------------------------------------------------------------
 
 @router.post("/from-image-base64")
-async def cad_from_image_base64(req: CadFromImageBase64Request):
+async def cad_from_image_base64(req: CadFromImageBase64Request) -> Dict[str, Any]:
     scale_mode_clean = (req.scale_mode or "two_point").strip()
     if scale_mode_clean not in ("two_point", "door_height_fallback"):
         raise HTTPException(status_code=400, detail="scale_mode must be 'two_point' or 'door_height_fallback'")
@@ -555,9 +547,8 @@ async def cad_from_image_base64(req: CadFromImageBase64Request):
     if scale_mode_clean == "two_point":
         _validate_scale_two_point(req.scale_reference_distance, req.scale_point_1, req.scale_point_2)
 
-    # validate unit + semantic
-    _ = _normalize_scale_unit(req.scale_reference_unit)
-    _ = _normalize_semantic_level(req.semantic_level)
+    unit_clean = _normalize_scale_unit(req.scale_reference_unit)
+    semantic_clean = _normalize_semantic_level(req.semantic_level)
 
     img_bytes, ext = _decode_base64_image_png_jpg_only(req.image_base64)
 
@@ -571,54 +562,31 @@ async def cad_from_image_base64(req: CadFromImageBase64Request):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed writing input.png: {exc}") from exc
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.datetime.utcnow().isoformat(),
-        "type": "cad_from_image",
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "inputs": {
+    meta = _base_meta(
+        job_id=job_id,
+        inputs={
             "image": "input.png",
             "content_type": f"image/{'jpeg' if ext == 'jpg' else 'png'}",
             "source": "base64",
         },
-
-        "scaling": {
+        scaling={
             "mode": scale_mode_clean,
             "distance": float(req.scale_reference_distance) if req.scale_reference_distance is not None else None,
-            "unit": _normalize_scale_unit(req.scale_reference_unit),
+            "unit": unit_clean,
             "points": (
                 [{"x": req.scale_point_1.x, "y": req.scale_point_1.y},
                  {"x": req.scale_point_2.x, "y": req.scale_point_2.y}]
-                if scale_mode_clean == "two_point" and req.scale_point_1 and req.scale_point_2 else None
+                if scale_mode_clean == "two_point" and req.scale_point_1 and req.scale_point_2
+                else None
             ),
             "fallback_door_height": float(req.fallback_door_height),
             "no_dimensions": True,
         },
-
-        "semantics": {
-            "level": _normalize_semantic_level(req.semantic_level),
+        semantics={
+            "level": semantic_clean,
             "layer_profile": req.layer_profile,
         },
-
-        "outputs": {
-            "preview": "lines_preview.png",
-            "dxf": "output.dxf",
-            "dwg": "output.dwg",
-            "meta": "meta.json",
-        },
-
-        "pipeline_key": "cad::from_image",
-
-        "dispatch": {
-            "job_type": "cad_from_image",
-            "target": _gpu_dispatch_url(),
-            "dispatched_at": None,
-            "gpu_response": None,
-            "error": None,
-        },
-    }
+    )
 
     meta_path = os.path.join(job_folder, "meta.json")
     try:
@@ -671,7 +639,7 @@ async def cad_from_image_base64(req: CadFromImageBase64Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/from-job")
-async def cad_from_job(req: CadFromJobRequest):
+async def cad_from_job(req: CadFromJobRequest) -> Dict[str, Any]:
     source_job_id = (req.source_job_id or "").strip()
     if not source_job_id:
         raise HTTPException(status_code=400, detail="source_job_id is required")
@@ -690,72 +658,50 @@ async def cad_from_job(req: CadFromJobRequest):
     if req.scale_mode == "two_point":
         _validate_scale_two_point(req.scale_reference_distance, req.scale_point_1, req.scale_point_2)
 
-    # Create CAD job
+    unit_clean = _normalize_scale_unit(req.scale_reference_unit)
+    semantic_clean = _normalize_semantic_level(req.semantic_level)
+
     job_folder = _create_job_folder()
     job_id = os.path.basename(job_folder)
 
-    # Copy source image into job folder as input.png
     dst_img = os.path.join(job_folder, "input.png")
     try:
         shutil.copyfile(src_img, dst_img)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed copying source image: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed copying source image: {exc}") from exc
 
-    meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": datetime.datetime.utcnow().isoformat(),
-        "type": "cad_from_image",
-        "status": "queued",
-        "mode_runtime": "gpu-dispatch",
-
-        "inputs": {
+    meta = _base_meta(
+        job_id=job_id,
+        inputs={
             "image": "input.png",
             "source": "job_reference",
             "source_job_id": source_job_id,
             "source_image_path": safe_rel,
         },
-
-        "scaling": {
+        scaling={
             "mode": req.scale_mode,
             "distance": float(req.scale_reference_distance) if req.scale_reference_distance is not None else None,
-            "unit": _normalize_scale_unit(req.scale_reference_unit),
+            "unit": unit_clean,
             "points": (
                 [{"x": req.scale_point_1.x, "y": req.scale_point_1.y},
                  {"x": req.scale_point_2.x, "y": req.scale_point_2.y}]
-                if req.scale_mode == "two_point" and req.scale_point_1 and req.scale_point_2 else None
+                if req.scale_mode == "two_point" and req.scale_point_1 and req.scale_point_2
+                else None
             ),
             "fallback_door_height": float(req.fallback_door_height),
             "no_dimensions": True,
         },
-
-        "semantics": {
-            "level": _normalize_semantic_level(req.semantic_level),
+        semantics={
+            "level": semantic_clean,
             "layer_profile": req.layer_profile,
         },
-
-        "outputs": {
-            "preview": "lines_preview.png",
-            "dxf": "output.dxf",
-            "dwg": "output.dwg",
-            "meta": "meta.json",
-        },
-
-        "pipeline_key": "cad::from_image",
-
-        "dispatch": {
-            "job_type": "cad_from_image",
-            "target": _gpu_dispatch_url(),
-            "dispatched_at": None,
-            "gpu_response": None,
-            "error": None,
-        },
-    }
+    )
 
     meta_path = os.path.join(job_folder, "meta.json")
     try:
         _write_meta(job_folder, meta)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to write meta.json: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to write meta.json: {exc}") from exc
 
     public_urls = _outputs_public_urls(job_folder)
 
@@ -779,7 +725,7 @@ async def cad_from_job(req: CadFromJobRequest):
             "gpu_response": gpu_resp,
         }
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         try:
             meta["status"] = "gpu_error"
             meta["dispatch"]["error"] = {"detail": str(exc)}
@@ -802,7 +748,7 @@ async def cad_from_job(req: CadFromJobRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/from-job-base64")
-async def cad_from_job_base64(req: CadFromJobBase64Request):
+async def cad_from_job_base64(req: CadFromJobBase64Request) -> Dict[str, Any]:
     r = CadFromJobRequest(
         source_job_id=req.source_job_id,
         source_image_path=req.source_image_path,

@@ -1,27 +1,34 @@
 # app/routers/text2img.py
 """
-RENDEREXPO AI STUDIO - SD3.5 Text2Img Router
+RENDEREXPO AI STUDIO - SD3.5 Text2Img Router (Planner)
 
-CRITICAL (Doc 18):
-- This endpoint MUST write meta using the locked preset system:
-  steps, CFG, LyCORIS(PRO 2.1) multiplier, GEO multiplier, resolution
-- NO denoise anywhere (denoise always 0.0)
-- Upscale is OPTIONAL and must be explicitly requested per job (or preset default)
+Planner responsibilities:
+- Validate request shape
+- Create outputs/{date}/{job_id}/
+- Build and write meta.json
+- Apply centralized locked presets via app.presets_sd35.apply_preset_to_meta(...)
+- Dispatch to GPU worker through app.clients.gpu_client.dispatch_sd35_text2img
 
-This router:
-- Validates optional LoRA/refiner profiles (legacy/extra metadata only)
-- Creates outputs/{date}/{job_id}/
-- Writes meta.json
-- Dispatches to GPU worker via app.clients.gpu_client.dispatch_sd35_text2img
+IMPORTANT:
+- This file is planner-side only.
+- It must NOT load SD3.5 directly.
+- Planner = port 8012
+- GPU worker = port 8002
+- Root = /workspace-data/RENDEREXPO-AI-Studio-Backend
+
+Locked behavior:
+- Presets decide width / height / steps / cfg / PRO / GEO / upscale defaults
+- This router stores optional legacy profile labels only
+- It does not let legacy profile configs override locked preset multipliers
 """
 
 from __future__ import annotations
 
+import datetime
+import json
 import os
 import uuid
-import json
-import datetime
-from typing import Optional, Dict, Any, Literal
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -32,7 +39,7 @@ from app.presets_sd35 import apply_preset_to_meta
 router = APIRouter(prefix="/api/sd35", tags=["SD3.5 Text2Img"])
 
 # ---------------------------------------------------------------------------
-# Config paths for LoRA & Refiner profiles (optional / legacy)
+# Config paths for LoRA & Refiner profiles (optional / legacy metadata only)
 # ---------------------------------------------------------------------------
 
 CONFIG_DIR = "config"
@@ -75,7 +82,6 @@ def _ensure_job_folder(base_outputs_dir: str = "outputs") -> str:
     job_folder = os.path.join(base_outputs_dir, today_str, job_id)
     os.makedirs(job_folder, exist_ok=True)
 
-    # marker file
     try:
         with open(os.path.join(job_folder, "job_type.txt"), "w", encoding="utf-8") as f:
             f.write("sd35_text2img")
@@ -112,11 +118,10 @@ def _build_detail_pass(
     custom: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Produces meta["detail_pass"] that your GPU runtime understands.
+    Produces meta["detail_pass"] that the GPU runtime understands.
 
     NOTE:
-    - This is separate from diffusion denoise.
-    - Diffusion denoise remains HARD-LOCKED to 0.0 everywhere.
+    - This is a post-process clarity pass concept, not diffusion denoise.
     """
     presets = {
         "off": {"enabled": False},
@@ -131,6 +136,18 @@ def _build_detail_pass(
     return dp
 
 
+def _output_public_url(job_folder: str) -> Optional[str]:
+    """
+    Convert outputs/YYYY-MM-DD/JOBID to /outputs/YYYY-MM-DD/JOBID/output.png
+    """
+    parts = os.path.normpath(job_folder).split(os.sep)
+    if len(parts) < 3:
+        return None
+    date_str = parts[-2]
+    job_id = parts[-1]
+    return f"/outputs/{date_str}/{job_id}/output.png"
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request model
 # ---------------------------------------------------------------------------
@@ -139,11 +156,11 @@ class SD35Text2ImgRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="Main text prompt for SD3.5.")
     negative_prompt: Optional[str] = Field(default=None)
 
-    # Doc 18 preset selectors (LOCKED SYSTEM)
-    category: Category = Field(..., description="Doc 18 preset category.")
-    shot: Shot = Field(..., description="Doc 18 preset shot (wide/close).")
+    # Locked preset selectors
+    category: Category = Field(..., description="Preset category.")
+    shot: Shot = Field(..., description="Preset shot (wide/close).")
 
-    # Upscale is OPTIONAL per job
+    # Optional per-request upscale override
     upscale_2x: Optional[bool] = Field(
         default=None,
         description="Optional per-request upscale (true/false). If omitted, preset default applies.",
@@ -163,44 +180,41 @@ class SD35Text2ImgRequest(BaseModel):
     material_preset: Optional[str] = None
     lighting_preset: Optional[str] = None
 
-    # Optional / legacy profiles (DO NOT overwrite Doc 18 multipliers)
+    # Optional / legacy profiles (stored only)
     lora_profile: Optional[str] = Field(
         default=None,
-        description="Optional legacy profile name (stored only; Doc 18 multipliers remain primary).",
+        description="Optional legacy profile name (stored only; locked preset multipliers remain primary).",
     )
     refiner_profile: Optional[str] = Field(
         default=None,
-        description="Optional legacy profile name (stored only; Doc 18 multipliers remain primary).",
+        description="Optional legacy profile name (stored only; locked preset multipliers remain primary).",
     )
 
-    # Precision modes (stored; GPU runtime may interpret)
     render_mode: Literal["precise", "balanced", "creative"] = Field(
         default="balanced",
-        description="Controls how strictly architecture is preserved vs creative variation.",
+        description="Planner metadata only; GPU runtime may interpret it later.",
     )
 
-    # Detail pass control (post-process clarity boost)
     detail_mode: Literal["off", "standard", "strong"] = Field(
         default="standard",
-        description="Post-process clarity boost (GPU runtime).",
+        description="Post-process clarity boost metadata for GPU runtime.",
     )
 
     detail_pass: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Optional override dict for detail pass: {enabled, amount, radius, threshold}.",
+        description="Optional detail pass override dict: {enabled, amount, radius, threshold}.",
     )
 
 
 @router.post("/render")
-async def sd35_render(request: SD35Text2ImgRequest):
+async def sd35_render(request: SD35Text2ImgRequest) -> Dict[str, Any]:
     """
-    SD3.5 Text2Img endpoint (job creation + GPU dispatch).
+    SD3.5 Text2Img endpoint (planner job creation + GPU dispatch).
 
     Flow:
     - Validate optional profiles
     - Create job folder
-    - Build meta.json with Doc 18 locked preset system
-    - HARD LOCK: denoise = 0.0 always (and upscale.denoise = 0.0 if present)
+    - Build meta.json with centralized preset system
     - Dispatch to GPU worker
     """
     prompt_clean = (request.prompt or "").strip()
@@ -216,60 +230,42 @@ async def sd35_render(request: SD35Text2ImgRequest):
     job_id = os.path.basename(job_folder)
     meta_path = os.path.join(job_folder, "meta.json")
     planned_output_image_abs = os.path.join(job_folder, "output.png")
+    public_output_url = _output_public_url(job_folder)
 
     # Seed
     seed = request.seed if request.seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    # Build base meta (preset-locked will fill width/height/steps/cfg + multipliers)
+    # Build base meta
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
-
         "type": "text2img",
-
-        # Always use PRO 2.1 (your locked rule)
-        "model_name": "sd3.5-large-pro-2.1",
-
+        "model_name": "sd35_large_pro_v2_1",
+        "engine": "sd35_large_pro_v2_1",
         "prompt": prompt_clean,
         "negative_prompt": request.negative_prompt,
         "seed": seed,
-
-        # Doc 18 selectors (these drive the preset system)
         "category": request.category,
         "shot": request.shot,
-
-        # Traceability for decision-making (apply_preset_to_meta decides final upscale)
         "upscale_request": request.upscale_2x,
-
-        # HARD LOCK: no denoise anywhere
-        "denoise": 0.0,
-
-        # Labels only
         "style_preset": request.style_preset,
         "material_preset": request.material_preset,
         "lighting_preset": request.lighting_preset,
-
-        # Output
         "planned_output_image": "output.png",
         "status": "planned",
-
-        # Modes
         "render_mode": request.render_mode,
         "detail_pass": _build_detail_pass(request.detail_mode, request.detail_pass),
-
-        # Optional/legacy profiles are stored but must NOT override Doc 18 preset multipliers
         "optional_profiles": {
             "lora_profile": request.lora_profile,
             "lora_profile_config": lora_cfg,
             "refiner_profile": request.refiner_profile,
             "refiner_profile_config": refiner_cfg,
         },
-
-        # Runtime decides skeleton vs real
-        "mode": "skeleton-or-real",
+        "mode": "planner-dispatch",
+        "pipeline_key": "sd35::sd35_text2img",
     }
 
-    # Apply Doc 18 locked preset system (this injects steps/cfg/resolution + lycoris/geo configs)
+    # Apply centralized locked preset system
     try:
         apply_preset_to_meta(
             meta,
@@ -279,11 +275,6 @@ async def sd35_render(request: SD35Text2ImgRequest):
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
-
-    # Safety hard-lock again
-    meta["denoise"] = 0.0
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
 
     # Write meta.json
     try:
@@ -302,16 +293,18 @@ async def sd35_render(request: SD35Text2ImgRequest):
             "job_folder": job_folder,
             "meta_path": meta_path,
             "planned_output_image": planned_output_image_abs,
+            "public_output_url": public_output_url,
             "gpu_error": gpu_resp,
             "preset_applied": meta.get("preset", {}),
         }
 
     return {
         "status": "dispatched",
-        "message": "Text2Img job dispatched to GPU worker (Doc 18 locked presets).",
+        "message": "Text2Img job dispatched to GPU worker.",
         "job_folder": job_folder,
         "meta_path": meta_path,
         "output_image": planned_output_image_abs,
+        "public_output_url": public_output_url,
         "gpu_response": gpu_resp,
         "preset_applied": meta.get("preset", {}),
     }
@@ -322,7 +315,7 @@ async def sd35_render(request: SD35Text2ImgRequest):
 # ---------------------------------------------------------------------------
 
 @router.get("/config/lora-profiles")
-async def list_lora_profiles():
+async def list_lora_profiles() -> Dict[str, Any]:
     return {
         "status": "ok",
         "source": LORA_PROFILES_PATH,
@@ -331,7 +324,7 @@ async def list_lora_profiles():
 
 
 @router.get("/config/refiner-profiles")
-async def list_refiner_profiles():
+async def list_refiner_profiles() -> Dict[str, Any]:
     return {
         "status": "ok",
         "source": REFINER_PROFILES_PATH,
