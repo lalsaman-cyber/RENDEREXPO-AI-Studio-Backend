@@ -1,12 +1,17 @@
 # app/routers/__init__.py
 """
-Central export for planner-side FastAPI routers used in RENDEREXPO AI STUDIO.
+Central export for all FastAPI routers used in RENDEREXPO AI STUDIO (PLANNER).
+
+Each router file defines:
+- an APIRouter instance
+- one or more endpoints
+
+We import them here so app.main can do package-level router imports cleanly.
 
 IMPORTANT:
-- Planner = port 8012
-- GPU worker = port 8002
-- This module is for planner routers only.
-- Do NOT add the GPU worker dispatch router here.
+- This module is for PLANNER routers only.
+- Do NOT add the GPU worker dispatch router here (/api/gpu/dispatch).
+  That route belongs to the separate GPU worker service.
 """
 
 from __future__ import annotations

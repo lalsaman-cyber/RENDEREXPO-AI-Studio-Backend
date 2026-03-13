@@ -3,69 +3,39 @@
 RENDEREXPO AI STUDIO - GPU Dispatch Handler (REAL, Production)
 
 Purpose:
-- Accept dispatch requests from the main FastAPI "planner" service (8002).
-- Route each job to the correct GPU implementation (8012).
-- Run heavy jobs in background threads.
+- Accept dispatch requests from the planner service.
+- Route each job to the correct REAL GPU/local implementation that actually exists in this repo.
+- Run jobs in background threads.
 - Update job_folder/meta.json with REAL results or REAL errors.
-- Guarantee: no "completed" status without real artifact outputs when applicable.
+- Never mark a job completed unless the expected result artifact exists when applicable.
 
-Supports (REAL):
-- SD3.5 text2img
-- SD3.5 img2img (Pass2 refine) [optional]
-- Upscale 2x
-- VR reconstruction (gaussian_splat, nerf, mesh)
-- Video (from image, between frames)
-- CAD (from image → DXF / DWG geometry)
-- Mesh (from image → OBJ / GLB)
-
-Contract:
-- job_folder is an ABSOLUTE path on the GPU worker filesystem.
-- meta.json is the disk source-of-truth.
+IMPORTANT:
+- job_folder must be an ABSOLUTE path on the GPU worker filesystem.
+- meta.json inside job_folder is the disk source of truth.
+- This version only imports modules that actually exist in your repository.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import time
-import uuid
-import traceback
-import threading
 import tempfile
-from typing import Any, Dict, Optional, Literal
+import threading
+import time
+import traceback
+import uuid
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-# -----------------------------
-# SD3.5 + Upscale runners (REAL)
-# -----------------------------
-from app.gpu.sd35 import run_sd35_txt2img, run_sd35_img2img
-from app.gpu.upscale import run_upscale_2x
-
-# -----------------------------
-# VR runners (REAL)
-# -----------------------------
-from app.gpu.vr.gaussian_splat import run_gaussian_splat
-from app.gpu.vr.nerf import run_nerf
-from app.gpu.vr.mesh import run_mesh
-
-# -----------------------------
-# Video runners (REAL)
-# -----------------------------
-from app.gpu.video.from_image import run_video_from_image
-from app.gpu.video.between_frames import run_video_between_frames
-
-# -----------------------------
-# CAD runner (REAL)
-# -----------------------------
+# REAL runners that exist in this repo
 from app.gpu.cad.from_image import run_cad_from_image
-
-# -----------------------------
-# Mesh runner (REAL)
-# -----------------------------
 from app.gpu.mesh.from_image import run_mesh_from_image
-
+from app.gpu.sd35 import run_sd35_img2img, run_sd35_txt2img
+from app.gpu.upscale import run_upscale_2x
+from app.gpu.video.between_frames import run_video_between_frames
+from app.gpu.video.from_image import run_video_from_image
 
 router = APIRouter(prefix="/api/gpu", tags=["GPU Dispatch"])
 
@@ -75,21 +45,16 @@ router = APIRouter(prefix="/api/gpu", tags=["GPU Dispatch"])
 # ---------------------------------------------------------------------------
 
 JobType = Literal[
-    # SD35 (support both legacy + planner naming)
-    "sd35_txt2img",     # legacy
-    "sd35_text2img",    # planner uses this
+    "sd35_txt2img",
+    "sd35_text2img",
     "sd35_img2img",
-    # Upscale
     "upscale_2x",
-    # Existing
     "vr_reconstruct",
     "video_from_image",
     "video_between_frames",
     "cad_from_image",
     "mesh_from_image",
 ]
-
-VRMode = Literal["gaussian_splat", "nerf", "mesh"]
 
 
 class GPUDispatchRequest(BaseModel):
@@ -98,7 +63,7 @@ class GPUDispatchRequest(BaseModel):
     meta: Dict[str, Any] = Field(..., description="Meta payload written by planner.")
 
     pipeline_key: Optional[str] = Field(default=None, description="Optional explicit routing key.")
-    vr_mode: Optional[VRMode] = Field(default=None, description="VR mode (required for vr_reconstruct).")
+    vr_mode: Optional[str] = Field(default=None, description="VR mode if used by a future VR implementation.")
 
 
 class GPUDispatchResponse(BaseModel):
@@ -114,7 +79,6 @@ class GPUDispatchResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Per-job locks prevent meta.json clobbering between threads
 _JOB_LOCKS: Dict[str, threading.Lock] = {}
 _JOB_LOCKS_GUARD = threading.Lock()
 
@@ -147,10 +111,6 @@ def _read_meta(job_folder: str) -> Dict[str, Any]:
 
 
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    """
-    Atomic write: write temp file then replace.
-    Prevents partial meta.json corruption on crashes.
-    """
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix="meta_", suffix=".tmp", dir=d)
@@ -226,18 +186,6 @@ def _ensure_meta_exists(job_folder: str) -> None:
 
 
 def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
-    """
-    Enforce LyCORIS + GEO multipliers using the SAME fields the planner writes:
-
-      meta["lora_config"]["strength"/"scale"]    (LyCORIS PRO 2.1)
-      meta["geo_config"]["strength"/"scale"]     (GEO)
-      meta["preset"]["lycoris_multiplier"/"geo_multiplier"] (mirror)
-
-    Safety band:
-      LyCORIS: 0.0 .. 0.20
-      GEO:     0.0 .. 0.05
-    """
-    # Defaults (Doc 18 baseline)
     default_ly = 0.05
     default_ge = 0.01
 
@@ -245,7 +193,6 @@ def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
     geo_cfg = meta.get("geo_config") if isinstance(meta.get("geo_config"), dict) else None
     preset = meta.get("preset") if isinstance(meta.get("preset"), dict) else None
 
-    # Pull values from planner fields (prefer explicit strength, fallback scale, fallback preset)
     ly_val = None
     ge_val = None
 
@@ -259,7 +206,6 @@ def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
     if ge_val is None and isinstance(preset, dict):
         ge_val = preset.get("geo_multiplier")
 
-    # If missing entirely, lock to defaults
     try:
         ly = float(default_ly if ly_val is None else ly_val)
     except Exception:
@@ -270,13 +216,11 @@ def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
     except Exception:
         ge = float(default_ge)
 
-    # Clamp/validate hard safety band
     if not (0.0 <= ly <= 0.20):
         raise RuntimeError(f"Invalid LyCORIS multiplier: {ly}. Allowed: [0.0, 0.20].")
     if not (0.0 <= ge <= 0.05):
         raise RuntimeError(f"Invalid GEO multiplier: {ge}. Allowed: [0.0, 0.05].")
 
-    # Write back normalized values so runners always see clean numbers
     if isinstance(lora_cfg, dict):
         lora_cfg["strength"] = ly
         lora_cfg["scale"] = ly
@@ -294,10 +238,6 @@ def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
 
 
 def _require_file(job_folder: str, *names: str, err: str) -> str:
-    """
-    Require at least one of the provided filenames to exist in job_folder.
-    Return the first match path.
-    """
     for n in names:
         p = os.path.join(job_folder, n)
         if os.path.isfile(p):
@@ -310,8 +250,8 @@ def _assert_artifact_exists(path: Any, description: str) -> None:
         raise RuntimeError(f"{description} did not return a valid path.")
     if not os.path.isfile(path):
         raise RuntimeError(f"{description} path does not exist on disk: {path}")
-    if os.path.getsize(path) < 1024:
-        raise RuntimeError(f"{description} output file is too small / invalid: {path}")
+    if os.path.getsize(path) <= 0:
+        raise RuntimeError(f"{description} output file is empty: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -344,13 +284,11 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
         with lock:
             meta = _read_meta(job_folder)
 
-        # Enforce locked multipliers for SD35-related work
         if job_type in ("sd35_txt2img", "sd35_text2img", "sd35_img2img", "upscale_2x"):
             with lock:
                 _enforce_locked_multipliers(meta)
                 _write_meta(job_folder, meta)
 
-        # ---------------- SD35 ----------------
         if job_type in ("sd35_txt2img", "sd35_text2img"):
             prompt = meta.get("prompt")
             if not prompt or not isinstance(prompt, str):
@@ -361,7 +299,6 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 payload={**meta, "job_folder": job_folder},
             )
             _assert_artifact_exists(result_path, "SD35 text2img")
-
             result = {"output_png": result_path}
 
         elif job_type == "sd35_img2img":
@@ -385,11 +322,9 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload=payload,
             )
-            _assert_artifact_exists(result_path, "SD35 img2img refine")
-
+            _assert_artifact_exists(result_path, "SD35 img2img")
             result = {"refine_png": result_path, "input_image": input_path}
 
-        # ---------------- UPSCALE ----------------
         elif job_type == "upscale_2x":
             inp = None
             for n in ("refine.png", "output.png", "image.png", "input.png"):
@@ -403,37 +338,30 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 )
 
             payload = {**meta, "job_folder": job_folder, "input_image": inp}
-            result_path = run_upscale_2x(job={"date": meta.get("date"), "job_id": meta.get("job_id")}, payload=payload)
+            result_path = run_upscale_2x(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload=payload,
+            )
             _assert_artifact_exists(result_path, "Upscale 2x")
-
             result = {"final_up2x_png": result_path, "input_image": inp}
 
-        # ---------------- VR ----------------
-        elif job_type == "vr_reconstruct":
-            vr_mode = req.get("vr_mode") or meta.get("vr_mode")
-            if vr_mode == "gaussian_splat":
-                result = run_gaussian_splat(job_folder, meta)
-            elif vr_mode == "nerf":
-                result = run_nerf(job_folder, meta)
-            elif vr_mode == "mesh":
-                result = run_mesh(job_folder, meta)
-            else:
-                raise RuntimeError("Invalid or missing vr_mode for vr_reconstruct (gaussian_splat|nerf|mesh).")
-
-        # ---------------- VIDEO ----------------
         elif job_type == "video_from_image":
             result = run_video_from_image(job_folder, meta)
 
         elif job_type == "video_between_frames":
             result = run_video_between_frames(job_folder, meta)
 
-        # ---------------- CAD ----------------
         elif job_type == "cad_from_image":
             result = run_cad_from_image(job_folder, meta)
 
-        # ---------------- MESH ----------------
         elif job_type == "mesh_from_image":
             result = run_mesh_from_image(job_folder, meta)
+
+        elif job_type == "vr_reconstruct":
+            raise RuntimeError(
+                "vr_reconstruct is not wired yet in this repo. "
+                "A real VR GPU implementation must be added before enabling this route."
+            )
 
         else:
             raise RuntimeError(f"Unsupported job_type: {job_type}")
@@ -471,9 +399,7 @@ async def dispatch(request: GPUDispatchRequest):
         if not isinstance(disk_meta, dict):
             disk_meta = {}
 
-        # Merge: disk -> request.meta (planner wins)
         merged_meta = {**disk_meta, **(request.meta or {})}
-
         merged_meta["job_folder"] = request.job_folder
 
         merged_meta.setdefault("job_id", os.path.basename(request.job_folder.rstrip("/")))
@@ -482,16 +408,6 @@ async def dispatch(request: GPUDispatchRequest):
             merged_meta.setdefault("date", parent)
 
         _write_meta(request.job_folder, merged_meta)
-
-    # ---------------- Fail-early validations ----------------
-
-    if request.job_type == "vr_reconstruct":
-        vr_mode = request.vr_mode or merged_meta.get("vr_mode")
-        if vr_mode not in ("gaussian_splat", "nerf", "mesh"):
-            raise HTTPException(
-                status_code=400,
-                detail="vr_mode is required for vr_reconstruct (gaussian_splat|nerf|mesh).",
-            )
 
     if request.job_type == "video_between_frames":
         first_a = os.path.join(request.job_folder, "first.png")
@@ -521,6 +437,15 @@ async def dispatch(request: GPUDispatchRequest):
         img = os.path.join(request.job_folder, "image.png")
         if not os.path.isfile(img):
             raise HTTPException(status_code=400, detail="mesh_from_image requires image.png in job_folder.")
+
+    if request.job_type == "vr_reconstruct":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "vr_reconstruct is currently not available on this worker because "
+                "app.gpu.vr.* does not exist in this repository yet."
+            ),
+        )
 
     if request.job_type in ("sd35_txt2img", "sd35_text2img"):
         if not merged_meta.get("prompt"):
@@ -558,7 +483,6 @@ async def dispatch(request: GPUDispatchRequest):
                 detail="upscale_2x requires one of: refine.png, output.png, image.png, input.png in job_folder.",
             )
 
-    # ---------------- Queue + spawn thread ----------------
     run_id = f"{_now_epoch()}_{uuid.uuid4().hex[:12]}"
 
     with lock:

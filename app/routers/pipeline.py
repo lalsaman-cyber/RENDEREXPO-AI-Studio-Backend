@@ -1,6 +1,6 @@
 # app/routers/pipeline.py
 """
-Unified pipeline planner for RENDEREXPO AI STUDIO (planner-first + selective local execution).
+Unified pipeline planner for RENDEREXPO AI STUDIO (planner-first + selective execution).
 
 IMPORTANT:
 - Planner = port 8012
@@ -13,31 +13,35 @@ What this router does:
    - injects resolved SD3.5 meta blocks using locked presets
 
 2) /run
-   - executes only supported local stages now
+   - executes only supported stages now
    - currently:
-       - vr      -> builds a real Three.js viewer + zip package under job_folder/vr/
+       - vr      -> REAL GPU dispatch via planner -> GPU worker
        - upscale -> deterministic upscale only (Pillow Lanczos)
 
 What this router does NOT do:
 - no SD3.5 inference here
-- no GPU dispatch here
-- SD3.5 execution remains in the dedicated planner -> GPU worker flows
+- no local VR builder import
+- SD3.5 execution remains in dedicated planner -> GPU worker flows
 """
 
 from __future__ import annotations
 
 import datetime
+import hashlib
+import hmac
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from PIL import Image
 
 from app.presets_sd35 import apply_preset_to_meta
-from app.services.vr_builder import build_vr_package
 
 router = APIRouter(
     prefix="/api/pipeline",
@@ -64,14 +68,24 @@ StageType = Literal[
 
 Category = Literal["urban", "suburban", "interior", "wide_hero"]
 Shot = Literal["wide", "close"]
+VRMode = Literal["gaussian_splat", "nerf", "mesh"]
 
 SD35_STAGE_TYPES = {"text2img", "img2img", "controlnet"}
 SD35_ENGINE_NAME = "sd35_large_pro_v2_1"
 
+# ---------------------------------------------------------------------------
+# HMAC / GPU dispatch
+# ---------------------------------------------------------------------------
+
+HMAC_SECRET_ENV = "RENDEREXPO_HMAC_SECRET"
+SIG_HEADER = "X-RENDEREXPO-SIGNATURE"
+TS_HEADER = "X-RENDEREXPO-TIMESTAMP"
+NONCE_HEADER = "X-RENDEREXPO-NONCE"
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
 
 class PipelineStage(BaseModel):
     stage_type: StageType = Field(..., description="Type of stage in the pipeline.")
@@ -103,6 +117,17 @@ class PipelineRunResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def _repo_root() -> str:
+    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
+
+
+def _abs_repo_path(p: str) -> str:
+    if os.path.isabs(p):
+        return p
+    return os.path.abspath(os.path.join(_repo_root(), p))
+
+
 def _ensure_job_folder(job_folder: str) -> None:
     if not job_folder or not os.path.isdir(job_folder):
         raise HTTPException(status_code=400, detail=f"job_folder does not exist: {job_folder}")
@@ -129,6 +154,10 @@ def _write_meta(job_folder: str, meta: Dict[str, Any]) -> None:
 
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def _now_epoch() -> int:
+    return int(time.time())
 
 
 def _safe_basename(name: str) -> str:
@@ -198,6 +227,7 @@ def _build_sd35_meta_for_stage(
         "negative_prompt": negative_prompt,
         "status": "planned",
         "mode": "planned-local",
+        "denoise": 0.0,
     }
 
     if stage_type == "text2img":
@@ -222,15 +252,18 @@ def _build_sd35_meta_for_stage(
 
     apply_preset_to_meta(base, category=category, shot=shot, upscale_2x=upscale_2x)
 
+    base["denoise"] = 0.0
     if stage_type in ("img2img", "controlnet"):
         base["strength"] = float(strength)
+    if isinstance(base.get("upscale"), dict):
+        base["upscale"]["denoise"] = 0.0
 
     return base
 
 
 def _detect_overrides(params: Dict[str, Any]) -> Dict[str, Any]:
     locked_keys = ["width", "height", "steps", "num_inference_steps", "guidance_scale", "cfg", "denoise"]
-    overrides = {}
+    overrides: Dict[str, Any] = {}
     for k in locked_keys:
         if k in params and params.get(k) is not None:
             overrides[k] = params.get(k)
@@ -343,9 +376,71 @@ def _run_deterministic_upscale(*, job_folder: str, params: Dict[str, Any]) -> Di
     }
 
 
+def _gpu_dispatch_url() -> str:
+    """
+    GPU dispatch endpoint for pipeline-triggered VR stages.
+    """
+    return os.getenv("PIPELINE_GPU_DISPATCH_URL", "http://127.0.0.1:8002/api/gpu/dispatch").strip()
+
+
+def _compute_signature(secret: str, timestamp: str, nonce: str, body: bytes) -> str:
+    prefix = f"{timestamp}\n{nonce}\n".encode("utf-8")
+    msg = prefix + (body or b"")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _dispatch_vr_to_gpu(job_folder: str, meta: Dict[str, Any], vr_mode: VRMode) -> Dict[str, Any]:
+    url = _gpu_dispatch_url()
+
+    secret = (os.getenv(HMAC_SECRET_ENV) or "").strip()
+    if not secret or len(secret) < 32:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing/weak {HMAC_SECRET_ENV}. Pipeline VR dispatch requires HMAC.",
+        )
+
+    payload = {
+        "job_type": "vr_reconstruct",
+        "job_folder": _abs_repo_path(job_folder),
+        "meta": meta,
+        "pipeline_key": f"vr::{vr_mode}",
+        "vr_mode": vr_mode,
+    }
+
+    body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ts = str(_now_epoch())
+    nonce = uuid.uuid4().hex
+    sig = _compute_signature(secret=secret, timestamp=ts, nonce=nonce, body=body_bytes)
+
+    headers = {
+        "Content-Type": "application/json",
+        SIG_HEADER: sig,
+        TS_HEADER: ts,
+        NONCE_HEADER: nonce,
+    }
+
+    try:
+        r = requests.post(url, data=body_bytes, headers=headers, timeout=(10, 1800))
+        if not (200 <= r.status_code < 300):
+            raise HTTPException(status_code=502, detail=f"GPU dispatch HTTP {r.status_code}: {r.text[:2000]}")
+        return r.json() if r.content else {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"GPU dispatch failed: {exc}") from exc
+
+
+def _normalize_vr_mode(params: Dict[str, Any], meta: Dict[str, Any]) -> VRMode:
+    vr_mode = params.get("vr_mode") or meta.get("vr_mode") or "gaussian_splat"
+    if vr_mode not in ("gaussian_splat", "nerf", "mesh"):
+        raise HTTPException(status_code=400, detail="VR stage vr_mode must be gaussian_splat | nerf | mesh")
+    return vr_mode  # type: ignore[return-value]
+
+
 # ---------------------------------------------------------------------------
 # Route: PLAN
 # ---------------------------------------------------------------------------
+
 
 @router.post("/plan", response_model=PipelinePlanResponse)
 async def plan_pipeline(request: PipelinePlanRequest) -> PipelinePlanResponse:
@@ -447,6 +542,20 @@ async def plan_pipeline(request: PipelinePlanRequest) -> PipelinePlanResponse:
             }
             stage_entry["preset_locked"] = True
 
+        elif stage_type == "vr":
+            vr_mode = params.get("vr_mode", meta.get("vr_mode", "gaussian_splat"))
+            if vr_mode not in ("gaussian_splat", "nerf", "mesh"):
+                raise HTTPException(status_code=400, detail=f"Stage {idx} (vr) invalid vr_mode: {vr_mode}")
+
+            stage_entry["resolved_vr_plan"] = {
+                "vr_mode": vr_mode,
+                "pipeline_key": f"vr::{vr_mode}",
+                "planned_at": _now_iso(),
+                "mode": "gpu-dispatch",
+                "note": "VR execution is dispatched to the GPU worker during /run.",
+            }
+            stage_entry["preset_locked"] = False
+
         else:
             stage_entry["preset_locked"] = False
 
@@ -477,14 +586,15 @@ async def plan_pipeline(request: PipelinePlanRequest) -> PipelinePlanResponse:
 # Route: RUN
 # ---------------------------------------------------------------------------
 
+
 @router.post("/run", response_model=PipelineRunResponse)
 async def run_pipeline(request: PipelinePlanRequest) -> PipelineRunResponse:
     """
     Execute supported stages now.
 
     Supported:
-    - vr
-    - upscale
+    - vr      -> REAL GPU dispatch
+    - upscale -> deterministic local resize
 
     SD3.5 execution is not done here.
     """
@@ -504,44 +614,55 @@ async def run_pipeline(request: PipelinePlanRequest) -> PipelineRunResponse:
 
         if stage_type == "vr":
             view_files = sorted([p.name for p in Path(job_folder).glob("view_*.png")])
+
+            if len(view_files) < 3:
+                view_files = sorted([p.name for p in Path(job_folder).glob("view_*.jpg")])
+
+            if len(view_files) < 3:
+                view_files = sorted([p.name for p in Path(job_folder).glob("view_*.jpeg")])
+
             if len(view_files) < 3:
                 iv = meta.get("input_views")
                 if isinstance(iv, list):
-                    view_files = [str(x) for x in iv if isinstance(x, str)]
-                    view_files = [x for x in view_files if (Path(job_folder) / x).is_file()]
+                    extracted: List[str] = []
+                    for item in iv:
+                        if isinstance(item, str):
+                            extracted.append(item)
+                        elif isinstance(item, dict) and isinstance(item.get("file"), str):
+                            extracted.append(item["file"])
+                    view_files = [x for x in extracted if (Path(job_folder) / x).is_file()]
 
             if len(view_files) < 3:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Stage {idx} (vr) requires 3+ images in job_folder named view_*.png.",
+                    detail=f"Stage {idx} (vr) requires 3+ images in job_folder named view_*.png or view_*.jpg.",
                 )
 
+            vr_mode = _normalize_vr_mode(params, meta)
             prompt = params.get("prompt") if isinstance(params, dict) else None
             plan_hint = params.get("plan_hint") if isinstance(params, dict) else None
 
-            try:
-                built = build_vr_package(
-                    job_folder=job_folder,
-                    image_files=view_files,
-                    prompt=prompt,
-                    plan_hint=plan_hint,
-                )
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=500, detail=f"VR build failed: {exc}") from exc
+            meta["type"] = "vr_reconstruct"
+            meta["vr_mode"] = vr_mode
+            if prompt is not None:
+                meta["prompt"] = prompt
+            if plan_hint is not None:
+                meta["plan_hint"] = plan_hint
 
-            viewer_url = f"{public_base}/{built['viewer_rel']}"
-            download_url = f"/api/vr/download/{date_str}/{job_id}"
+            meta.setdefault("dispatch", {})
+            meta["pipeline_key"] = f"vr::{vr_mode}"
+            meta["last_updated"] = _now_iso()
+            _write_meta(job_folder, meta)
+
+            gpu_resp = _dispatch_vr_to_gpu(job_folder=job_folder, meta=meta, vr_mode=vr_mode)
 
             results["vr"] = {
-                "viewer_url": viewer_url,
-                "download_url": download_url,
-                "zip_path": built.get("zip_path"),
+                "status": "dispatched",
+                "vr_mode": vr_mode,
+                "viewer_url": f"{public_base}/viewer/index.html",
+                "preview_video_url": f"{public_base}/preview.mp4",
+                "gpu_response": gpu_resp,
             }
-
-            meta.setdefault("outputs", {})
-            meta["outputs"]["vr_viewer"] = built["viewer_rel"]
-            meta["outputs"]["vr_zip"] = "vr_package.zip"
-            meta["last_updated"] = _now_iso()
 
         elif stage_type == "upscale":
             upscale_result = _run_deterministic_upscale(job_folder=job_folder, params=params)
@@ -574,7 +695,7 @@ async def run_pipeline(request: PipelinePlanRequest) -> PipelineRunResponse:
 
     return PipelineRunResponse(
         status="ok",
-        message="Pipeline executed for supported stages (vr, upscale).",
+        message="Pipeline executed for supported stages (vr dispatch, upscale local).",
         job_folder=job_folder,
         results=results,
         meta_path=_meta_path(job_folder),

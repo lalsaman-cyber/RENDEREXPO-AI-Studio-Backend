@@ -141,12 +141,23 @@ def _dispatch_to_gpu(job_folder_rel: str, meta: Dict[str, Any]) -> Dict[str, Any
     """
     HMAC-signed dispatch to GPU worker (Option A).
     IMPORTANT: sign the exact raw bytes we send.
+
+    GPU dispatch contract requires:
+    - job_type
+    - job_folder
+    - meta
+    - optional pipeline_key / vr_mode
     """
     url = _gpu_dispatch_url()
+    vr_mode = meta.get("vr_mode")
+    pipeline_key = meta.get("pipeline_key") or (f"vr::{vr_mode}" if vr_mode else None)
 
     payload = {
+        "job_type": "vr_reconstruct",
         "job_folder": _abs(job_folder_rel),
         "meta": meta,
+        "pipeline_key": pipeline_key,
+        "vr_mode": vr_mode,
     }
 
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -319,7 +330,9 @@ async def _build_vr_job(
         "pipeline_key": f"vr::{vr_mode}",
         "dispatch": {
             "target": _gpu_dispatch_url(),
+            "job_type": "vr_reconstruct",
             "pipeline_key": f"vr::{vr_mode}",
+            "vr_mode": vr_mode,
             "dispatched_at": None,
             "gpu_response": None,
             "error": None,

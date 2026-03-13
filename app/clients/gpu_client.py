@@ -164,7 +164,9 @@ def dispatch_sd35_inpaint(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, 
     return _dispatch(job_folder, meta)
 
 
+# -------------------------------------------------------------------
 # Moodboard / Space
+# -------------------------------------------------------------------
 
 def dispatch_sd35_moodboard_to_space(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     return _dispatch(job_folder, meta)
@@ -184,4 +186,40 @@ def dispatch_sd35_apply_space_to_render(job_folder: str, meta: Dict[str, Any]) -
 
 
 def dispatch_sd35_space_to_render(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+# -------------------------------------------------------------------
+# Object / product insertion
+# -------------------------------------------------------------------
+
+def dispatch_insert_object(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_product_insert(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+# -------------------------------------------------------------------
+# VR / video / CAD / mesh aliases for future-safe router imports
+# -------------------------------------------------------------------
+
+def dispatch_vr_reconstruct(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_video_from_image(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_video_between_frames(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_cad_from_image(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_mesh_from_image(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     return _dispatch(job_folder, meta)

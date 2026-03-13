@@ -34,6 +34,8 @@ IMPORTANT:
 - That route belongs to the separate GPU worker service.
 """
 
+from __future__ import annotations
+
 import hashlib
 import hmac
 import os
@@ -82,6 +84,13 @@ NONCE_TTL_SECONDS = 90
 OPEN_PATHS = {"/api/health"}
 OPEN_PREFIXES = ("/outputs/",)
 
+# In-memory nonce replay cache (nonce -> expires_at_epoch)
+_NONCE_CACHE: Dict[str, int] = {}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _now_epoch() -> int:
     return int(time.time())
@@ -112,137 +121,12 @@ def _constant_time_equal(a: str, b: str) -> bool:
     return hmac.compare_digest(a or "", b or "")
 
 
-app = FastAPI(
-    title="RENDEREXPO AI STUDIO - Internal API (Planner)",
-    description=(
-        "Internal API for RENDEREXPO AI STUDIO. "
-        "This is NOT client-facing. Wix UI will be client-facing. "
-        "All endpoints (except /api/health) require HMAC authentication."
-    ),
-    version="0.2.1",
-)
-
-# Serve outputs so /outputs/... URLs work
-app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
-
-# In-memory nonce replay cache (nonce -> expires_at_epoch)
-_NONCE_CACHE: Dict[str, int] = {}
-
-
-@app.on_event("startup")
-async def _startup_check_secret() -> None:
+def _ensure_outputs_dir() -> None:
     """
-    Fail fast if the HMAC secret is missing.
+    Ensure outputs/ exists before StaticFiles mounts it.
     """
-    secret = os.getenv(HMAC_SECRET_ENV, "")
-    if not secret or len(secret.strip()) < 32:
-        raise RuntimeError(
-            f"Missing or too-short {HMAC_SECRET_ENV}. "
-            "Set a strong secret (64+ chars recommended) before running the API."
-        )
+    os.makedirs("outputs", exist_ok=True)
 
-
-@app.middleware("http")
-async def hmac_auth_middleware(request: Request, call_next):
-    """
-    Enforce HMAC auth on all paths except OPEN_PATHS and OPEN_PREFIXES.
-    """
-    path = request.url.path
-
-    if path in OPEN_PATHS or any(path.startswith(p) for p in OPEN_PREFIXES):
-        return await call_next(request)
-
-    provided_sig = request.headers.get(SIG_HEADER, "")
-    ts = request.headers.get(TS_HEADER, "")
-    nonce = request.headers.get(NONCE_HEADER, "")
-
-    if not provided_sig or not ts or not nonce:
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": "missing_auth",
-                "detail": f"Required headers: {SIG_HEADER}, {TS_HEADER}, {NONCE_HEADER}",
-            },
-        )
-
-    try:
-        ts_int = int(ts)
-    except Exception:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "timestamp_invalid", "detail": "Timestamp must be unix epoch seconds (int)."},
-        )
-
-    now = _now_epoch()
-    if abs(now - ts_int) > TS_WINDOW_SECONDS:
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": "timestamp_expired",
-                "detail": f"Timestamp outside ±{TS_WINDOW_SECONDS}s window.",
-            },
-        )
-
-    _purge_expired_nonces(_NONCE_CACHE)
-    if nonce in _NONCE_CACHE:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "nonce_reused", "detail": "Nonce has already been used within the allowed window."},
-        )
-
-    body = await request.body()
-
-    # Preserve body for downstream handlers
-    request._body = body  # type: ignore[attr-defined]
-
-    secret = os.getenv(HMAC_SECRET_ENV, "")
-    expected_sig = _compute_signature(secret=secret, timestamp=ts, nonce=nonce, body=body)
-
-    if not _constant_time_equal(provided_sig.lower(), expected_sig.lower()):
-        return JSONResponse(
-            status_code=401,
-            content={"error": "invalid_signature", "detail": "Signature verification failed."},
-        )
-
-    _NONCE_CACHE[nonce] = now + NONCE_TTL_SECONDS
-
-    return await call_next(request)
-
-
-# ---------------------------------------------------------------------------
-# Attach routers
-# ---------------------------------------------------------------------------
-
-app.include_router(plan.router)
-app.include_router(text2img.router)
-app.include_router(img2img.router)
-app.include_router(jobs.router)
-app.include_router(depth.router)
-app.include_router(controlnet.router)
-app.include_router(upscale.router)
-app.include_router(vr.router)
-app.include_router(moodboard.router)
-app.include_router(product.router)
-app.include_router(product_insert.router)
-app.include_router(insert_object.router)
-app.include_router(floorplan.router)
-app.include_router(sketch.router)
-app.include_router(pipeline.router)
-
-# REAL via GPU dispatch
-app.include_router(cad.router)
-app.include_router(mesh_from_image.router)
-app.include_router(video_between_frames.router)
-app.include_router(video_from_image.router)
-
-# IMPORTANT:
-# Do NOT include the GPU worker router here.
-# The GPU worker service hosts /api/gpu/dispatch separately.
-
-
-# ---------------------------------------------------------------------------
-# Helpers: read config/model_paths.yaml WITHOUT extra libraries
-# ---------------------------------------------------------------------------
 
 def _read_sd35_model_dir_from_config() -> str:
     """
@@ -269,6 +153,7 @@ def _read_sd35_model_dir_from_config() -> str:
                 parts = line.split(":", 1)
                 if len(parts) != 2:
                     continue
+
                 value = parts[1].strip()
 
                 if value.startswith('"') and value.endswith('"'):
@@ -311,6 +196,146 @@ def _list_directory_contents(path: str, max_items: int = 200) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+_ensure_outputs_dir()
+
+app = FastAPI(
+    title="RENDEREXPO AI STUDIO - Internal API (Planner)",
+    description=(
+        "Internal API for RENDEREXPO AI STUDIO. "
+        "This is NOT client-facing. Wix UI will be client-facing. "
+        "All endpoints (except /api/health) require HMAC authentication."
+    ),
+    version="0.2.2",
+)
+
+# Serve outputs so /outputs/... URLs work
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+
+
+@app.on_event("startup")
+async def _startup_check_secret() -> None:
+    """
+    Fail fast if the HMAC secret is missing.
+    """
+    secret = os.getenv(HMAC_SECRET_ENV, "").strip()
+    if len(secret) < 32:
+        raise RuntimeError(
+            f"Missing or too-short {HMAC_SECRET_ENV}. "
+            "Set a strong secret (64+ chars recommended) before running the API."
+        )
+
+
+@app.middleware("http")
+async def hmac_auth_middleware(request: Request, call_next):
+    """
+    Enforce HMAC auth on all paths except OPEN_PATHS and OPEN_PREFIXES.
+    """
+    path = request.url.path
+
+    if path in OPEN_PATHS or any(path.startswith(prefix) for prefix in OPEN_PREFIXES):
+        return await call_next(request)
+
+    provided_sig = request.headers.get(SIG_HEADER, "")
+    ts = request.headers.get(TS_HEADER, "")
+    nonce = request.headers.get(NONCE_HEADER, "")
+
+    if not provided_sig or not ts or not nonce:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "missing_auth",
+                "detail": f"Required headers: {SIG_HEADER}, {TS_HEADER}, {NONCE_HEADER}",
+            },
+        )
+
+    try:
+        ts_int = int(ts)
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "timestamp_invalid",
+                "detail": "Timestamp must be unix epoch seconds (int).",
+            },
+        )
+
+    now = _now_epoch()
+    if abs(now - ts_int) > TS_WINDOW_SECONDS:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "timestamp_expired",
+                "detail": f"Timestamp outside ±{TS_WINDOW_SECONDS}s window.",
+            },
+        )
+
+    _purge_expired_nonces(_NONCE_CACHE)
+    if nonce in _NONCE_CACHE:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "nonce_reused",
+                "detail": "Nonce has already been used within the allowed window.",
+            },
+        )
+
+    body = await request.body()
+
+    # Preserve body for downstream handlers
+    request._body = body  # type: ignore[attr-defined]
+
+    secret = os.getenv(HMAC_SECRET_ENV, "").strip()
+    expected_sig = _compute_signature(secret=secret, timestamp=ts, nonce=nonce, body=body)
+
+    if not _constant_time_equal(provided_sig.lower(), expected_sig.lower()):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "invalid_signature",
+                "detail": "Signature verification failed.",
+            },
+        )
+
+    _NONCE_CACHE[nonce] = now + NONCE_TTL_SECONDS
+
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Attach routers
+# ---------------------------------------------------------------------------
+
+app.include_router(plan.router)
+app.include_router(text2img.router)
+app.include_router(img2img.router)
+app.include_router(jobs.router)
+app.include_router(depth.router)
+app.include_router(controlnet.router)
+app.include_router(upscale.router)
+app.include_router(vr.router)
+app.include_router(moodboard.router)
+app.include_router(product.router)
+app.include_router(product_insert.router)
+app.include_router(insert_object.router)
+app.include_router(floorplan.router)
+app.include_router(sketch.router)
+app.include_router(pipeline.router)
+
+# REAL via GPU dispatch
+app.include_router(cad.router)
+app.include_router(mesh_from_image.router)
+app.include_router(video_between_frames.router)
+app.include_router(video_from_image.router)
+
+# IMPORTANT:
+# Do NOT include the GPU worker router here.
+# The GPU worker service hosts /api/gpu/dispatch separately.
+
+
+# ---------------------------------------------------------------------------
 # Basic routes
 # ---------------------------------------------------------------------------
 
@@ -345,13 +370,13 @@ async def sd35_files():
     """
     try:
         sd35_dir = _read_sd35_model_dir_from_config()
-    except (FileNotFoundError, KeyError) as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     try:
         listing = _list_directory_contents(sd35_dir)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
         "status": "ok",

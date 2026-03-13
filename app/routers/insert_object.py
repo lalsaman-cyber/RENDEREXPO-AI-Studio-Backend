@@ -39,8 +39,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from app.presets_sd35 import apply_preset_to_meta
 from app.clients.gpu_client import dispatch_insert_object
+from app.presets_sd35 import apply_preset_to_meta
 
 router = APIRouter(
     prefix="/api/insert-object",
@@ -166,6 +166,7 @@ def _build_sd35_harmonize_meta(
         "category": category,
         "shot": shot,
         "strength": float(strength),
+        "denoise": 0.0,
         "input_image": input_image,
         "planned_output_image": planned_output,
         "mode_runtime": "gpu-dispatch",
@@ -173,7 +174,13 @@ def _build_sd35_harmonize_meta(
     }
 
     apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
+
+    # Safety re-lock
     meta["strength"] = float(strength)
+    meta["denoise"] = 0.0
+    if isinstance(meta.get("upscale"), dict):
+        meta["upscale"]["denoise"] = 0.0
+
     return meta
 
 
@@ -293,6 +300,7 @@ async def insert_object_render(
             "shot": final_shot,
             "meta": sd35_meta,
         },
+        "denoise": 0.0,
         "outputs": {
             "product_mask": "product_mask.png",
             "product_rgba": "product_rgba.png",
