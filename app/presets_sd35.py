@@ -36,6 +36,11 @@ Backward-compatible category/shot aliases are also supported:
 - interior:wide
 - interior:close
 - wide_hero:wide
+
+RENDEREXPO img2img rule:
+- Presets still define the DEFAULT working resolution.
+- But planner/runtime may follow INPUT aspect ratio for img2img unless caller explicitly specifies otherwise.
+- Therefore this file should mark preset resolution as DEFAULT/INHERITED, not as a forced user override.
 """
 
 from __future__ import annotations
@@ -207,6 +212,37 @@ def resolve_preset(
     return PROFILES[mapped]
 
 
+def _set_default_resolution_metadata(meta: Dict[str, Any], preset: SD35Preset) -> None:
+    """
+    Record preset resolution as the DEFAULT planner working size.
+
+    IMPORTANT:
+    - This is not the same thing as an explicit user override.
+    - Img2img/inpaint runtime may auto-follow the input aspect ratio when
+      dimensions were not explicitly requested by caller.
+    """
+    meta["width"] = int(preset.width)
+    meta["height"] = int(preset.height)
+
+    # Traceability flags for routers/runtime.
+    meta["resolution_policy"] = "preset_default"
+    meta["preset_resolution"] = {
+        "width": int(preset.width),
+        "height": int(preset.height),
+        "source": "preset_default",
+    }
+
+    # Preserve any router decision if already present; otherwise default to False.
+    if "explicit_dimensions" not in meta:
+        meta["explicit_dimensions"] = False
+
+    # Preserve any router decision if already present; otherwise default to True
+    # because default preset size for img2img should be treated as follow-input
+    # unless caller explicitly overrides.
+    if "preserve_input_aspect_ratio" not in meta:
+        meta["preserve_input_aspect_ratio"] = True
+
+
 def apply_preset_to_meta(
     meta: Dict[str, Any],
     category: Optional[str] = None,
@@ -218,7 +254,7 @@ def apply_preset_to_meta(
     Mutates + returns meta.
 
     Injects locked values into meta:
-    - width/height
+    - width/height (as DEFAULT preset resolution, not implicit user override)
     - num_inference_steps
     - guidance_scale
     - lora_config (LyCORIS PRO 2.1)
@@ -228,6 +264,8 @@ def apply_preset_to_meta(
     IMPORTANT:
     - This function does NOT overwrite img2img strength/denoise.
     - Routers must preserve strength for reclad/img2img flows.
+    - This function should not silently force square output for img2img when
+      caller did not explicitly request square dimensions.
     """
     p = resolve_preset(category=category, shot=shot, profile=profile)
 
@@ -236,8 +274,7 @@ def apply_preset_to_meta(
     # ------------------------------------------------------------------
     # LOCKED core generation controls
     # ------------------------------------------------------------------
-    meta["width"] = int(p.width)
-    meta["height"] = int(p.height)
+    _set_default_resolution_metadata(meta, p)
     meta["num_inference_steps"] = int(p.steps)
     meta["guidance_scale"] = float(p.cfg)
 
@@ -280,6 +317,8 @@ def apply_preset_to_meta(
         "geo_multiplier": p.geo_multiplier,
         "upscale_default": p.upscale_default,
         "upscale_enabled": bool(upscale_enabled),
+        "width": p.width,
+        "height": p.height,
     }
 
     return meta

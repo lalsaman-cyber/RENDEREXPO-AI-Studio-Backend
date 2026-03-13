@@ -29,6 +29,12 @@ IMPORTANT:
 - Img2img strength MUST be preserved.
 - Do NOT globally force denoise/strength to 0.0 here.
 - Planner writes meta; GPU runtime executes meta.
+
+RENDEREXPO img2img ratio rule:
+- Output should match the INPUT ratio unless explicitly specified otherwise.
+- Because presets currently inject default resolution, planner marks whether
+  dimensions were explicitly supplied by caller or just inherited from defaults.
+- Runtime uses that signal to auto-follow source aspect when appropriate.
 """
 
 from __future__ import annotations
@@ -199,6 +205,41 @@ def _resolve_optional_profiles(
     return resolved_lora_profile, resolved_refiner_profile
 
 
+def _get_image_size(image_path: str) -> Tuple[int, int]:
+    try:
+        from PIL import Image  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"PIL is required to inspect input image size: {exc}") from exc
+
+    try:
+        with Image.open(image_path) as im:
+            return int(im.width), int(im.height)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed reading image size: {exc}") from exc
+
+
+def _augment_meta_with_input_geometry(
+    meta: Dict[str, Any],
+    *,
+    input_width: int,
+    input_height: int,
+    explicit_dimensions: bool,
+) -> None:
+    """
+    Record the original input image geometry and whether planner dimensions were
+    explicitly requested by caller vs injected by presets/defaults.
+
+    Runtime should use:
+    - explicit_dimensions=False  -> follow input ratio unless non-default explicit size exists
+    - explicit_dimensions=True   -> respect target width/height even if aspect differs
+    """
+    meta["input_width"] = int(input_width)
+    meta["input_height"] = int(input_height)
+    meta["input_aspect_ratio"] = float(input_width) / float(input_height) if input_height else None
+    meta["preserve_input_aspect_ratio"] = not bool(explicit_dimensions)
+    meta["explicit_dimensions"] = bool(explicit_dimensions)
+
+
 def _base_meta(
     *,
     job_id: str,
@@ -288,6 +329,11 @@ class Img2ImgFromJobRequest(BaseModel):
     lora_profile: Optional[str] = None
     refiner_profile: Optional[str] = None
 
+    # Optional explicit override path for future callers.
+    # When omitted, planner/runtime should preserve the source aspect ratio.
+    width: Optional[int] = Field(default=None, ge=64)
+    height: Optional[int] = Field(default=None, ge=64)
+
 
 # ---------------------------------------------------------------------------
 # 1) REAL Img2Img: upload image + prompt (multipart)
@@ -308,6 +354,8 @@ async def sd35_img2img_render(
     lighting_preset: Optional[str] = Form(None),
     lora_profile: Optional[str] = Form(None),
     refiner_profile: Optional[str] = Form(None),
+    width: Optional[int] = Form(None, description="Optional explicit output width. If omitted, follow input ratio."),
+    height: Optional[int] = Form(None, description="Optional explicit output height. If omitted, follow input ratio."),
 ) -> Dict[str, Any]:
     _validate_strength(float(strength))
     _validate_upload_is_png_jpg(image, "image")
@@ -315,6 +363,10 @@ async def sd35_img2img_render(
     prompt_clean = (prompt or "").strip()
     if not prompt_clean:
         raise HTTPException(status_code=400, detail="prompt is required")
+
+    explicit_dimensions = (width is not None) or (height is not None)
+    if explicit_dimensions and (width is None or height is None):
+        raise HTTPException(status_code=400, detail="width and height must both be provided when overriding aspect ratio")
 
     resolved_lora_profile, resolved_refiner_profile = _resolve_optional_profiles(
         lora_profile=lora_profile,
@@ -326,6 +378,7 @@ async def sd35_img2img_render(
 
     input_path = os.path.join(job_folder, "input.png")
     await _save_upload_stream(image, input_path)
+    input_width, input_height = _get_image_size(input_path)
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
@@ -359,6 +412,18 @@ async def sd35_img2img_render(
 
     # Preserve true img2img strength explicitly after preset application.
     meta["strength"] = float(strength)
+
+    # Explicit size wins over preset defaults.
+    if explicit_dimensions:
+        meta["width"] = int(width)
+        meta["height"] = int(height)
+
+    _augment_meta_with_input_geometry(
+        meta,
+        input_width=input_width,
+        input_height=input_height,
+        explicit_dimensions=explicit_dimensions,
+    )
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder, has_mask=False)
@@ -399,6 +464,12 @@ async def sd35_img2img_render(
         "gpu_response": gpu_resp,
         "preset_applied": meta.get("preset", {}),
         "upscale_enabled": bool(meta.get("upscale", {}).get("enabled", False)),
+        "input_geometry": {
+            "width": input_width,
+            "height": input_height,
+            "preserve_input_aspect_ratio": meta.get("preserve_input_aspect_ratio"),
+            "explicit_dimensions": meta.get("explicit_dimensions"),
+        },
     }
 
 
@@ -423,6 +494,10 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest) -> Dict[str, Any]:
 
     _validate_strength(float(req.strength))
 
+    explicit_dimensions = (req.width is not None) or (req.height is not None)
+    if explicit_dimensions and (req.width is None or req.height is None):
+        raise HTTPException(status_code=400, detail="width and height must both be provided when overriding aspect ratio")
+
     resolved_lora_profile, resolved_refiner_profile = _resolve_optional_profiles(
         lora_profile=req.lora_profile,
         refiner_profile=req.refiner_profile,
@@ -437,6 +512,7 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed copying source image: {exc}") from exc
 
+    input_width, input_height = _get_image_size(dst_img)
     final_seed = req.seed if req.seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
     meta = _base_meta(
@@ -469,6 +545,18 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
     meta["strength"] = float(req.strength)
+
+    # Explicit size wins over preset defaults.
+    if explicit_dimensions:
+        meta["width"] = int(req.width)
+        meta["height"] = int(req.height)
+
+    _augment_meta_with_input_geometry(
+        meta,
+        input_width=input_width,
+        input_height=input_height,
+        explicit_dimensions=explicit_dimensions,
+    )
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder, has_mask=False)
@@ -506,6 +594,12 @@ async def sd35_img2img_from_job(req: Img2ImgFromJobRequest) -> Dict[str, Any]:
         "public_urls": public_urls,
         "gpu_response": gpu_resp,
         "preset_applied": meta.get("preset", {}),
+        "input_geometry": {
+            "width": input_width,
+            "height": input_height,
+            "preserve_input_aspect_ratio": meta.get("preserve_input_aspect_ratio"),
+            "explicit_dimensions": meta.get("explicit_dimensions"),
+        },
     }
 
 
@@ -524,6 +618,8 @@ async def sd35_inpaint_render(
     shot: Shot = Form(...),
     upscale_2x: Optional[bool] = Form(None),
     seed: Optional[int] = Form(None),
+    width: Optional[int] = Form(None, description="Optional explicit output width. If omitted, follow input ratio."),
+    height: Optional[int] = Form(None, description="Optional explicit output height. If omitted, follow input ratio."),
 ) -> Dict[str, Any]:
     _validate_strength(float(strength))
     _validate_upload_is_png_jpg(image, "image")
@@ -533,6 +629,10 @@ async def sd35_inpaint_render(
     if not prompt_clean:
         raise HTTPException(status_code=400, detail="prompt is required")
 
+    explicit_dimensions = (width is not None) or (height is not None)
+    if explicit_dimensions and (width is None or height is None):
+        raise HTTPException(status_code=400, detail="width and height must both be provided when overriding aspect ratio")
+
     job_folder = _create_job_folder(job_type="sd35_inpaint")
     job_id = os.path.basename(job_folder)
 
@@ -540,6 +640,7 @@ async def sd35_inpaint_render(
     mask_path = os.path.join(job_folder, "mask.png")
     await _save_upload_stream(image, input_path)
     await _save_upload_stream(mask, mask_path)
+    input_width, input_height = _get_image_size(input_path)
 
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
@@ -563,6 +664,17 @@ async def sd35_inpaint_render(
         raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
     meta["strength"] = float(strength)
+
+    if explicit_dimensions:
+        meta["width"] = int(width)
+        meta["height"] = int(height)
+
+    _augment_meta_with_input_geometry(
+        meta,
+        input_width=input_width,
+        input_height=input_height,
+        explicit_dimensions=explicit_dimensions,
+    )
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder, has_mask=True)
@@ -600,4 +712,10 @@ async def sd35_inpaint_render(
         "public_urls": public_urls,
         "gpu_response": gpu_resp,
         "preset_applied": meta.get("preset", {}),
+        "input_geometry": {
+            "width": input_width,
+            "height": input_height,
+            "preserve_input_aspect_ratio": meta.get("preserve_input_aspect_ratio"),
+            "explicit_dimensions": meta.get("explicit_dimensions"),
+        },
     }

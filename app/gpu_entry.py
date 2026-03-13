@@ -15,6 +15,15 @@ Important:
   are locked by the planner/routers and saved into meta.json.
 - This file executes what meta.json says.
 - This file must boot LIGHT and must NOT eagerly load SD3.5 on startup.
+
+RENDEREXPO img2img ratio note:
+- Planner may include:
+    * preserve_input_aspect_ratio
+    * explicit_dimensions
+    * input_width / input_height
+    * preset_resolution / resolution_policy
+- GPU entry must pass those fields through untouched.
+- Runtime decides how to honor them.
 """
 
 from __future__ import annotations
@@ -254,6 +263,9 @@ def _merge_meta_preserve_planner(existing: Dict[str, Any], incoming: Dict[str, A
       - Start with existing disk meta (planner-written)
       - Overlay incoming payload meta (payload wins)
       - Preserve planner fields GPU does not know about
+
+    IMPORTANT:
+    - This intentionally preserves img2img geometry/aspect metadata emitted by planner.
     """
     if not isinstance(existing, dict):
         existing = {}

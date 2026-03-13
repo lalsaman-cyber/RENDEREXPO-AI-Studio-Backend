@@ -19,6 +19,12 @@ Safety:
 - If optional dependencies are missing (PIL/xformers), we do NOT hard-crash on import.
 - If adapter files are missing and were explicitly requested, we HARD-FAIL.
 - We never silently pretend adapters were applied when they were not.
+
+RENDEREXPO img2img rule:
+- Img2img output MUST follow the input image aspect ratio unless the caller explicitly
+  specifies otherwise with non-default dimensions.
+- Preset-injected default square dimensions (1024x1024) are treated as "unspecified"
+  for img2img aspect purposes.
 """
 
 from __future__ import annotations
@@ -557,6 +563,135 @@ class SD35Runtime:
         return image
 
     # ------------------------------------------------------------------
+    # Img2Img sizing helpers
+    # ------------------------------------------------------------------
+
+    def _round_down_to_multiple(self, value: int, base: int = 64, minimum: int = 64) -> int:
+        try:
+            v = int(value)
+        except Exception:
+            v = minimum
+        if v < minimum:
+            v = minimum
+        return max(minimum, (v // base) * base)
+
+    def _resolve_img2img_target_size(
+        self,
+        meta: Dict[str, Any],
+        input_size: Tuple[int, int],
+    ) -> Tuple[int, int, bool]:
+        """
+        Decide the working render size for img2img.
+
+        Rule:
+        - Follow the input aspect ratio unless the caller explicitly specifies otherwise.
+        - Because preset application currently injects 1024x1024 for wide_hero,
+          we treat EXACT default square 1024x1024 as "unspecified" for img2img.
+        - If caller supplies any non-default size, we respect it as explicit.
+        """
+        iw, ih = input_size
+        if iw <= 0 or ih <= 0:
+            raise RuntimeError(f"Invalid img2img input size: {iw}x{ih}")
+
+        raw_w = meta.get("width", 1024)
+        raw_h = meta.get("height", 1024)
+
+        try:
+            req_w = int(raw_w)
+        except Exception:
+            req_w = 1024
+        try:
+            req_h = int(raw_h)
+        except Exception:
+            req_h = 1024
+
+        # Treat preset default square as not explicitly requested for img2img.
+        explicit_size = not (req_w == 1024 and req_h == 1024)
+
+        if explicit_size:
+            target_w = self._round_down_to_multiple(req_w, base=64, minimum=64)
+            target_h = self._round_down_to_multiple(req_h, base=64, minimum=64)
+            return target_w, target_h, True
+
+        # Auto-follow source aspect using the requested default long side budget.
+        long_side_budget = max(req_w, req_h, 1024)
+
+        if iw >= ih:
+            scale = long_side_budget / float(iw)
+            target_w = long_side_budget
+            target_h = int(round(ih * scale))
+        else:
+            scale = long_side_budget / float(ih)
+            target_h = long_side_budget
+            target_w = int(round(iw * scale))
+
+        target_w = self._round_down_to_multiple(target_w, base=64, minimum=64)
+        target_h = self._round_down_to_multiple(target_h, base=64, minimum=64)
+
+        if target_w <= 0 or target_h <= 0:
+            raise RuntimeError(f"Resolved invalid img2img target size: {target_w}x{target_h}")
+
+        return target_w, target_h, False
+
+    def _prepare_img2img_input_image(
+        self,
+        init_image: Any,
+        target_size: Tuple[int, int],
+        explicit_size: bool,
+    ) -> Any:
+        """
+        Prepare input image for img2img.
+
+        Behavior:
+        - If we auto-followed aspect ratio, resize directly to the resolved target size.
+          That preserves source ratio and avoids letterboxing for the default path.
+        - If the caller explicitly requested dimensions, honor those dimensions.
+          If requested aspect differs from source, use fit+pad to avoid destructive stretch.
+        """
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"PIL is required for img2img input preparation: {exc}") from exc
+
+        if not isinstance(init_image, Image.Image):
+            raise RuntimeError("init_image must be a PIL image before preprocessing.")
+
+        target_w, target_h = int(target_size[0]), int(target_size[1])
+        iw, ih = init_image.size
+
+        if iw <= 0 or ih <= 0:
+            raise RuntimeError(f"Invalid source img2img size: {iw}x{ih}")
+
+        input_aspect = iw / float(ih)
+        target_aspect = target_w / float(target_h)
+
+        # Auto-follow path: target ratio already matches source, so use clean resize.
+        if not explicit_size:
+            if init_image.size != (target_w, target_h):
+                init_image = init_image.resize((target_w, target_h), Image.LANCZOS)
+            return init_image
+
+        # Explicit dimensions requested.
+        # If aspect matches, resize cleanly. Otherwise preserve input and pad.
+        if abs(input_aspect - target_aspect) < 1e-6:
+            if init_image.size != (target_w, target_h):
+                init_image = init_image.resize((target_w, target_h), Image.LANCZOS)
+            return init_image
+
+        fit = min(target_w / float(iw), target_h / float(ih))
+        new_w = max(64, int(round(iw * fit)))
+        new_h = max(64, int(round(ih * fit)))
+
+        if (new_w, new_h) != (iw, ih):
+            init_image = init_image.resize((new_w, new_h), Image.LANCZOS)
+
+        canvas = Image.new("RGB", (target_w, target_h), (127, 127, 127))
+        off_x = max(0, (target_w - new_w) // 2)
+        off_y = max(0, (target_h - new_h) // 2)
+        canvas.paste(init_image, (off_x, off_y))
+        return canvas
+
+    # ------------------------------------------------------------------
     # Text2Img
     # ------------------------------------------------------------------
 
@@ -646,6 +781,11 @@ class SD35Runtime:
     def generate_img2img(self, job_folder: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         """
         Real SD3.5 img2img execution.
+
+        RENDEREXPO rule:
+        - Follow input aspect ratio unless caller explicitly specifies otherwise.
+        - Default preset-injected square size (1024x1024) is treated as "unspecified"
+          for img2img and will auto-resolve to the input aspect.
         """
         if not self.is_loaded:
             raise RuntimeError("SD35Runtime.generate_img2img() called but runtime is not loaded in real mode.")
@@ -668,8 +808,6 @@ class SD35Runtime:
 
         prompt = meta.get("prompt") or ""
         negative_prompt = meta.get("negative_prompt") or None
-        width = int(meta.get("width", 1024))
-        height = int(meta.get("height", 1024))
         num_steps = int(meta.get("num_inference_steps", 46))
         guidance_scale = float(meta.get("guidance_scale", 5.6))
 
@@ -717,20 +855,30 @@ class SD35Runtime:
                 except Exception:
                     generator = None
 
+            init_image = Image.open(input_path).convert("RGB")
+            input_size = init_image.size
+
+            width, height, explicit_size = self._resolve_img2img_target_size(meta, input_size)
+            init_image = self._prepare_img2img_input_image(init_image, (width, height), explicit_size)
+
+            # Keep meta synchronized with the TRUE img2img render size.
+            meta["width"] = int(width)
+            meta["height"] = int(height)
+
             logger.info(
-                "SD3.5 img2img: strength=%.3f w=%d h=%d steps=%d cfg=%.3f seed=%s prompt='%s'",
+                "SD3.5 img2img: strength=%.3f input=%dx%d resolved=%dx%d explicit_size=%s "
+                "steps=%d cfg=%.3f seed=%s prompt='%s'",
                 strength,
+                input_size[0],
+                input_size[1],
                 width,
                 height,
+                explicit_size,
                 num_steps,
                 guidance_scale,
                 seed,
                 prompt[:140],
             )
-
-            init_image = Image.open(input_path).convert("RGB")
-            if init_image.size != (width, height):
-                init_image = init_image.resize((width, height), Image.LANCZOS)
 
             kwargs: Dict[str, Any] = {
                 "prompt": prompt,
@@ -777,3 +925,12 @@ class SD35Runtime:
             except Exception:
                 pass
             self.pipe = old_pipe
+            try:
+                del img_pipe
+            except Exception:
+                pass
+            try:
+                if self._torch is not None:
+                    self._torch.cuda.empty_cache()
+            except Exception:
+                pass

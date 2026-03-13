@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from runtime.sd35_runtime import SD35Runtime
 
@@ -12,6 +12,10 @@ from runtime.sd35_runtime import SD35Runtime
 # These are compatibility defaults only.
 # Planner/routers remain the real source of truth and should write
 # steps / cfg / width / height / upscale into meta/payload explicitly.
+#
+# IMPORTANT FOR IMG2IMG:
+# - These width/height values are DEFAULT compatibility fallbacks only.
+# - They must NOT silently override planner/runtime aspect-preservation logic.
 PROFILES = {
     "r1_wide_hero": {
         "cfg": 5.6,
@@ -152,6 +156,11 @@ def _merge_profile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Merge profile defaults into the execution meta only when fields
     are missing. Planner values always win.
+
+    IMPORTANT:
+    - Planner remains source of truth.
+    - These are compatibility fallbacks only.
+    - Img2img aspect-ratio preservation flags from planner must survive unchanged.
     """
     merged = dict(payload)
     profile = str(payload.get("profile") or "r1_wide_hero").strip()
@@ -164,6 +173,17 @@ def _merge_profile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if "upscale" not in merged and isinstance(p.get("upscale"), dict):
         merged["upscale"] = dict(p["upscale"])
+
+    # Helpful traceability when planner omitted preset metadata.
+    merged.setdefault(
+        "preset_resolution",
+        {
+            "width": int(p["width"]),
+            "height": int(p["height"]),
+            "source": "compat_profile_default",
+        },
+    )
+    merged.setdefault("resolution_policy", "compat_profile_default")
 
     return merged
 
@@ -186,6 +206,19 @@ def _normalize_input_image(job_folder: str, payload: Dict[str, Any]) -> str:
     return str(inp_path)
 
 
+def _read_image_size(path: str) -> Tuple[int, int]:
+    try:
+        from PIL import Image  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"PIL is required to inspect img2img input size: {exc}") from exc
+
+    try:
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception as exc:
+        raise RuntimeError(f"Failed reading img2img input size from {path}: {exc}") from exc
+
+
 def _build_runtime_meta_for_text2img(job_folder: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     meta = _merge_profile_defaults(payload)
 
@@ -205,6 +238,15 @@ def _build_runtime_meta_for_text2img(job_folder: str, payload: Dict[str, Any]) -
 
 
 def _build_runtime_meta_for_img2img(job_folder: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build runtime meta for img2img while preserving planner intent.
+
+    CRITICAL:
+    - If planner says preserve_input_aspect_ratio=True and explicit_dimensions=False,
+      runtime should auto-follow source aspect ratio.
+    - If planner supplied explicit width/height, runtime should respect them.
+    - Compatibility layer should not silently convert img2img back to forced square.
+    """
     meta = _merge_profile_defaults(payload)
 
     prompt = str(meta.get("prompt") or "").strip()
@@ -212,6 +254,7 @@ def _build_runtime_meta_for_img2img(job_folder: str, payload: Dict[str, Any]) ->
         raise ValueError("Missing 'prompt' for sd35_img2img")
 
     input_path = _normalize_input_image(job_folder, meta)
+    input_w, input_h = _read_image_size(input_path)
 
     meta["type"] = "img2img"
     meta["job_folder"] = job_folder
@@ -228,6 +271,20 @@ def _build_runtime_meta_for_img2img(job_folder: str, payload: Dict[str, Any]) ->
             meta["strength"] = float(meta["denoise"])
         except Exception:
             pass
+
+    # Planner-level aspect-ratio metadata should survive.
+    # If older callers omitted these fields, set safe compatibility defaults.
+    meta.setdefault("input_width", int(input_w))
+    meta.setdefault("input_height", int(input_h))
+    meta.setdefault(
+        "input_aspect_ratio",
+        float(input_w) / float(input_h) if input_h else None,
+    )
+
+    # If caller did not explicitly supply dimensions, preserve source aspect.
+    # This is the compatibility-safe default for img2img.
+    meta.setdefault("explicit_dimensions", False)
+    meta.setdefault("preserve_input_aspect_ratio", not bool(meta.get("explicit_dimensions", False)))
 
     return meta
 

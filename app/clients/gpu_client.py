@@ -1,4 +1,26 @@
-﻿import hashlib
+﻿# app/clients/gpu_client.py
+"""
+RENDEREXPO AI STUDIO - Planner -> GPU Worker client
+
+Purpose:
+- Planner (8012) dispatches prepared jobs to the GPU worker (8002)
+- This file does NOT modify generation semantics
+- It forwards meta exactly as planner prepared it
+
+IMPORTANT:
+- Img2img aspect-ratio behavior must NOT be destroyed here
+- If planner/runtime include:
+    * preserve_input_aspect_ratio
+    * explicit_dimensions
+    * input_width / input_height
+    * preset_resolution / resolution_policy
+  those fields must pass through unchanged
+- This client signs and forwards payloads only
+"""
+
+from __future__ import annotations
+
+import hashlib
 import hmac
 import json
 import os
@@ -89,10 +111,19 @@ def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, An
     Contract: POST /api/gpu/dispatch with { job_folder, meta }
 
     HMAC is required because the GPU worker endpoint is protected.
+
+    CRITICAL:
+    - meta must be forwarded as-is
+    - do NOT strip or rewrite img2img geometry/aspect keys here
     """
     job_folder_abs = _normalize_job_folder(job_folder)
     url = f"{GPU_BASE_URL}/api/gpu/dispatch"
-    payload = {"job_folder": job_folder_abs, "meta": meta}
+
+    # Forward metadata exactly as planner/runtime prepared it.
+    payload = {
+        "job_folder": job_folder_abs,
+        "meta": meta,
+    }
 
     try:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
