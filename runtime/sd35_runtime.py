@@ -25,12 +25,19 @@ RENDEREXPO img2img rule:
   specifies otherwise with non-default dimensions.
 - Preset-injected default square dimensions (1024x1024) are treated as "unspecified"
   for img2img aspect purposes.
+
+IMPORTANT FINAL SAFETY FOR IMG2IMG:
+- Some diffusers builds / pipelines may ignore target width/height in img2img.
+- Therefore this runtime must BOTH:
+    1) pass target sizing arguments when supported, and
+    2) validate and enforce the final output size before saving.
+- We do NOT silently save wrong-sized square outputs anymore.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -329,19 +336,12 @@ class SD35Runtime:
     def _apply_locked_adapters(self, meta: Dict[str, Any]) -> None:
         """
         Apply LyCORIS (PRO 2.1) + GEO adapters using LyCORIS kohya runtime.
-
-        IMPORTANT:
-        - Your .safetensors are LyCORIS-format outputs.
-        - We DO NOT use diffusers.load_lora_weights() for these.
-        - SD3 uses pipe.transformer (not pipe.unet).
-        - Override multipliers MUST be honored.
         """
         if self.pipe is None:
             raise RuntimeError("Cannot apply adapters because SD35Runtime is not loaded.")
 
         lora_cfg, geo_cfg = self._extract_adapter_cfg(meta)
 
-        # Nothing configured -> ensure clean state
         if not lora_cfg and not geo_cfg:
             self._safe_unload_adapters()
             meta["adapters_applied"] = False
@@ -373,7 +373,6 @@ class SD35Runtime:
 
             label = str(cfg.get("label") or default_label)
 
-            # If explicitly requested config exists but weight is zero, treat as disabled.
             if w_f <= 0.0:
                 return None
 
@@ -388,7 +387,6 @@ class SD35Runtime:
             adapters.append(g)
 
         if not adapters:
-            # Explicit configs present but both disabled -> clean state.
             self._safe_unload_adapters()
             meta["adapters_applied"] = False
             meta["adapters_reason"] = "disabled_or_missing"
@@ -582,12 +580,6 @@ class SD35Runtime:
     ) -> Tuple[int, int, bool]:
         """
         Decide the working render size for img2img.
-
-        Rule:
-        - Follow the input aspect ratio unless the caller explicitly specifies otherwise.
-        - Because preset application currently injects 1024x1024 for wide_hero,
-          we treat EXACT default square 1024x1024 as "unspecified" for img2img.
-        - If caller supplies any non-default size, we respect it as explicit.
         """
         iw, ih = input_size
         if iw <= 0 or ih <= 0:
@@ -608,14 +600,11 @@ class SD35Runtime:
         explicit_flag = bool(meta.get("explicit_dimensions", False))
         preserve_ratio = bool(meta.get("preserve_input_aspect_ratio", False))
 
-        # Explicit caller override always wins.
         if explicit_flag:
             target_w = self._round_down_to_multiple(req_w, base=64, minimum=64)
             target_h = self._round_down_to_multiple(req_h, base=64, minimum=64)
             return target_w, target_h, True
 
-        # Treat preset default square as not explicitly requested for img2img.
-        # If planner asked to preserve input ratio, auto-follow it.
         if preserve_ratio or (req_w == 1024 and req_h == 1024):
             long_side_budget = max(req_w, req_h, 1024)
 
@@ -636,7 +625,6 @@ class SD35Runtime:
 
             return target_w, target_h, False
 
-        # Fallback: respect supplied dimensions if they are non-default.
         target_w = self._round_down_to_multiple(req_w, base=64, minimum=64)
         target_h = self._round_down_to_multiple(req_h, base=64, minimum=64)
         return target_w, target_h, True
@@ -649,12 +637,6 @@ class SD35Runtime:
     ) -> Any:
         """
         Prepare input image for img2img.
-
-        Behavior:
-        - If we auto-followed aspect ratio, resize directly to the resolved target size.
-          That preserves source ratio and avoids letterboxing for the default path.
-        - If the caller explicitly requested dimensions, honor those dimensions.
-          If requested aspect differs from source, use fit+pad to avoid destructive stretch.
         """
         try:
             from PIL import Image  # type: ignore
@@ -673,14 +655,11 @@ class SD35Runtime:
         input_aspect = iw / float(ih)
         target_aspect = target_w / float(target_h)
 
-        # Auto-follow path: target ratio already matches source, so use clean resize.
         if not explicit_size:
             if init_image.size != (target_w, target_h):
                 init_image = init_image.resize((target_w, target_h), Image.LANCZOS)
             return init_image
 
-        # Explicit dimensions requested.
-        # If aspect matches, resize cleanly. Otherwise preserve input and pad.
         if abs(input_aspect - target_aspect) < 1e-6:
             if init_image.size != (target_w, target_h):
                 init_image = init_image.resize((target_w, target_h), Image.LANCZOS)
@@ -698,6 +677,87 @@ class SD35Runtime:
         off_y = max(0, (target_h - new_h) // 2)
         canvas.paste(init_image, (off_x, off_y))
         return canvas
+
+    def _filter_supported_call_kwargs(self, fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Some diffusers builds/pipelines accept different kwargs.
+        Only pass keys supported by the installed pipeline __call__ signature.
+        """
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                return dict(kwargs)
+
+            allowed = set(params.keys())
+            filtered = {k: v for k, v in kwargs.items() if k in allowed}
+            dropped = sorted(set(kwargs.keys()) - set(filtered.keys()))
+            if dropped:
+                logger.info("Dropping unsupported img2img kwargs for installed pipeline: %s", dropped)
+            return filtered
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Could not inspect pipeline signature; passing kwargs unchanged: %s", exc)
+            return dict(kwargs)
+
+    def _enforce_output_size(
+        self,
+        image: Any,
+        target_size: Tuple[int, int],
+    ) -> Tuple[Any, bool, str, Tuple[int, int], Tuple[int, int]]:
+        """
+        Enforce exact final output size.
+
+        Why this exists:
+        - Some SD3 img2img builds still emit square output even when non-square
+          input/target is requested.
+        - We must not silently save wrong-sized square outputs anymore.
+
+        Strategy:
+        - If already correct: no-op
+        - If same aspect: simple resize
+        - Otherwise: center-crop to target aspect, then resize
+        """
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"PIL is required for output-size enforcement: {exc}") from exc
+
+        if not isinstance(image, Image.Image):
+            try:
+                image = Image.fromarray(image)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"Pipeline output is not a PIL image and cannot be converted: {exc}") from exc
+
+        src_w, src_h = image.size
+        tgt_w, tgt_h = int(target_size[0]), int(target_size[1])
+
+        if (src_w, src_h) == (tgt_w, tgt_h):
+            return image, False, "none", (src_w, src_h), (tgt_w, tgt_h)
+
+        src_aspect = src_w / float(src_h)
+        tgt_aspect = tgt_w / float(tgt_h)
+
+        if abs(src_aspect - tgt_aspect) < 1e-6:
+            image = image.resize((tgt_w, tgt_h), Image.LANCZOS)
+            return image, True, "resize_only", (src_w, src_h), (tgt_w, tgt_h)
+
+        # center-crop to desired aspect, then resize
+        if src_aspect > tgt_aspect:
+            # too wide -> crop left/right
+            crop_w = int(round(src_h * tgt_aspect))
+            crop_w = max(1, min(crop_w, src_w))
+            x0 = max(0, (src_w - crop_w) // 2)
+            box = (x0, 0, x0 + crop_w, src_h)
+        else:
+            # too tall / square -> crop top/bottom
+            crop_h = int(round(src_w / tgt_aspect))
+            crop_h = max(1, min(crop_h, src_h))
+            y0 = max(0, (src_h - crop_h) // 2)
+            box = (0, y0, src_w, y0 + crop_h)
+
+        image = image.crop(box)
+        image = image.resize((tgt_w, tgt_h), Image.LANCZOS)
+        return image, True, "center_crop_resize", (src_w, src_h), (tgt_w, tgt_h)
 
     # ------------------------------------------------------------------
     # Text2Img
@@ -721,7 +781,6 @@ class SD35Runtime:
         num_steps = int(meta.get("num_inference_steps", 46))
         guidance_scale = float(meta.get("guidance_scale", 5.6))
 
-        # Apply locked LyCORIS + GEO adapters from meta
         self._apply_locked_adapters(meta)
 
         seed = meta.get("seed")
@@ -794,6 +853,10 @@ class SD35Runtime:
         - Follow input aspect ratio unless caller explicitly specifies otherwise.
         - Default preset-injected square size (1024x1024) is treated as "unspecified"
           for img2img and will auto-resolve to the input aspect.
+
+        FINAL GUARANTEE:
+        - Even if the underlying pipeline ignores non-square target shape,
+          the saved output files will be conformed to the resolved target size.
         """
         if not self.is_loaded:
             raise RuntimeError("SD35Runtime.generate_img2img() called but runtime is not loaded in real mode.")
@@ -819,7 +882,6 @@ class SD35Runtime:
         num_steps = int(meta.get("num_inference_steps", 46))
         guidance_scale = float(meta.get("guidance_scale", 5.6))
 
-        # Apply locked adapters to the main pipe context
         self._apply_locked_adapters(meta)
 
         try:
@@ -869,26 +931,29 @@ class SD35Runtime:
             width, height, explicit_size = self._resolve_img2img_target_size(meta, input_size)
             init_image = self._prepare_img2img_input_image(init_image, (width, height), explicit_size)
 
-            # Keep meta synchronized with the TRUE img2img render size.
             meta["width"] = int(width)
             meta["height"] = int(height)
 
+            preserve_ratio = bool(meta.get("preserve_input_aspect_ratio", False))
+            explicit_dimensions = bool(meta.get("explicit_dimensions", False))
+
             logger.info(
                 "SD3.5 img2img: strength=%.3f input=%dx%d resolved=%dx%d explicit_size=%s "
-                "steps=%d cfg=%.3f seed=%s prompt='%s'",
+                "preserve_ratio=%s steps=%d cfg=%.3f seed=%s prompt='%s'",
                 strength,
                 input_size[0],
                 input_size[1],
                 width,
                 height,
                 explicit_size,
+                preserve_ratio,
                 num_steps,
                 guidance_scale,
                 seed,
                 prompt[:140],
             )
 
-            kwargs: Dict[str, Any] = {
+            candidate_kwargs: Dict[str, Any] = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
                 "image": init_image,
@@ -897,18 +962,66 @@ class SD35Runtime:
                 "guidance_scale": guidance_scale,
                 "width": width,
                 "height": height,
+                "original_size": (width, height),
+                "target_size": (width, height),
             }
             if generator is not None:
-                kwargs["generator"] = generator
+                candidate_kwargs["generator"] = generator
+
+            kwargs = self._filter_supported_call_kwargs(img_pipe.__call__, candidate_kwargs)
+
+            logger.info("SD3.5 img2img call kwargs keys: %s", sorted(kwargs.keys()))
 
             images = img_pipe(**kwargs).images
             if not images:
                 raise RuntimeError("SD3.5 img2img pipeline returned no images.")
 
             image = images[0]
-            image = self._detail_pass_if_enabled(image, meta)
+
+            raw_output_size = getattr(image, "size", None)
+            if not raw_output_size or len(raw_output_size) != 2:
+                raise RuntimeError("Img2img pipeline returned an image without a readable size.")
+
+            meta["pipeline_output_size_before_enforce"] = {
+                "width": int(raw_output_size[0]),
+                "height": int(raw_output_size[1]),
+            }
 
             os.makedirs(job_folder, exist_ok=True)
+
+            # Save raw pipeline output for debugging if it mismatches the target.
+            if tuple(raw_output_size) != (width, height):
+                raw_path = os.path.join(job_folder, "output_pipeline_raw.png")
+                try:
+                    image.save(raw_path)
+                    meta["output_pipeline_raw_image"] = "output_pipeline_raw.png"
+                except Exception:
+                    pass
+
+            image, enforced, method, before_sz, after_sz = self._enforce_output_size(image, (width, height))
+
+            meta["output_size_enforced"] = bool(enforced)
+            meta["output_size_enforcement_method"] = method
+            meta["pipeline_output_size_after_enforce"] = {
+                "width": int(after_sz[0]),
+                "height": int(after_sz[1]),
+            }
+
+            # Hard assertion: do not silently save wrong-sized outputs anymore.
+            if getattr(image, "size", None) != (width, height):
+                raise RuntimeError(
+                    f"Img2img output size enforcement failed. Expected {(width, height)}, got {getattr(image, 'size', None)}"
+                )
+
+            # Extra traceability for the exact failure mode that caused the previous loop.
+            if tuple(before_sz) != (width, height):
+                meta["output_size_warning"] = (
+                    f"Pipeline emitted {before_sz[0]}x{before_sz[1]} while target was {width}x{height}. "
+                    f"Runtime corrected final output using {method}."
+                )
+
+            image = self._detail_pass_if_enabled(image, meta)
+
             base_out = os.path.join(job_folder, "output_base.png")
             try:
                 image.save(base_out)
@@ -926,7 +1039,14 @@ class SD35Runtime:
             meta["output_image"] = "output.png"
             meta["output_base_image"] = "output_base.png"
 
-            logger.info("SD3.5 img2img completed. Saved to %s", out_path)
+            logger.info(
+                "SD3.5 img2img completed. Saved to %s (raw pipeline size=%s, final size=%s, enforced=%s, method=%s)",
+                out_path,
+                before_sz,
+                getattr(image, "size", None),
+                enforced,
+                method,
+            )
             return meta
 
         finally:
