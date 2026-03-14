@@ -605,33 +605,41 @@ class SD35Runtime:
         except Exception:
             req_h = 1024
 
-        # Treat preset default square as not explicitly requested for img2img.
-        explicit_size = not (req_w == 1024 and req_h == 1024)
+        explicit_flag = bool(meta.get("explicit_dimensions", False))
+        preserve_ratio = bool(meta.get("preserve_input_aspect_ratio", False))
 
-        if explicit_size:
+        # Explicit caller override always wins.
+        if explicit_flag:
             target_w = self._round_down_to_multiple(req_w, base=64, minimum=64)
             target_h = self._round_down_to_multiple(req_h, base=64, minimum=64)
             return target_w, target_h, True
 
-        # Auto-follow source aspect using the requested default long side budget.
-        long_side_budget = max(req_w, req_h, 1024)
+        # Treat preset default square as not explicitly requested for img2img.
+        # If planner asked to preserve input ratio, auto-follow it.
+        if preserve_ratio or (req_w == 1024 and req_h == 1024):
+            long_side_budget = max(req_w, req_h, 1024)
 
-        if iw >= ih:
-            scale = long_side_budget / float(iw)
-            target_w = long_side_budget
-            target_h = int(round(ih * scale))
-        else:
-            scale = long_side_budget / float(ih)
-            target_h = long_side_budget
-            target_w = int(round(iw * scale))
+            if iw >= ih:
+                scale = long_side_budget / float(iw)
+                target_w = long_side_budget
+                target_h = int(round(ih * scale))
+            else:
+                scale = long_side_budget / float(ih)
+                target_h = long_side_budget
+                target_w = int(round(iw * scale))
 
-        target_w = self._round_down_to_multiple(target_w, base=64, minimum=64)
-        target_h = self._round_down_to_multiple(target_h, base=64, minimum=64)
+            target_w = self._round_down_to_multiple(target_w, base=64, minimum=64)
+            target_h = self._round_down_to_multiple(target_h, base=64, minimum=64)
 
-        if target_w <= 0 or target_h <= 0:
-            raise RuntimeError(f"Resolved invalid img2img target size: {target_w}x{target_h}")
+            if target_w <= 0 or target_h <= 0:
+                raise RuntimeError(f"Resolved invalid img2img target size: {target_w}x{target_h}")
 
-        return target_w, target_h, False
+            return target_w, target_h, False
+
+        # Fallback: respect supplied dimensions if they are non-default.
+        target_w = self._round_down_to_multiple(req_w, base=64, minimum=64)
+        target_h = self._round_down_to_multiple(req_h, base=64, minimum=64)
+        return target_w, target_h, True
 
     def _prepare_img2img_input_image(
         self,
@@ -887,6 +895,8 @@ class SD35Runtime:
                 "strength": strength,
                 "num_inference_steps": num_steps,
                 "guidance_scale": guidance_scale,
+                "width": width,
+                "height": height,
             }
             if generator is not None:
                 kwargs["generator"] = generator
