@@ -32,6 +32,11 @@ IMPORTANT FINAL SAFETY FOR IMG2IMG:
     1) pass target sizing arguments when supported, and
     2) validate and enforce the final output size before saving.
 - We do NOT silently save wrong-sized square outputs anymore.
+
+FINAL DELIVERY RULE:
+- Internal img2img generation may run at a working size such as 1024x576.
+- Final saved output must match the EXACT original input dimensions unless
+  an explicit dimension override is used.
 """
 
 from __future__ import annotations
@@ -705,7 +710,7 @@ class SD35Runtime:
         target_size: Tuple[int, int],
     ) -> Tuple[Any, bool, str, Tuple[int, int], Tuple[int, int]]:
         """
-        Enforce exact final output size.
+        Enforce exact working output size.
 
         Why this exists:
         - Some SD3 img2img builds still emit square output even when non-square
@@ -741,15 +746,12 @@ class SD35Runtime:
             image = image.resize((tgt_w, tgt_h), Image.LANCZOS)
             return image, True, "resize_only", (src_w, src_h), (tgt_w, tgt_h)
 
-        # center-crop to desired aspect, then resize
         if src_aspect > tgt_aspect:
-            # too wide -> crop left/right
             crop_w = int(round(src_h * tgt_aspect))
             crop_w = max(1, min(crop_w, src_w))
             x0 = max(0, (src_w - crop_w) // 2)
             box = (x0, 0, x0 + crop_w, src_h)
         else:
-            # too tall / square -> crop top/bottom
             crop_h = int(round(src_w / tgt_aspect))
             crop_h = max(1, min(crop_h, src_h))
             y0 = max(0, (src_h - crop_h) // 2)
@@ -758,6 +760,36 @@ class SD35Runtime:
         image = image.crop(box)
         image = image.resize((tgt_w, tgt_h), Image.LANCZOS)
         return image, True, "center_crop_resize", (src_w, src_h), (tgt_w, tgt_h)
+
+    def _resize_to_exact_output_dimensions(
+        self,
+        image: Any,
+        target_size: Tuple[int, int],
+    ) -> Any:
+        """
+        Final delivery resize.
+
+        Purpose:
+        - Img2img may work internally at a smaller render size such as 1024x576.
+        - But RENDEREXPO delivery may require the exact original input dimensions.
+        - This function resizes the already-correct-aspect final image to the exact target.
+        """
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"PIL is required for exact output resize: {exc}") from exc
+
+        if not isinstance(image, Image.Image):
+            try:
+                image = Image.fromarray(image)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"Cannot convert image for exact output resize: {exc}") from exc
+
+        tw, th = int(target_size[0]), int(target_size[1])
+        if image.size == (tw, th):
+            return image
+
+        return image.resize((tw, th), Image.LANCZOS)
 
     # ------------------------------------------------------------------
     # Text2Img
@@ -856,7 +888,8 @@ class SD35Runtime:
 
         FINAL GUARANTEE:
         - Even if the underlying pipeline ignores non-square target shape,
-          the saved output files will be conformed to the resolved target size.
+          the runtime will enforce the working size and then resize final saved outputs
+          to the exact original input dimensions unless explicit dimensions were requested.
         """
         if not self.is_loaded:
             raise RuntimeError("SD35Runtime.generate_img2img() called but runtime is not loaded in real mode.")
@@ -927,6 +960,7 @@ class SD35Runtime:
 
             init_image = Image.open(input_path).convert("RGB")
             input_size = init_image.size
+            original_output_w, original_output_h = int(input_size[0]), int(input_size[1])
 
             width, height, explicit_size = self._resolve_img2img_target_size(meta, input_size)
             init_image = self._prepare_img2img_input_image(init_image, (width, height), explicit_size)
@@ -989,7 +1023,6 @@ class SD35Runtime:
 
             os.makedirs(job_folder, exist_ok=True)
 
-            # Save raw pipeline output for debugging if it mismatches the target.
             if tuple(raw_output_size) != (width, height):
                 raw_path = os.path.join(job_folder, "output_pipeline_raw.png")
                 try:
@@ -1007,20 +1040,43 @@ class SD35Runtime:
                 "height": int(after_sz[1]),
             }
 
-            # Hard assertion: do not silently save wrong-sized outputs anymore.
             if getattr(image, "size", None) != (width, height):
                 raise RuntimeError(
                     f"Img2img output size enforcement failed. Expected {(width, height)}, got {getattr(image, 'size', None)}"
                 )
 
-            # Extra traceability for the exact failure mode that caused the previous loop.
             if tuple(before_sz) != (width, height):
                 meta["output_size_warning"] = (
                     f"Pipeline emitted {before_sz[0]}x{before_sz[1]} while target was {width}x{height}. "
-                    f"Runtime corrected final output using {method}."
+                    f"Runtime corrected working output using {method}."
                 )
 
             image = self._detail_pass_if_enabled(image, meta)
+
+            # Final delivery size:
+            # - explicit dims requested -> honor explicit working size
+            # - otherwise -> return exact original input dimensions
+            if explicit_dimensions:
+                final_delivery_w, final_delivery_h = int(width), int(height)
+            else:
+                final_delivery_w, final_delivery_h = original_output_w, original_output_h
+
+            image = self._resize_to_exact_output_dimensions(
+                image,
+                (final_delivery_w, final_delivery_h),
+            )
+
+            meta["final_delivery_size"] = {
+                "width": final_delivery_w,
+                "height": final_delivery_h,
+            }
+            meta["final_delivery_resize_applied"] = (final_delivery_w, final_delivery_h) != (width, height)
+
+            if getattr(image, "size", None) != (final_delivery_w, final_delivery_h):
+                raise RuntimeError(
+                    f"Final img2img delivery size failed. Expected {(final_delivery_w, final_delivery_h)}, "
+                    f"got {getattr(image, 'size', None)}"
+                )
 
             base_out = os.path.join(job_folder, "output_base.png")
             try:
@@ -1040,12 +1096,14 @@ class SD35Runtime:
             meta["output_base_image"] = "output_base.png"
 
             logger.info(
-                "SD3.5 img2img completed. Saved to %s (raw pipeline size=%s, final size=%s, enforced=%s, method=%s)",
+                "SD3.5 img2img completed. Saved to %s "
+                "(raw pipeline size=%s, working size=%s, enforced=%s, method=%s, final delivery size=%s)",
                 out_path,
                 before_sz,
-                getattr(image, "size", None),
+                after_sz,
                 enforced,
                 method,
+                getattr(image, "size", None),
             )
             return meta
 
