@@ -37,16 +37,24 @@ FINAL DELIVERY RULE:
 - Internal img2img generation may run at a working size such as 1024x576.
 - Final saved output must match the EXACT original input dimensions unless
   an explicit dimension override is used.
+
+NEW SKETCH RULE:
+- Sketch mode is NOT plain img2img.
+- Sketch mode MUST run:
+    sketch.png -> canny.png + depth.png -> SD3.5 Large dual ControlNet -> output.png
 """
 
 from __future__ import annotations
 
 import inspect
-import os
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from runtime.controlnet.sketch_controlnet import run_sketch_controlnet_generation
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +95,31 @@ class SD35Runtime:
         # If env var is set, it wins.
         self.model_path = os.getenv("SD35_MODEL_PATH", "/workspace-data/models/sd35-large")
 
+        # Official SD3.5 ControlNet paths
+        self.controlnet_canny_path = os.getenv(
+            "SD35_CONTROLNET_CANNY_PATH",
+            "/workspace-data/models/sd35-controlnet-canny",
+        )
+        self.controlnet_depth_path = os.getenv(
+            "SD35_CONTROLNET_DEPTH_PATH",
+            "/workspace-data/models/sd35-controlnet-depth",
+        )
+
+        # Depth preprocessor model (permissive, inference-only)
+        self.depth_model_id = os.getenv(
+            "SD35_DEPTH_MODEL_ID",
+            "Intel/dpt-hybrid-midas",
+        )
+
         self.pipe: Optional[Any] = None
+        self._sketch_pipe: Optional[Any] = None
         self._torch: Optional[Any] = None
+        self._np: Optional[Any] = None
         self._loaded: bool = False
+
+        # Lazy depth-estimation objects
+        self._depth_image_processor: Optional[Any] = None
+        self._depth_model: Optional[Any] = None
 
         # Track last adapters we applied so we can avoid stacking accidentally.
         self._active_adapters: Tuple[str, ...] = ()
@@ -100,10 +130,12 @@ class SD35Runtime:
         self._active_lyco_paths: Tuple[str, ...] = ()
 
         logger.info(
-            "SD35Runtime initialized with mode=%s, device=%s, model_path=%s",
+            "SD35Runtime initialized with mode=%s, device=%s, model_path=%s, canny_path=%s, depth_path=%s",
             self.mode,
             self.device,
             self.model_path,
+            self.controlnet_canny_path,
+            self.controlnet_depth_path,
         )
 
     # ------------------------------------------------------------------
@@ -133,17 +165,20 @@ class SD35Runtime:
             return
 
         try:
+            import numpy as np  # type: ignore
             import torch  # type: ignore
             from diffusers import StableDiffusion3Pipeline  # type: ignore
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to import torch/diffusers for SD3.5 runtime: %s", exc)
+            logger.exception("Failed to import torch/diffusers/numpy for SD3.5 runtime: %s", exc)
             self.mode = "skeleton"
             self._torch = None
+            self._np = None
             self.pipe = None
             self._loaded = False
             return
 
         self._torch = torch
+        self._np = np
 
         if not os.path.isdir(self.model_path):
             logger.error("SD3.5 model path does not exist: %s (staying unloaded)", self.model_path)
@@ -153,21 +188,19 @@ class SD35Runtime:
             return
 
         try:
-            logger.info("Loading SD3.5 model from %s ...", self.model_path)
+            logger.info("Loading SD3.5 base model from %s ...", self.model_path)
 
             pipe = StableDiffusion3Pipeline.from_pretrained(
                 self.model_path,
                 torch_dtype=torch.float16,
             )
 
-            # Prefer xformers if available
             try:
                 pipe.enable_xformers_memory_efficient_attention()
                 logger.info("Enabled xformers memory efficient attention.")
             except Exception:
                 pass
 
-            # Optional CPU offload (big VRAM saver)
             if os.getenv("SD35_ENABLE_CPU_OFFLOAD", "0").strip().lower() in ("1", "true", "yes", "on"):
                 try:
                     pipe.enable_model_cpu_offload()
@@ -180,9 +213,9 @@ class SD35Runtime:
 
             self.pipe = pipe
             self._loaded = True
-            logger.info("SD35Runtime successfully loaded SD3.5 model.")
+            logger.info("SD35Runtime successfully loaded SD3.5 base model.")
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to load SD3.5 model: %s", exc)
+            logger.exception("Failed to load SD3.5 base model: %s", exc)
             self.mode = "skeleton"
             self.pipe = None
             self._loaded = False
@@ -197,6 +230,9 @@ class SD35Runtime:
 
         self._active_adapters = ()
         self.pipe = None
+        self._sketch_pipe = None
+        self._depth_image_processor = None
+        self._depth_model = None
         self._loaded = False
 
         if self._torch is not None:
@@ -216,12 +252,13 @@ class SD35Runtime:
         Restore LyCORIS networks (prevents stacking across jobs),
         and unload any diffusers LoRA adapters if they were ever used.
         """
-        if self.pipe is None:
+        active_pipe = self.pipe
+        if active_pipe is None:
             return
 
         if self._active_lyco_networks:
-            te_list = self._get_text_encoders(self.pipe)
-            unet_like = self._get_unet_like(self.pipe)
+            te_list = self._get_text_encoders(active_pipe)
+            unet_like = self._get_unet_like(active_pipe)
             for net in self._active_lyco_networks:
                 try:
                     net.restore(te_list, unet_like)
@@ -237,8 +274,8 @@ class SD35Runtime:
         self._active_lyco_paths = ()
 
         try:
-            if hasattr(self.pipe, "unload_lora_weights"):
-                self.pipe.unload_lora_weights()
+            if hasattr(active_pipe, "unload_lora_weights"):
+                active_pipe.unload_lora_weights()
         except Exception:
             pass
 
@@ -485,7 +522,7 @@ class SD35Runtime:
             return image
 
         try:
-            from PIL import Image, ImageFilter, ImageEnhance  # type: ignore
+            from PIL import Image, ImageEnhance, ImageFilter  # type: ignore
         except Exception:
             logger.warning("Detail pass requested but PIL is not available. Skipping.")
             meta["detail_pass_applied"] = False
@@ -698,7 +735,7 @@ class SD35Runtime:
             filtered = {k: v for k, v in kwargs.items() if k in allowed}
             dropped = sorted(set(kwargs.keys()) - set(filtered.keys()))
             if dropped:
-                logger.info("Dropping unsupported img2img kwargs for installed pipeline: %s", dropped)
+                logger.info("Dropping unsupported kwargs for installed pipeline: %s", dropped)
             return filtered
         except Exception as exc:  # noqa: BLE001
             logger.info("Could not inspect pipeline signature; passing kwargs unchanged: %s", exc)
@@ -711,16 +748,6 @@ class SD35Runtime:
     ) -> Tuple[Any, bool, str, Tuple[int, int], Tuple[int, int]]:
         """
         Enforce exact working output size.
-
-        Why this exists:
-        - Some SD3 img2img builds still emit square output even when non-square
-          input/target is requested.
-        - We must not silently save wrong-sized square outputs anymore.
-
-        Strategy:
-        - If already correct: no-op
-        - If same aspect: simple resize
-        - Otherwise: center-crop to target aspect, then resize
         """
         try:
             from PIL import Image  # type: ignore
@@ -768,11 +795,6 @@ class SD35Runtime:
     ) -> Any:
         """
         Final delivery resize.
-
-        Purpose:
-        - Img2img may work internally at a smaller render size such as 1024x576.
-        - But RENDEREXPO delivery may require the exact original input dimensions.
-        - This function resizes the already-correct-aspect final image to the exact target.
         """
         try:
             from PIL import Image  # type: ignore
@@ -790,6 +812,126 @@ class SD35Runtime:
             return image
 
         return image.resize((tw, th), Image.LANCZOS)
+
+    # ------------------------------------------------------------------
+    # Sketch / ControlNet helpers
+    # ------------------------------------------------------------------
+
+    def _load_sketch_pipe(self) -> Any:
+        """
+        Lazy-load dedicated SD3.5 dual-ControlNet pipeline.
+
+        This is intentionally separate from base text2img/img2img execution
+        because sketch mode requires official SD3.5 ControlNet models.
+        """
+        if self.mode != "real":
+            raise RuntimeError("Sketch ControlNet runtime requested in non-real mode.")
+
+        if self._torch is None:
+            raise RuntimeError("Torch is unavailable; SD35Runtime base load must happen first.")
+
+        if self._sketch_pipe is not None:
+            return self._sketch_pipe
+
+        if not os.path.isdir(self.model_path):
+            raise RuntimeError(f"Base SD3.5 model path missing: {self.model_path}")
+        if not os.path.isdir(self.controlnet_canny_path):
+            raise RuntimeError(f"SD3.5 ControlNet Canny path missing: {self.controlnet_canny_path}")
+        if not os.path.isdir(self.controlnet_depth_path):
+            raise RuntimeError(f"SD3.5 ControlNet Depth path missing: {self.controlnet_depth_path}")
+
+        try:
+            from diffusers import SD3ControlNetModel, StableDiffusion3ControlNetPipeline  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "StableDiffusion3ControlNetPipeline / SD3ControlNetModel are not available in this diffusers build."
+            ) from exc
+
+        torch = self._torch
+
+        logger.info(
+            "Loading SD3.5 sketch ControlNet pipeline base=%s canny=%s depth=%s",
+            self.model_path,
+            self.controlnet_canny_path,
+            self.controlnet_depth_path,
+        )
+
+        canny_cn = SD3ControlNetModel.from_pretrained(
+            self.controlnet_canny_path,
+            torch_dtype=torch.float16,
+        )
+        depth_cn = SD3ControlNetModel.from_pretrained(
+            self.controlnet_depth_path,
+            torch_dtype=torch.float16,
+        )
+
+        pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
+            self.model_path,
+            controlnet=[canny_cn, depth_cn],
+            torch_dtype=torch.float16,
+        )
+
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+
+        if os.getenv("SD35_ENABLE_CPU_OFFLOAD", "0").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception:
+                pipe = pipe.to(self.device)
+        else:
+            pipe = pipe.to(self.device)
+
+        self._sketch_pipe = pipe
+        logger.info("Loaded SD3.5 sketch ControlNet pipeline.")
+        return pipe
+
+    def _get_depth_estimator(self) -> Tuple[Any, Any]:
+        """
+        Lazy-load depth estimator.
+
+        We use Hugging Face Transformers depth estimation with MiDaS-family model id.
+        """
+        if self._depth_image_processor is not None and self._depth_model is not None:
+            return self._depth_image_processor, self._depth_model
+
+        try:
+            from transformers import AutoImageProcessor, DPTForDepthEstimation  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Transformers depth-estimation dependencies are missing. Install transformers for sketch depth preprocessing."
+            ) from exc
+
+        if self._torch is None:
+            raise RuntimeError("Torch must be loaded before depth estimator initialization.")
+
+        logger.info("Loading depth estimator model: %s", self.depth_model_id)
+
+        image_processor = AutoImageProcessor.from_pretrained(self.depth_model_id)
+        model = DPTForDepthEstimation.from_pretrained(self.depth_model_id)
+
+        try:
+            model = model.to(self.device)
+        except Exception:
+            pass
+
+        model.eval()
+
+        self._depth_image_processor = image_processor
+        self._depth_model = model
+        return image_processor, model
+
+    def _resolve_sketch_target_size(
+        self,
+        meta: Dict[str, Any],
+        input_size: Tuple[int, int],
+    ) -> Tuple[int, int, bool]:
+        """
+        For sketch mode, preserve the uploaded sketch aspect ratio unless explicit dimensions are requested.
+        """
+        return self._resolve_img2img_target_size(meta, input_size)
 
     # ------------------------------------------------------------------
     # Text2Img
@@ -969,7 +1111,6 @@ class SD35Runtime:
             meta["height"] = int(height)
 
             preserve_ratio = bool(meta.get("preserve_input_aspect_ratio", False))
-            explicit_dimensions = bool(meta.get("explicit_dimensions", False))
 
             logger.info(
                 "SD3.5 img2img: strength=%.3f input=%dx%d resolved=%dx%d explicit_size=%s "
@@ -1053,10 +1194,7 @@ class SD35Runtime:
 
             image = self._detail_pass_if_enabled(image, meta)
 
-            # Final delivery size:
-            # - explicit dims requested -> honor explicit working size
-            # - otherwise -> return exact original input dimensions
-            if explicit_dimensions:
+            if explicit_size:
                 final_delivery_w, final_delivery_h = int(width), int(height)
             else:
                 final_delivery_w, final_delivery_h = original_output_w, original_output_h
@@ -1117,6 +1255,94 @@ class SD35Runtime:
                 del img_pipe
             except Exception:
                 pass
+            try:
+                if self._torch is not None:
+                    self._torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Sketch -> Dual ControlNet
+    # ------------------------------------------------------------------
+
+    def generate_sketch_controlnet(self, job_folder: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Real SD3.5 sketch execution using dual ControlNet.
+
+        REQUIRED FLOW:
+            sketch.png -> canny.png + depth.png -> SD3.5 Large dual ControlNet -> output.png
+
+        IMPORTANT:
+        - This is NOT plain img2img.
+        - Prompt is for materials / lighting / realism, not primary geometry invention.
+        """
+        if not self.is_loaded:
+            raise RuntimeError(
+                "SD35Runtime.generate_sketch_controlnet() called but runtime is not loaded in real mode."
+            )
+
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"PIL is required for sketch controlnet execution: {exc}") from exc
+
+        torch = self._torch
+        if torch is None:
+            raise RuntimeError("Torch runtime is unavailable.")
+
+        input_rel = meta.get("sketch_image") or meta.get("input_image") or "sketch.png"
+        input_path = input_rel if os.path.isabs(str(input_rel)) else os.path.join(job_folder, str(input_rel))
+        if not os.path.isfile(input_path):
+            raise RuntimeError(f"Sketch input image not found: {input_path}")
+
+        original_sketch = Image.open(input_path).convert("RGB")
+        input_size = original_sketch.size
+
+        width, height, explicit_size = self._resolve_sketch_target_size(meta, input_size)
+        meta["width"] = int(width)
+        meta["height"] = int(height)
+
+        sketch_pipe = self._load_sketch_pipe()
+        depth_image_processor, depth_model = self._get_depth_estimator()
+
+        old_pipe = self.pipe
+        try:
+            self.pipe = sketch_pipe
+            self._apply_locked_adapters(meta)
+
+            updated_meta = run_sketch_controlnet_generation(
+                pipe=sketch_pipe,
+                torch_module=torch,
+                device=self.device,
+                job_folder=job_folder,
+                meta=meta,
+                sketch_image=original_sketch,
+                depth_image_processor=depth_image_processor,
+                depth_model=depth_model,
+                target_size=(width, height),
+                explicit_dimensions=explicit_size,
+                detail_pass_fn=self._detail_pass_if_enabled,
+                upscale_if_enabled_fn=self._upscale_if_enabled,
+                resize_exact_fn=self._resize_to_exact_output_dimensions,
+                enforce_output_size_fn=self._enforce_output_size,
+            )
+
+            updated_meta["completed_at"] = datetime.utcnow().isoformat()
+
+            logger.info(
+                "SD3.5 sketch-controlnet completed. output=%s canny=%s depth=%s",
+                updated_meta.get("output_image"),
+                updated_meta.get("canny_image"),
+                updated_meta.get("depth_image"),
+            )
+            return updated_meta
+
+        finally:
+            try:
+                self._safe_unload_adapters()
+            except Exception:
+                pass
+            self.pipe = old_pipe
             try:
                 if self._torch is not None:
                     self._torch.cuda.empty_cache()

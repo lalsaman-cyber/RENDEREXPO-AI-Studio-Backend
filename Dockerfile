@@ -1,19 +1,31 @@
 # ============================================
 # RENDEREXPO AI STUDIO - GPU Backend (SD3.5)
 # Dockerfile for RunPod / CUDA GPU environment
+# UPDATED FOR:
+# - SD3.5 Large
+# - dual ControlNet sketch route
+# - Canny + Depth preprocessing
 # ============================================
 
 FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
 # -----------------------------
 # System packages
 # -----------------------------
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-venv \
-    git wget curl vim \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    wget \
+    curl \
+    vim \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -29,65 +41,67 @@ COPY ./Licenses ./Licenses
 COPY ./requirements.txt ./requirements.txt
 COPY ./start.sh ./start.sh
 
-# Models & outputs will be mounted as volumes later:
+# Models & outputs are expected as mounted volumes:
 #   /workspace/models
 #   /workspace/outputs
 
-# Make start.sh executable
 RUN chmod +x /workspace/start.sh
 
 # -----------------------------
-# Python & core deps
+# Python bootstrap
 # -----------------------------
-RUN python3 -m pip install --upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# 1) Install GPU Torch first (CUDA wheels)
+# -----------------------------
+# Install GPU Torch first
+# IMPORTANT:
+# Keep Torch pinned explicitly from CUDA 12.1 wheels.
+# Then install the rest from requirements.txt.
+# -----------------------------
 RUN python3 -m pip install \
     --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0
+    torch==2.2.2 \
+    torchvision==0.17.2 \
+    torchaudio==2.2.2
 
-# 2) Install the main libraries (FastAPI, diffusers, etc.)
-#    We install the diffusion stack explicitly so dependencies are pulled,
-#    then install the rest of requirements without dependencies to avoid
-#    re-resolving Torch.
-RUN python3 -m pip install \
-    fastapi==0.109.2 \
-    uvicorn[standard]==0.29.0 \
-    starlette==0.36.3 \
-    pydantic==2.12.4 \
-    typing-extensions==4.14.1 \
-    tqdm==4.67.1 \
-    python-dotenv==1.0.1 \
-    diffusers==0.27.2 \
-    transformers==4.39.3 \
-    accelerate==0.28.0 \
-    safetensors==0.4.2 \
-    huggingface_hub==0.23.0 \
-    Pillow==10.2.0 \
-    opencv-python==4.9.0.80 \
-    einops==0.7.0 \
-    timm==0.9.16
-
-# (Optional) install any extra libs listed in requirements.txt, but
-# we disable dependency resolution here to avoid messing with Torch.
-RUN python3 -m pip install --no-deps -r requirements.txt || true
+# -----------------------------
+# Install backend requirements
+# IMPORTANT:
+# Do NOT use --no-deps here.
+# We want the upgraded diffusers / transformers / controlnet stack
+# to resolve correctly for the new sketch route.
+# -----------------------------
+RUN python3 -m pip install -r requirements.txt
 
 # -----------------------------
 # Environment variables
 # -----------------------------
-# SD3.5 model directory inside the container
-ENV SD35_MODEL_DIR=/workspace/models/sd35-large
-ENV SD_DEVICE=cuda
+# Base SD3.5 model
+ENV SD35_MODEL_PATH=/workspace/models/sd35-large
 
-# HF_TOKEN will be injected in RunPod environment (never hard-coded)
-# ENV HF_TOKEN=...
+# Official SD3.5 ControlNet model folders
+ENV SD35_CONTROLNET_CANNY_PATH=/workspace/models/sd35-controlnet-canny
+ENV SD35_CONTROLNET_DEPTH_PATH=/workspace/models/sd35-controlnet-depth
 
-# Outputs directory (will be mounted to a volume in RunPod)
+# Depth preprocessor model
+ENV SD35_DEPTH_MODEL_ID=Intel/dpt-hybrid-midas
+
+# Runtime controls
+ENV SD35_DEVICE=cuda
+ENV RUN_REAL_SD35=1
+ENV SD35_RUNTIME_MODE=lazy
+ENV SD35_ENABLE_CPU_OFFLOAD=0
+
+# Outputs directory
 ENV OUTPUTS_ROOT=/workspace/outputs
+
+# HF token is injected at runtime in RunPod if needed
+# ENV HF_TOKEN=...
 
 # -----------------------------
 # Networking
 # -----------------------------
+# Main API port
 EXPOSE 8000
 
 # -----------------------------

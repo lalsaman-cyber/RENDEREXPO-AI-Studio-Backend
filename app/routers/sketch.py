@@ -1,35 +1,37 @@
 # app/routers/sketch.py
 """
-RENDEREXPO AI STUDIO - Sketch Realtime Router (Planner -> GPU worker)
+RENDEREXPO AI STUDIO - Sketch Router (Planner -> GPU worker)
 
-WHAT THIS DOES:
-- Client draws on Wix canvas + types a prompt.
-- Wix sends frames (PNG/JPG) + prompt to this API.
-- This router:
-  1) Stores frames in a session folder (for history + audit)
-  2) Creates a real SD3.5 img2img job folder (outputs/YYYY-MM-DD/<job_id>/)
-  3) Writes a real meta.json with locked presets via apply_preset_to_meta()
-  4) Dispatches to the GPU worker and returns output URLs
+FINAL PURPOSE:
+- Sketch mode is NO LONGER treated as plain img2img.
+- Sketch mode plans and dispatches a dedicated SD3.5 Large dual-ControlNet job:
+    uploaded sketch -> cleanup -> canny + depth -> SD3.5 Large -> optional light polish/upscale
 
-NO SKELETON:
-- If GPU dispatch is not configured, this fails fast.
+WHAT THIS ROUTER DOES:
+1) Creates/maintains a sketch session
+2) Stores uploaded sketch frames for history/audit
+3) Creates a real outputs/YYYY-MM-DD/<job_id>/ folder
+4) Saves the uploaded sketch as the source image for preprocessing
+5) Writes a real meta.json describing a dedicated sketch-control pipeline
+6) Dispatches to the GPU worker through app.clients.gpu_client
+
+IMPORTANT:
+- This is the PLANNER router only.
+- No SD3.5 model is loaded here.
+- No preprocessing is executed here.
+- The GPU worker must implement the runtime for:
+    job_type = "sd35_sketch_controlnet"
+    pipeline_key = "sd35::sd35_sketch_controlnet"
 
 LOCKED SERVICE SPLIT:
 - Planner = port 8012
 - GPU worker = port 8002
 
-REQUIRED RUNTIME CONFIG:
-- RENDEREXPO_GPU_DISPATCH_URL
-    Example: "http://127.0.0.1:8002/api/gpu/dispatch"
-- Optional:
-  - RENDEREXPO_GPU_TIMEOUT_SECONDS (default 90)
-  - RENDEREXPO_GPU_POLL_SECONDS (default 0.5)
-  - RENDEREXPO_OUTPUTS_MOUNT (default "/outputs")
-
-DISPATCH CONTRACT:
-- Planner sends:
-    {"job_folder":"ABSOLUTE_PATH","meta":{...}}
-- GPU worker reads meta and writes output.png into the same folder.
+DESIGN LOCK:
+- Do NOT route sketch mode through plain img2img as the main method.
+- Do NOT use prompt-only as the main structural method.
+- The structural route is:
+    sketch.png -> cleanup -> canny.png + depth.png -> SD3.5 dual ControlNet
 """
 
 from __future__ import annotations
@@ -38,15 +40,13 @@ import datetime
 import json
 import os
 import shutil
-import time
-import urllib.error
-import urllib.request
 import uuid
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.clients.gpu_client import dispatch_sd35_sketch_controlnet
 from app.presets_sd35 import apply_preset_to_meta
 
 router = APIRouter(prefix="/api/sketch", tags=["Sketch Realtime"])
@@ -71,10 +71,7 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return v
 
 
-GPU_DISPATCH_URL = _env("RENDEREXPO_GPU_DISPATCH_URL")
 OUTPUTS_MOUNT = _env("RENDEREXPO_OUTPUTS_MOUNT", "/outputs")
-GPU_TIMEOUT_SECONDS = float(_env("RENDEREXPO_GPU_TIMEOUT_SECONDS", "90") or "90")
-GPU_POLL_SECONDS = float(_env("RENDEREXPO_GPU_POLL_SECONDS", "0.5") or "0.5")
 
 
 # ---------------------------------------------------------------------------
@@ -87,16 +84,6 @@ def _utc_iso() -> str:
 
 def _today_utc_str() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
-
-
-def _repo_root() -> str:
-    return "/workspace-data/RENDEREXPO-AI-Studio-Backend"
-
-
-def _abs_repo_path(rel_path: str) -> str:
-    if os.path.isabs(rel_path):
-        return rel_path
-    return os.path.abspath(os.path.join(_repo_root(), rel_path))
 
 
 def _ensure_dir(path: str) -> None:
@@ -143,9 +130,6 @@ def _create_session_folder(session_id: str) -> str:
 
 
 def _create_job_folder(job_type: str) -> str:
-    """
-    Create outputs/YYYY-MM-DD/<job_id>/ and write a small marker.
-    """
     today = _today_utc_str()
     job_id = uuid.uuid4().hex
     folder = os.path.join("outputs", today, job_id)
@@ -168,19 +152,27 @@ def _parse_job_path(job_folder: str) -> Tuple[Optional[str], Optional[str]]:
 def _job_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
     date_str, job_id = _parse_job_path(job_folder)
     if not date_str or not job_id:
-        return {"meta_url": None, "input_url": None, "output_url": None}
+        return {
+            "meta_url": None,
+            "sketch_url": None,
+            "canny_url": None,
+            "depth_url": None,
+            "output_url": None,
+            "final_up2x_url": None,
+        }
+
     base = f"{OUTPUTS_MOUNT}/{date_str}/{job_id}"
     return {
         "meta_url": f"{base}/meta.json",
-        "input_url": f"{base}/input.png",
+        "sketch_url": f"{base}/sketch.png",
+        "canny_url": f"{base}/canny.png",
+        "depth_url": f"{base}/depth.png",
         "output_url": f"{base}/output.png",
+        "final_up2x_url": f"{base}/final_up2x.png",
     }
 
 
 async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
-    """
-    Stream-save UploadFile without reading whole file into RAM.
-    """
     try:
         try:
             upload.file.seek(0)
@@ -192,93 +184,144 @@ async def _save_upload_stream(upload: UploadFile, dst_path: str) -> None:
         raise HTTPException(status_code=500, detail=f"Failed saving upload '{upload.filename}': {exc}") from exc
 
 
-def _require_gpu_dispatch() -> str:
-    if not GPU_DISPATCH_URL:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Sketch realtime requires GPU dispatch. "
-                "Set env var RENDEREXPO_GPU_DISPATCH_URL to your real GPU worker dispatch endpoint."
+def _clean_prompt(prompt: str) -> str:
+    return " ".join((prompt or "").strip().split())
+
+
+def _default_negative_prompt() -> str:
+    return (
+        "sketch, line drawing, line art, blueprint, technical drawing, monochrome, unfinished architecture, "
+        "white model, clay render, flat shading, cartoon, anime, blurry, distorted windows, warped geometry, "
+        "fantasy building, changed camera angle, changed massing, cropped composition, text, watermark, logo"
+    )
+
+
+def _cleanup_defaults() -> Dict[str, Any]:
+    return {
+        "enabled": True,
+        "grayscale": True,
+        "autocontrast": True,
+        "contrast_boost": 1.2,
+        "median_blur_ksize": 3,
+        "adaptive_threshold": False,
+        "threshold_value": 185,
+        "morphology_close": False,
+        "close_kernel": 2,
+        "thicken_lines": False,
+        "thicken_kernel": 2,
+        "invert_to_white_bg_black_lines": True,
+    }
+
+
+def _build_sketch_controlnet_meta(
+    *,
+    job_id: str,
+    prompt: str,
+    negative_prompt: Optional[str],
+    category: Category,
+    shot: Shot,
+    seed: int,
+    upscale_2x: Optional[bool],
+    sketch_filename: str,
+    session_id: str,
+    frame_index: int,
+) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "job_id": job_id,
+        "created_at": _utc_iso(),
+        "type": "controlnet",
+        "job_type": "sd35_sketch_controlnet",
+        "engine": "sd35_large_pro_v2_1",
+        "model_name": "sd35_large_pro_v2_1",
+        "pipeline_key": "sd35::sd35_sketch_controlnet",
+        "status": "queued",
+        "mode_runtime": "gpu-dispatch",
+        "task_family": "sketch_to_render",
+        "category": category,
+        "shot": shot,
+        "seed": int(seed),
+        "prompt": _clean_prompt(prompt),
+        "negative_prompt": _clean_prompt(negative_prompt or "") or _default_negative_prompt(),
+        "inputs": {
+            "sketch_image": sketch_filename,
+            "content_type": "image/png",
+            "source": "sketch_session_upload",
+            "session_id": session_id,
+            "frame_index": frame_index,
+        },
+        "outputs": {
+            "meta": "meta.json",
+            "sketch_image": sketch_filename,
+            "canny_image": "canny.png",
+            "depth_image": "depth.png",
+            "final_image": "output.png",
+        },
+        "controlnet": {
+            "enabled": True,
+            "mode": "multi",
+            "base_input": sketch_filename,
+            "save_preprocessed_images": True,
+            "controls": [
+                {
+                    "control_type": "canny",
+                    "input_image": "canny.png",
+                    "conditioning_scale": 1.0,
+                    "preprocessor": {
+                        "name": "opencv_canny",
+                        "source_image": sketch_filename,
+                        "low_threshold": 100,
+                        "high_threshold": 200,
+                        "invert_if_dark_background": False,
+                        "line_boost": False,
+                        "line_boost_kernel": 2,
+                        "cleanup": _cleanup_defaults(),
+                    },
+                },
+                {
+                    "control_type": "depth",
+                    "input_image": "depth.png",
+                    "conditioning_scale": 0.85,
+                    "preprocessor": {
+                        "name": "midas_depth",
+                        "source_image": sketch_filename,
+                        "normalize_to_png": True,
+                        "invert_output": False,
+                        "blur_radius": 0.0,
+                        "cleanup": _cleanup_defaults(),
+                    },
+                },
+            ],
+            "note": (
+                "Sketch mode is routed through SD3.5 dual ControlNet. "
+                "Do not fall back to plain img2img as the primary generation method."
             ),
-        )
-    return GPU_DISPATCH_URL
+        },
+        "render_intent": {
+            "mode": "materialize_structure",
+            "preserve_camera_and_massing": True,
+            "preserve_building_geometry": True,
+            "allow_realistic_materialization": True,
+            "allow_site_completion": True,
+            "allow_daylight_rendering": True,
+            "prompt_role": "materials_lighting_realism_only",
+        },
+        "optional_polish": {
+            "enabled": False,
+            "type": "none",
+            "note": "Optional light polish/upscale may run after ControlNet output exists.",
+        },
+    }
 
+    apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
 
-def _http_post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise HTTPException(status_code=502, detail=f"GPU dispatch HTTPError: {e.code}: {detail}") from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"GPU dispatch failed: {e}") from e
+    # Safety relock: sketch mode must not degrade into img2img denoise logic.
+    meta["denoise"] = 0.0
+    meta.pop("strength", None)
 
+    if isinstance(meta.get("upscale"), dict):
+        meta["upscale"]["denoise"] = 0.0
 
-def _http_get_json(url: str, timeout_s: float) -> Dict[str, Any]:
-    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise HTTPException(status_code=502, detail=f"GPU status HTTPError: {e.code}: {detail}") from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"GPU status check failed: {e}") from e
-
-
-def _dispatch_to_gpu(job_folder: str, timeout_s: float) -> Dict[str, Any]:
-    """
-    Dispatch the SD3.5 img2img job to the GPU worker.
-
-    We send:
-      {"job_folder": "ABSOLUTE_PATH", "meta": {...}}
-
-    Sync success:
-      {"status":"ok", ...}
-
-    Async success:
-      {"status":"queued","status_url":"..."} then poll until ok/error.
-    """
-    url = _require_gpu_dispatch()
-    meta_path = os.path.join(job_folder, "meta.json")
-    meta = _read_json(meta_path)
-
-    start = time.time()
-    first = _http_post_json(
-        url,
-        {"job_folder": _abs_repo_path(job_folder), "meta": meta},
-        timeout_s=timeout_s,
-    )
-
-    status = (first.get("status") or "").lower().strip()
-
-    if status in ("ok", "success", "completed"):
-        return {"dispatch_mode": "sync", "runtime_response": first}
-
-    status_url = first.get("status_url")
-    if status_url:
-        while True:
-            if (time.time() - start) > timeout_s:
-                raise HTTPException(status_code=504, detail="GPU job timed out while polling status_url.")
-            s = _http_get_json(status_url, timeout_s=timeout_s)
-            st = (s.get("status") or "").lower().strip()
-            if st in ("ok", "success", "completed"):
-                return {"dispatch_mode": "async", "runtime_response": s, "status_url": status_url}
-            if st in ("error", "failed"):
-                raise HTTPException(status_code=500, detail=f"GPU job failed: {s.get('detail') or s}")
-            time.sleep(GPU_POLL_SECONDS)
-
-    raise HTTPException(status_code=502, detail=f"GPU dispatch returned unexpected payload: {first}")
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +329,6 @@ def _dispatch_to_gpu(job_folder: str, timeout_s: float) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class StartSketchSessionRequest(BaseModel):
-    """
-    Creates a sketch session that locks the preset selectors.
-    These are reused unless overridden per frame upload.
-    """
     category: Category = Field(..., description="Preset category: urban/suburban/interior/wide_hero")
     shot: Shot = Field(..., description="Preset shot: wide/close")
     upscale_2x: Optional[bool] = Field(None, description="Optional override. If omitted, preset default applies.")
@@ -303,31 +342,14 @@ class StartSketchSessionRequest(BaseModel):
 
 @router.post("/start-session")
 async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, Any]:
-    """
-    Start a sketch session and store locked preset selectors.
-    """
     session_id = uuid.uuid4().hex
     root = _create_session_folder(session_id)
 
     seed = request.seed if request.seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
-    session_meta: Dict[str, Any] = {
-        "session_id": session_id,
-        "created_at": _utc_iso(),
-        "engine": "sd35_large_pro_v2_1",
-        "model_name": "sd35_large_pro_v2_1",
-        "category": request.category,
-        "shot": request.shot,
-        "seed": seed,
-        "notes": request.notes,
-        "upscale_2x": request.upscale_2x,
-        "last_frame_index": -1,
-        "last_frame_filename": None,
-        "status": "active",
-    }
-
     preset_probe: Dict[str, Any] = {
-        "type": "img2img",
+        "type": "controlnet",
+        "job_type": "sd35_sketch_controlnet",
         "engine": "sd35_large_pro_v2_1",
         "model_name": "sd35_large_pro_v2_1",
         "category": request.category,
@@ -336,7 +358,8 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
         "prompt": "probe",
         "planned_output_image": "output.png",
         "status": "planned",
-        "mode": "probe",
+        "mode_runtime": "probe",
+        "pipeline_key": "sd35::sd35_sketch_controlnet",
     }
     apply_preset_to_meta(
         preset_probe,
@@ -344,23 +367,43 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
         shot=request.shot,
         upscale_2x=request.upscale_2x,
     )
+    preset_probe["denoise"] = 0.0
+    preset_probe.pop("strength", None)
+    if isinstance(preset_probe.get("upscale"), dict):
+        preset_probe["upscale"]["denoise"] = 0.0
 
-    session_meta["preset"] = preset_probe.get("preset", {})
-    session_meta["locked_generation_controls"] = {
-        "width": preset_probe.get("width"),
-        "height": preset_probe.get("height"),
-        "num_inference_steps": preset_probe.get("num_inference_steps"),
-        "guidance_scale": preset_probe.get("guidance_scale"),
-        "lora_config": preset_probe.get("lora_config"),
-        "geo_config": preset_probe.get("geo_config"),
-        "upscale": preset_probe.get("upscale"),
+    session_meta: Dict[str, Any] = {
+        "session_id": session_id,
+        "created_at": _utc_iso(),
+        "engine": "sd35_large_pro_v2_1",
+        "model_name": "sd35_large_pro_v2_1",
+        "route_mode": "sd35_sketch_controlnet",
+        "category": request.category,
+        "shot": request.shot,
+        "seed": seed,
+        "notes": request.notes,
+        "upscale_2x": request.upscale_2x,
+        "last_frame_index": -1,
+        "last_frame_filename": None,
+        "status": "active",
+        "preset": preset_probe.get("preset", {}),
+        "locked_generation_controls": {
+            "width": preset_probe.get("width"),
+            "height": preset_probe.get("height"),
+            "num_inference_steps": preset_probe.get("num_inference_steps"),
+            "guidance_scale": preset_probe.get("guidance_scale"),
+            "lora_config": preset_probe.get("lora_config"),
+            "geo_config": preset_probe.get("geo_config"),
+            "upscale": preset_probe.get("upscale"),
+            "pipeline_key": "sd35::sd35_sketch_controlnet",
+        },
     }
 
     _write_json(_session_meta_path(session_id), session_meta)
 
     return {
         "status": "ok",
-        "message": "Sketch session created. Presets are locked for this session.",
+        "message": "Sketch session created. Dual-ControlNet sketch routing is locked for this session.",
         "session_id": session_id,
         "session_folder": root,
         "session_meta_path": _session_meta_path(session_id),
@@ -373,25 +416,19 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
 async def upload_sketch_frame(
     image: UploadFile = File(..., description="Sketch frame image (PNG/JPG only)"),
     session_id: str = Form(..., description="Session ID from /start-session"),
-    prompt: str = Form(..., description="Prompt used to generate the right-side image in realtime."),
+    prompt: str = Form(..., description="Prompt for architectural materialization and rendering realism."),
     negative_prompt: Optional[str] = Form(None, description="Optional negative prompt"),
-    strength: float = Form(0.22, ge=0.0, le=1.0, description="Img2img transform strength"),
     category: Optional[Category] = Form(None, description="Optional override category"),
     shot: Optional[Shot] = Form(None, description="Optional override shot"),
     upscale_2x: Optional[bool] = Form(None, description="Optional override upscale"),
     seed: Optional[int] = Form(None, description="Optional override seed"),
 ) -> Dict[str, Any]:
-    """
-    REALTIME:
-    - Stores the sketch frame in the session
-    - Creates a real SD3.5 img2img job folder + meta.json
-    - Dispatches to GPU worker and returns output URL
-    """
     if not image.filename:
         raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
     _ensure_png_jpg_only(image)
 
-    if not prompt or not str(prompt).strip():
+    prompt_clean = _clean_prompt(prompt)
+    if not prompt_clean:
         raise HTTPException(status_code=400, detail="prompt is required for realtime generation.")
 
     meta_path = _session_meta_path(session_id)
@@ -406,10 +443,7 @@ async def upload_sketch_frame(
     if use_seed is None:
         use_seed = int(uuid.uuid4().int % 1_000_000_000)
 
-    if upscale_2x is None:
-        upscale_override = session_meta.get("upscale_2x", None)
-    else:
-        upscale_override = upscale_2x
+    upscale_override = session_meta.get("upscale_2x", None) if upscale_2x is None else upscale_2x
 
     # 1) Save frame into session history
     frames_dir = _frames_dir(session_id)
@@ -421,11 +455,6 @@ async def upload_sketch_frame(
 
     await _save_upload_stream(image, frame_path)
 
-    session_meta["last_frame_index"] = next_idx
-    session_meta["last_frame_filename"] = frame_name
-    session_meta["updated_at"] = _utc_iso()
-    _write_json(meta_path, session_meta)
-
     frame_meta: Dict[str, Any] = {
         "session_id": session_id,
         "frame_index": next_idx,
@@ -434,77 +463,110 @@ async def upload_sketch_frame(
         "category": use_category,
         "shot": use_shot,
         "seed": use_seed,
-        "prompt": prompt,
+        "prompt": prompt_clean,
         "negative_prompt": negative_prompt,
-        "strength": float(strength),
+        "route_mode": "sd35_sketch_controlnet",
     }
     frame_meta_path = os.path.join(frames_dir, f"frame_{next_idx:05d}.json")
     _write_json(frame_meta_path, frame_meta)
 
-    # 2) Create REAL job folder for GPU worker
-    job_folder = _create_job_folder(job_type="sketch_img2img_realtime")
+    session_meta["last_frame_index"] = next_idx
+    session_meta["last_frame_filename"] = frame_name
+    session_meta["updated_at"] = _utc_iso()
+    _write_json(meta_path, session_meta)
+
+    # 2) Create real job folder for this frame
+    job_folder = _create_job_folder(job_type="sd35_sketch_controlnet")
     job_id = os.path.basename(job_folder)
 
-    job_input = os.path.join(job_folder, "input.png")
-    try:
-        with open(frame_path, "rb") as src, open(job_input, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Failed to stage input.png for job: {exc}") from exc
+    sketch_path = os.path.join(job_folder, "sketch.png")
+    shutil.copyfile(frame_path, sketch_path)
 
-    # 3) Write REAL meta.json for the GPU worker to execute
-    job_meta: Dict[str, Any] = {
-        "job_id": job_id,
-        "created_at": _utc_iso(),
-        "type": "img2img",
-        "engine": "sd35_large_pro_v2_1",
-        "model_name": "sd35_large_pro_v2_1",
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "seed": use_seed,
-        "strength": float(strength),
-        "input_image": "input.png",
-        "planned_output_image": "output.png",
-        "category": use_category,
-        "shot": use_shot,
-        "source": {
-            "feature": "sketch",
+    # Compatibility duplicate if any legacy tooling expects input.png to exist.
+    input_path = os.path.join(job_folder, "input.png")
+    try:
+        shutil.copyfile(frame_path, input_path)
+    except Exception:
+        pass
+
+    # 3) Build dedicated sketch-control meta
+    job_meta = _build_sketch_controlnet_meta(
+        job_id=job_id,
+        prompt=prompt_clean,
+        negative_prompt=negative_prompt,
+        category=use_category,
+        shot=use_shot,
+        seed=int(use_seed),
+        upscale_2x=upscale_override,
+        sketch_filename="sketch.png",
+        session_id=session_id,
+        frame_index=next_idx,
+    )
+
+    job_meta["session"] = {
+        "session_id": session_id,
+        "frame_index": next_idx,
+        "frame_filename": frame_name,
+        "frame_meta_filename": os.path.basename(frame_meta_path),
+    }
+
+    job_meta["planner_artifacts"] = {
+        "session_frame_source": os.path.relpath(frame_path).replace("\\", "/"),
+        "copied_into_job_folder": ["sketch.png", "input.png"],
+    }
+
+    job_meta["public_urls"] = _job_public_urls(job_folder)
+
+    meta_path_out = os.path.join(job_folder, "meta.json")
+    _write_json(meta_path_out, job_meta)
+
+    # 4) Dispatch to GPU worker through shared planner client
+    ok, gpu_resp = dispatch_sd35_sketch_controlnet(job_folder=job_folder, meta=job_meta)
+
+    if not ok:
+        try:
+            job_meta["status"] = "gpu_error"
+            job_meta["gpu_error"] = gpu_resp
+            _write_json(meta_path_out, job_meta)
+        except Exception:
+            pass
+
+        return {
+            "status": "gpu_error",
+            "message": "Sketch frame stored but GPU worker failed.",
             "session_id": session_id,
             "frame_index": next_idx,
             "frame_filename": frame_name,
-        },
-        "status": "queued",
-        "mode": "realtime",
-    }
+            "frame_meta_path": frame_meta_path,
+            "job_folder": job_folder,
+            "job_id": job_id,
+            "meta_path": meta_path_out,
+            "public_urls": _job_public_urls(job_folder),
+            "gpu_error": gpu_resp,
+            "pipeline_key": "sd35::sd35_sketch_controlnet",
+            "controlnet_mode": "canny+depth",
+        }
 
-    apply_preset_to_meta(job_meta, category=use_category, shot=use_shot, upscale_2x=upscale_override)
+    try:
+        job_meta["status"] = "dispatched"
+        job_meta["gpu_response"] = gpu_resp
+        _write_json(meta_path_out, job_meta)
+    except Exception:
+        pass
 
-    # Preserve the actual img2img strength after preset application.
-    job_meta["strength"] = float(strength)
-
-    job_meta_path = os.path.join(job_folder, "meta.json")
-    _write_json(job_meta_path, job_meta)
-
-    # 4) Dispatch to GPU worker and wait for completion
-    dispatch_result = _dispatch_to_gpu(job_folder=job_folder, timeout_s=GPU_TIMEOUT_SECONDS)
-
-    # 5) Return stable public URLs for Wix UI
-    public = _job_public_urls(job_folder)
-
+    # 5) Return
     return {
-        "status": "ok",
-        "message": "Frame stored and SD3.5 img2img executed in realtime.",
+        "status": "dispatched",
+        "message": "Sketch frame stored and dispatched as a dedicated SD3.5 dual-ControlNet sketch job.",
         "session_id": session_id,
         "frame_index": next_idx,
-        "frame_path": frame_path,
+        "frame_filename": frame_name,
         "frame_meta_path": frame_meta_path,
-        "job_id": job_id,
         "job_folder": job_folder,
-        "job_meta_path": job_meta_path,
-        "public_urls": public,
-        "dispatch": dispatch_result,
-        "category_used": use_category,
-        "shot_used": use_shot,
-        "preset_applied": job_meta.get("preset", {}),
-        "upscale_enabled": bool(isinstance(job_meta.get("upscale"), dict) and job_meta["upscale"].get("enabled", False)),
+        "job_id": job_id,
+        "meta_path": meta_path_out,
+        "public_urls": _job_public_urls(job_folder),
+        "gpu_response": gpu_resp,
+        "pipeline_key": "sd35::sd35_sketch_controlnet",
+        "controlnet_mode": "canny+depth",
     }

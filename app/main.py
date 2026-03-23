@@ -32,6 +32,13 @@ IMPORTANT:
 - This is the PLANNER service.
 - It must NOT expose the GPU worker's /api/gpu/dispatch route.
 - That route belongs to the separate GPU worker service.
+
+SKETCH PIPELINE NOTE:
+- Sketch routing is planner-side only.
+- Real sketch execution happens on the GPU worker through dedicated dispatch.
+- Sketch mode is no longer intended to be plain img2img.
+- The intended GPU job path is:
+    sketch -> canny + depth -> SD3.5 dual ControlNet -> output
 """
 
 from __future__ import annotations
@@ -208,7 +215,7 @@ app = FastAPI(
         "This is NOT client-facing. Wix UI will be client-facing. "
         "All endpoints (except /api/health) require HMAC authentication."
     ),
-    version="0.2.2",
+    version="0.3.0",
 )
 
 # Serve outputs so /outputs/... URLs work
@@ -308,6 +315,7 @@ async def hmac_auth_middleware(request: Request, call_next):
 # Attach routers
 # ---------------------------------------------------------------------------
 
+# Planner / orchestration routes
 app.include_router(plan.router)
 app.include_router(text2img.router)
 app.include_router(img2img.router)
@@ -324,7 +332,7 @@ app.include_router(floorplan.router)
 app.include_router(sketch.router)
 app.include_router(pipeline.router)
 
-# REAL via GPU dispatch
+# Real generation routes that dispatch to GPU worker
 app.include_router(cad.router)
 app.include_router(mesh_from_image.router)
 app.include_router(video_between_frames.router)

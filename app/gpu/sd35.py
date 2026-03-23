@@ -13,7 +13,7 @@ from runtime.sd35_runtime import SD35Runtime
 # Planner/routers remain the real source of truth and should write
 # steps / cfg / width / height / upscale into meta/payload explicitly.
 #
-# IMPORTANT FOR IMG2IMG:
+# IMPORTANT FOR IMG2IMG / SKETCH:
 # - These width/height values are DEFAULT compatibility fallbacks only.
 # - They must NOT silently override planner/runtime aspect-preservation logic.
 PROFILES = {
@@ -160,7 +160,7 @@ def _merge_profile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     IMPORTANT:
     - Planner remains source of truth.
     - These are compatibility fallbacks only.
-    - Img2img aspect-ratio preservation flags from planner must survive unchanged.
+    - Img2img/sketch aspect-ratio preservation flags from planner must survive unchanged.
     """
     merged = dict(payload)
     profile = str(payload.get("profile") or "r1_wide_hero").strip()
@@ -174,7 +174,6 @@ def _merge_profile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "upscale" not in merged and isinstance(p.get("upscale"), dict):
         merged["upscale"] = dict(p["upscale"])
 
-    # Helpful traceability when planner omitted preset metadata.
     merged.setdefault(
         "preset_resolution",
         {
@@ -190,11 +189,11 @@ def _merge_profile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_input_image(job_folder: str, payload: Dict[str, Any]) -> str:
     """
-    Ensure img2img input_image resolves correctly.
+    Ensure img2img/sketch input_image resolves correctly.
     """
     inp = payload.get("input_image")
     if not inp:
-        raise ValueError("Missing 'input_image' for sd35_img2img")
+        raise ValueError("Missing 'input_image' in payload.")
 
     inp_path = Path(str(inp))
     if not inp_path.is_absolute():
@@ -210,13 +209,13 @@ def _read_image_size(path: str) -> Tuple[int, int]:
     try:
         from PIL import Image  # type: ignore
     except Exception as exc:
-        raise RuntimeError(f"PIL is required to inspect img2img input size: {exc}") from exc
+        raise RuntimeError(f"PIL is required to inspect input size: {exc}") from exc
 
     try:
         with Image.open(path) as im:
             return int(im.width), int(im.height)
     except Exception as exc:
-        raise RuntimeError(f"Failed reading img2img input size from {path}: {exc}") from exc
+        raise RuntimeError(f"Failed reading input size from {path}: {exc}") from exc
 
 
 def _build_runtime_meta_for_text2img(job_folder: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -272,8 +271,6 @@ def _build_runtime_meta_for_img2img(job_folder: str, payload: Dict[str, Any]) ->
         except Exception:
             pass
 
-    # Planner-level aspect-ratio metadata should survive.
-    # If older callers omitted these fields, set safe compatibility defaults.
     meta.setdefault("input_width", int(input_w))
     meta.setdefault("input_height", int(input_h))
     meta.setdefault(
@@ -281,10 +278,86 @@ def _build_runtime_meta_for_img2img(job_folder: str, payload: Dict[str, Any]) ->
         float(input_w) / float(input_h) if input_h else None,
     )
 
-    # If caller did not explicitly supply dimensions, preserve source aspect.
-    # This is the compatibility-safe default for img2img.
     meta.setdefault("explicit_dimensions", False)
     meta.setdefault("preserve_input_aspect_ratio", not bool(meta.get("explicit_dimensions", False)))
+
+    return meta
+
+
+def _build_runtime_meta_for_sketch_controlnet(job_folder: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build runtime meta for the dedicated sketch route.
+
+    DESIGN LOCK:
+    - This is NOT plain img2img.
+    - Structure comes from dual ControlNet conditioning:
+        sketch -> cleanup -> canny + depth -> SD3.5 Large
+    - Prompt should mainly carry materials / lighting / realism.
+    """
+    meta = _merge_profile_defaults(payload)
+
+    prompt = str(meta.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("Missing 'prompt' for sd35_sketch_controlnet")
+
+    input_path = _normalize_input_image(job_folder, meta)
+    input_w, input_h = _read_image_size(input_path)
+
+    meta["type"] = "controlnet"
+    meta["job_folder"] = job_folder
+    meta["prompt"] = prompt
+    meta["input_image"] = input_path
+    meta["sketch_image"] = input_path
+
+    negative = str(meta.get("negative_prompt") or "").strip()
+    if negative:
+        meta["negative_prompt"] = negative
+
+    meta.setdefault("input_width", int(input_w))
+    meta.setdefault("input_height", int(input_h))
+    meta.setdefault(
+        "input_aspect_ratio",
+        float(input_w) / float(input_h) if input_h else None,
+    )
+
+    meta.setdefault("explicit_dimensions", False)
+    meta.setdefault("preserve_input_aspect_ratio", not bool(meta.get("explicit_dimensions", False)))
+
+    controlnet_cfg = meta.get("controlnet")
+    if not isinstance(controlnet_cfg, dict):
+        raise ValueError("sd35_sketch_controlnet requires a valid 'controlnet' config object.")
+
+    if not bool(controlnet_cfg.get("enabled")):
+        raise ValueError("sd35_sketch_controlnet requires controlnet.enabled = true.")
+
+    controls = controlnet_cfg.get("controls")
+    if not isinstance(controls, list) or len(controls) < 2:
+        raise ValueError("sd35_sketch_controlnet requires at least two controls: canny and depth.")
+
+    seen = {
+        str(c.get("control_type", "")).strip().lower()
+        for c in controls
+        if isinstance(c, dict)
+    }
+    if "canny" not in seen or "depth" not in seen:
+        raise ValueError("sd35_sketch_controlnet requires both canny and depth controls.")
+
+    meta.setdefault("planned_output_image", "output.png")
+
+    outputs = meta.get("outputs")
+    if not isinstance(outputs, dict):
+        outputs = {}
+        meta["outputs"] = outputs
+
+    outputs.setdefault("sketch_image", "sketch.png")
+    outputs.setdefault("canny_image", "canny.png")
+    outputs.setdefault("depth_image", "depth.png")
+    outputs.setdefault("final_image", "output.png")
+
+    optional_polish = meta.get("optional_polish")
+    if not isinstance(optional_polish, dict):
+        optional_polish = {"enabled": False, "type": "none"}
+        meta["optional_polish"] = optional_polish
 
     return meta
 
@@ -325,3 +398,49 @@ def run_sd35_img2img(job: Any, payload: Dict[str, Any]) -> str:
     result_meta = runtime.generate_img2img(job_folder, meta)
     out_name = str(result_meta.get("output_image") or "output.png")
     return os.path.join(job_folder, out_name)
+
+
+def run_sd35_sketch_controlnet(job: Any, payload: Dict[str, Any]) -> Dict[str, str]:
+    """
+    DISPATCH CONTRACT:
+      - payload.job_folder (ABSOLUTE) is the target directory
+      - payload.input_image / sketch.png must exist
+      - returns a DICT with real artifact paths:
+            {
+                "canny_png": ".../canny.png",
+                "depth_png": ".../depth.png",
+                "output_png": ".../output.png",
+                optional "final_up2x_png": ".../final_up2x.png"
+            }
+
+    IMPORTANT:
+      - This expects SD35Runtime to implement:
+            generate_sketch_controlnet(job_folder, meta) -> dict
+      - That runtime method must:
+            1) create sketch cleanup artifacts as needed
+            2) create canny.png
+            3) create depth.png
+            4) run SD3.5 Large with dual ControlNet
+            5) save output.png
+    """
+    job_folder = _job_folder_from_payload(payload)
+    runtime = _get_runtime()
+    meta = _build_runtime_meta_for_sketch_controlnet(job_folder, payload)
+
+    result_meta = runtime.generate_sketch_controlnet(job_folder, meta)
+
+    canny_name = str(result_meta.get("canny_image") or "canny.png")
+    depth_name = str(result_meta.get("depth_image") or "depth.png")
+    output_name = str(result_meta.get("output_image") or "output.png")
+
+    result: Dict[str, str] = {
+        "canny_png": os.path.join(job_folder, canny_name),
+        "depth_png": os.path.join(job_folder, depth_name),
+        "output_png": os.path.join(job_folder, output_name),
+    }
+
+    up2x_name = result_meta.get("final_up2x_image")
+    if isinstance(up2x_name, str) and up2x_name.strip():
+        result["final_up2x_png"] = os.path.join(job_folder, up2x_name)
+
+    return result

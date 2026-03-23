@@ -1,43 +1,74 @@
 # =====================================================
-# RENDEREXPO AI STUDIO - Backend Requirements (Windows)
-# FINAL STABLE VERSION (NO CONFLICTS)
+# RENDEREXPO AI STUDIO - Backend Requirements (LINUX / RUNPOD)
+# SD3.5 + DUAL CONTROLNET SKETCH ROUTE
 # =====================================================
 
-# --- Web framework ---
+# -----------------------------------------------------
+# Web framework
+# -----------------------------------------------------
 fastapi==0.109.2
 uvicorn[standard]==0.29.0
 starlette==0.36.3
 
-# --- Core types & utils ---
+# -----------------------------------------------------
+# Core types & utils
+# -----------------------------------------------------
 pydantic==2.12.4
 typing-extensions==4.14.1
 tqdm==4.67.1
 python-dotenv==1.0.1
 
-# =====================================================
-#  ML STACK (WINDOWS-COMPATIBLE)
-# =====================================================
+# -----------------------------------------------------
+# ML stack
+# -----------------------------------------------------
 torch==2.2.2
 torchvision==0.17.2
 torchaudio==2.2.2
 
-# =====================================================
-#  Diffusion Ecosystem
-# =====================================================
-diffusers==0.27.2
-transformers==4.39.3
-accelerate==0.28.0
-safetensors==0.4.2
-huggingface_hub==0.23.0
+# -----------------------------------------------------
+# Diffusion ecosystem
+# IMPORTANT:
+# - Upgraded diffusers for SD3 / SD3.5 ControlNet support
+# - Keep transformers + accelerate aligned
+# -----------------------------------------------------
+diffusers==0.35.1
+transformers==4.49.0
+accelerate==1.1.1
+safetensors==0.4.5
+huggingface_hub==0.27.1
 
-# =====================================================
-#  Image / CV Essentials
-# =====================================================
-Pillow==10.2.0
-opencv-python==4.9.0.80
+# -----------------------------------------------------
+# Image / CV essentials
+# Use headless OpenCV on RunPod / server environments
+# -----------------------------------------------------
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
 
-# =====================================================
-#  Extra utilities (MiDaS, ControlNet, ESRGAN depend on these)
-# =====================================================
-einops==0.7.0
-timm==0.9.16
+# -----------------------------------------------------
+# Extra utilities
+# Needed by depth preprocessing and model helpers
+# -----------------------------------------------------
+einops==0.8.0
+timm==1.0.11
+numpy==1.26.4
+scipy==1.13.1
+
+# -----------------------------------------------------
+# Depth preprocessing support
+# Used for MiDaS / DPT depth route in sketch mode
+# -----------------------------------------------------
+sentencepiece==0.2.0
+protobuf==5.29.3
+
+# -----------------------------------------------------
+# Optional performance helpers
+# Safe to install on Linux GPU environments
+# -----------------------------------------------------
+xformers==0.0.25.post1
+
+# -----------------------------------------------------
+# LyCORIS runtime support
+# Your code imports: lycoris.kohya
+# Install directly from the official repo for reliability
+# -----------------------------------------------------
+git+https://github.com/KohakuBlueleaf/LyCORIS.git

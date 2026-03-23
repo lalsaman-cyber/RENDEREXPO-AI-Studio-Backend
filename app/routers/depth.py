@@ -19,6 +19,13 @@ IMPORTANT:
 - GPU worker = port 8002
 - This router must NOT introduce diffusion denoise.
 - This router may store preset context so downstream SD3.5 stages stay aligned.
+
+IMPORTANT DISTINCTION:
+- This router is for standalone planned depth jobs.
+- It is NOT the runtime sketch-depth preprocessing path.
+- Sketch depth preprocessing now belongs to the GPU/runtime side and is executed
+  as part of:
+      sketch -> canny + depth -> SD3.5 dual ControlNet -> output
 """
 
 from __future__ import annotations
@@ -101,6 +108,8 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
     return {
         "input_url": f"{base}/input.png",
         "meta_url": f"{base}/meta.json",
+        "planned_depth_url": f"{base}/depth.png",
+        "planned_vis_url": f"{base}/depth_vis.png",
     }
 
 
@@ -157,6 +166,10 @@ async def plan_depth_map(
         "png",
         description="Planned output format for depth (planning only). Allowed: png/exr/npy",
     ),
+    attach_sd35_context: bool = Form(
+        True,
+        description="If true, attach locked SD3.5 preset context when category+shot are provided.",
+    ),
 ) -> Dict[str, Any]:
     """
     Plan a depth map job (planning only).
@@ -165,6 +178,11 @@ async def plan_depth_map(
     - outputs/YYYY-MM-DD/<job_id>/
       - input.png
       - meta.json
+
+    Does NOT create:
+    - real depth output
+    - GPU inference
+    - diffusion output
     """
     if not image.filename:
         raise HTTPException(status_code=400, detail="Uploaded image has no filename.")
@@ -206,6 +224,7 @@ async def plan_depth_map(
         "job_id": job_id,
         "created_at": _utc_iso(),
         "type": "depth_plan",
+        "job_type": "depth_plan",
         "status": "planned",
         "mode_runtime": "plan-only",
         "engine": "sd35_large_pro_v2_1",
@@ -231,11 +250,17 @@ async def plan_depth_map(
         "runtime_notes": {
             "gpu_required_later": True,
             "inference_not_implemented_here": True,
+            "sketch_runtime_depth_is_separate": True,
+            "note": (
+                "Standalone depth planning route only. "
+                "Sketch-mode depth preprocessing is executed separately inside the GPU sketch ControlNet runtime."
+            ),
         },
     }
 
     # Optional: attach preset context for downstream SD3.5 stages
-    if category is not None and shot is not None:
+    preset_context_attached = False
+    if attach_sd35_context and category is not None and shot is not None:
         meta["preset_context"] = {
             "category": category,
             "shot": shot,
@@ -248,12 +273,15 @@ async def plan_depth_map(
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"Preset error: {exc}") from exc
 
+        preset_context_attached = True
+
     _write_meta(job_folder, meta)
 
     return {
         "status": "ok",
         "message": "Depth map planned (planning only).",
         "job_folder": job_folder,
+        "job_id": job_id,
         "input_saved_as": input_path,
         "meta_path": _meta_path(job_folder),
         "public_urls": _outputs_public_urls(job_folder),
@@ -261,5 +289,6 @@ async def plan_depth_map(
             "depth": os.path.join(job_folder, planned_depth_name),
             "vis": os.path.join(job_folder, planned_vis_name),
         },
-        "preset_context_attached": bool(category is not None and shot is not None),
+        "preset_context_attached": preset_context_attached,
+        "note": "No depth inference was executed by this route.",
     }

@@ -2,7 +2,7 @@
 """
 RENDEREXPO AI STUDIO - GPU Dispatch Handler (REAL, Production)
 
-Purpose:
+FINAL PURPOSE:
 - Accept dispatch requests from the planner service.
 - Route each job to the correct REAL GPU/local implementation that actually exists in this repo.
 - Run jobs in background threads.
@@ -12,7 +12,15 @@ Purpose:
 IMPORTANT:
 - job_folder must be an ABSOLUTE path on the GPU worker filesystem.
 - meta.json inside job_folder is the disk source of truth.
-- This version only imports modules that actually exist in your repository.
+
+LOCKED SKETCH RULE:
+- Dedicated sketch route:
+    job_type = "sd35_sketch_controlnet"
+    pipeline_key = "sd35::sd35_sketch_controlnet"
+
+That route is NOT plain img2img.
+It must run:
+    sketch.png -> cleanup -> canny.png + depth.png -> SD3.5 Large dual ControlNet -> output.png
 """
 
 from __future__ import annotations
@@ -32,7 +40,11 @@ from pydantic import BaseModel, Field
 # REAL runners that exist in this repo
 from app.gpu.cad.from_image import run_cad_from_image
 from app.gpu.mesh.from_image import run_mesh_from_image
-from app.gpu.sd35 import run_sd35_img2img, run_sd35_txt2img
+from app.gpu.sd35 import (
+    run_sd35_img2img,
+    run_sd35_sketch_controlnet,
+    run_sd35_txt2img,
+)
 from app.gpu.upscale import run_upscale_2x
 from app.gpu.video.between_frames import run_video_between_frames
 from app.gpu.video.from_image import run_video_from_image
@@ -48,6 +60,7 @@ JobType = Literal[
     "sd35_txt2img",
     "sd35_text2img",
     "sd35_img2img",
+    "sd35_sketch_controlnet",
     "upscale_2x",
     "vr_reconstruct",
     "video_from_image",
@@ -174,6 +187,9 @@ def _route_key(job_type: str, vr_mode: Optional[str], pipeline_key: Optional[str
     if job_type == "sd35_img2img":
         return "sd35::img2img"
 
+    if job_type == "sd35_sketch_controlnet":
+        return "sd35::sd35_sketch_controlnet"
+
     if job_type == "upscale_2x":
         return "upscale::2x"
 
@@ -284,7 +300,13 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
         with lock:
             meta = _read_meta(job_folder)
 
-        if job_type in ("sd35_txt2img", "sd35_text2img", "sd35_img2img", "upscale_2x"):
+        if job_type in (
+            "sd35_txt2img",
+            "sd35_text2img",
+            "sd35_img2img",
+            "sd35_sketch_controlnet",
+            "upscale_2x",
+        ):
             with lock:
                 _enforce_locked_multipliers(meta)
                 _write_meta(job_folder, meta)
@@ -324,6 +346,51 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             )
             _assert_artifact_exists(result_path, "SD35 img2img")
             result = {"refine_png": result_path, "input_image": input_path}
+
+        elif job_type == "sd35_sketch_controlnet":
+            prompt = meta.get("prompt")
+            if not prompt or not isinstance(prompt, str):
+                raise RuntimeError("sd35_sketch_controlnet requires meta.prompt (string).")
+
+            sketch_input = None
+            for n in ("sketch.png", "input.png", "image.png"):
+                p = os.path.join(job_folder, n)
+                if os.path.isfile(p):
+                    sketch_input = p
+                    break
+            if not sketch_input:
+                raise RuntimeError(
+                    "sd35_sketch_controlnet requires one of: sketch.png, input.png, image.png inside job_folder."
+                )
+
+            payload = {**meta, "job_folder": job_folder, "input_image": sketch_input}
+            result_obj = run_sd35_sketch_controlnet(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload=payload,
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("SD35 sketch controlnet runner must return a dict.")
+
+            canny_path = result_obj.get("canny_png")
+            depth_path = result_obj.get("depth_png")
+            output_path = result_obj.get("output_png")
+
+            _assert_artifact_exists(canny_path, "Sketch ControlNet Canny preprocess")
+            _assert_artifact_exists(depth_path, "Sketch ControlNet Depth preprocess")
+            _assert_artifact_exists(output_path, "Sketch ControlNet final output")
+
+            result = {
+                "input_image": sketch_input,
+                "canny_png": canny_path,
+                "depth_png": depth_path,
+                "output_png": output_path,
+            }
+
+            optional_upscaled = result_obj.get("final_up2x_png")
+            if optional_upscaled:
+                _assert_artifact_exists(optional_upscaled, "Sketch ControlNet optional upscale")
+                result["final_up2x_png"] = optional_upscaled
 
         elif job_type == "upscale_2x":
             inp = None
@@ -467,6 +534,50 @@ async def dispatch(request: GPUDispatchRequest):
                 status_code=400,
                 detail="sd35_img2img requires one of: ref_input.png, input.png, image.png, output.png in job_folder.",
             )
+        try:
+            _enforce_locked_multipliers(merged_meta)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    if request.job_type == "sd35_sketch_controlnet":
+        if not merged_meta.get("prompt"):
+            raise HTTPException(status_code=400, detail="sd35_sketch_controlnet requires meta.prompt (string).")
+
+        has_input = any(
+            os.path.isfile(os.path.join(request.job_folder, n))
+            for n in ("sketch.png", "input.png", "image.png")
+        )
+        if not has_input:
+            raise HTTPException(
+                status_code=400,
+                detail="sd35_sketch_controlnet requires one of: sketch.png, input.png, image.png in job_folder.",
+            )
+
+        controlnet_cfg = merged_meta.get("controlnet")
+        if not isinstance(controlnet_cfg, dict) or not controlnet_cfg.get("enabled"):
+            raise HTTPException(
+                status_code=400,
+                detail="sd35_sketch_controlnet requires meta.controlnet.enabled = true.",
+            )
+
+        controls = controlnet_cfg.get("controls")
+        if not isinstance(controls, list) or len(controls) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="sd35_sketch_controlnet requires at least two controls: canny and depth.",
+            )
+
+        control_types = {
+            str(c.get("control_type", "")).strip().lower()
+            for c in controls
+            if isinstance(c, dict)
+        }
+        if "canny" not in control_types or "depth" not in control_types:
+            raise HTTPException(
+                status_code=400,
+                detail="sd35_sketch_controlnet requires both canny and depth controls in meta.controlnet.controls.",
+            )
+
         try:
             _enforce_locked_multipliers(merged_meta)
         except Exception as e:

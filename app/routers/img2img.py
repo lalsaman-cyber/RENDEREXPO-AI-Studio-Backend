@@ -35,6 +35,12 @@ RENDEREXPO img2img ratio rule:
 - Because presets currently inject default resolution, planner marks whether
   dimensions were explicitly supplied by caller or just inherited from defaults.
 - Runtime uses that signal to auto-follow source aspect when appropriate.
+
+CRITICAL SKETCH RULE:
+- This router is NOT the primary route for architectural sketch-to-render.
+- Sketch mode must use the dedicated sketch planner/router and dispatch to:
+    sd35_sketch_controlnet
+- Do NOT try to solve sketch structure through plain img2img here.
 """
 
 from __future__ import annotations
