@@ -518,7 +518,16 @@ async def upload_sketch_frame(
     job_meta["public_urls"] = _job_public_urls(job_folder)
 
     meta_path_out = os.path.join(job_folder, "meta.json")
+    job_meta["disable_adapters"] = True
+    job_meta["use_depth_control"] = False
+    try:
+        job_meta["controlnet"]["use_depth_control"] = False
+        controls = job_meta["controlnet"].get("controls", [])
+        job_meta["controlnet"]["controls"] = [c for c in controls if c.get("control_type") != "depth"]
+    except Exception:
+        pass
     _write_json(meta_path_out, job_meta)
+
 
     # 4) Dispatch to GPU worker through shared planner client
     ok, gpu_resp = dispatch_sd35_sketch_controlnet(job_folder=job_folder, meta=job_meta)

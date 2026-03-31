@@ -429,6 +429,13 @@ class SD35Runtime:
         """
         Apply LyCORIS (PRO 2.1) + GEO adapters using LyCORIS kohya runtime.
         """
+        if bool(meta.get("disable_adapters", False)):
+            self._safe_unload_adapters()
+            meta["adapters_applied"] = False
+            meta["adapters_reason"] = "disabled_by_meta"
+            meta["adapters"] = []
+            return
+
         if self.pipe is None:
             raise RuntimeError("Cannot apply adapters because SD35Runtime is not loaded.")
 

@@ -331,16 +331,16 @@ def _build_runtime_meta_for_sketch_controlnet(job_folder: str, payload: Dict[str
         raise ValueError("sd35_sketch_controlnet requires controlnet.enabled = true.")
 
     controls = controlnet_cfg.get("controls")
-    if not isinstance(controls, list) or len(controls) < 2:
-        raise ValueError("sd35_sketch_controlnet requires at least two controls: canny and depth.")
+    if not isinstance(controls, list) or len(controls) < 1:
+        raise ValueError("sd35_sketch_controlnet requires at least one control: canny.")
 
     seen = {
         str(c.get("control_type", "")).strip().lower()
         for c in controls
         if isinstance(c, dict)
     }
-    if "canny" not in seen or "depth" not in seen:
-        raise ValueError("sd35_sketch_controlnet requires both canny and depth controls.")
+    if "canny" not in seen:
+        raise ValueError("sd35_sketch_controlnet requires a canny control.")
 
     meta.setdefault("planned_output_image", "output.png")
 
@@ -426,6 +426,12 @@ def run_sd35_sketch_controlnet(job: Any, payload: Dict[str, Any]) -> Dict[str, s
     job_folder = _job_folder_from_payload(payload)
     runtime = _get_runtime()
     meta = _build_runtime_meta_for_sketch_controlnet(job_folder, payload)
+
+    # Production-safe sketch route:
+    # - disable LyCORIS / GEO adapters
+    # - make depth optional/off by default
+    meta["disable_adapters"] = True
+    meta["use_depth_control"] = False
 
     result_meta = runtime.generate_sketch_controlnet(job_folder, meta)
 
