@@ -119,8 +119,26 @@ def _read_meta(job_folder: str) -> Dict[str, Any]:
     p = _meta_path(job_folder)
     if not os.path.isfile(p):
         return {}
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+    last_exc: Optional[Exception] = None
+    for _ in range(10):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                raw = f.read()
+
+            if not raw.strip():
+                time.sleep(0.05)
+                continue
+
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            time.sleep(0.05)
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.05)
+
+    raise RuntimeError(f"Failed reading valid meta.json after retries: {p} :: {last_exc}")
 
 
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
@@ -375,17 +393,21 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             canny_path = result_obj.get("canny_png")
             depth_path = result_obj.get("depth_png")
             output_path = result_obj.get("output_png")
+            use_depth_control = bool(result_obj.get("use_depth_control", meta.get("use_depth_control", False)))
 
             _assert_artifact_exists(canny_path, "Sketch ControlNet Canny preprocess")
-            _assert_artifact_exists(depth_path, "Sketch ControlNet Depth preprocess")
+            if use_depth_control:
+                _assert_artifact_exists(depth_path, "Sketch ControlNet Depth preprocess")
             _assert_artifact_exists(output_path, "Sketch ControlNet final output")
 
             result = {
                 "input_image": sketch_input,
                 "canny_png": canny_path,
-                "depth_png": depth_path,
                 "output_png": output_path,
+                "use_depth_control": use_depth_control,
             }
+            if use_depth_control and depth_path:
+                result["depth_png"] = depth_path
 
             optional_upscaled = result_obj.get("final_up2x_png")
             if optional_upscaled:
@@ -435,6 +457,13 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
 
         with lock:
             meta2 = _read_meta(job_folder) or meta
+
+            # Preserve runtime-returned metadata for jobs that return a full meta dict.
+            if job_type == "sd35_sketch_controlnet" and isinstance(result_obj, dict):
+                merged_meta = dict(meta2)
+                merged_meta.update(result_obj)
+                meta2 = merged_meta
+
             meta2["status"] = "completed"
             meta2.setdefault("dispatch", {})
             _safe_set(meta2, "dispatch.completed_at_epoch", _now_epoch())
@@ -561,10 +590,10 @@ async def dispatch(request: GPUDispatchRequest):
             )
 
         controls = controlnet_cfg.get("controls")
-        if not isinstance(controls, list) or len(controls) < 2:
+        if not isinstance(controls, list) or len(controls) < 1:
             raise HTTPException(
                 status_code=400,
-                detail="sd35_sketch_controlnet requires at least two controls: canny and depth.",
+                detail="sd35_sketch_controlnet requires at least one control: canny.",
             )
 
         control_types = {
@@ -572,10 +601,18 @@ async def dispatch(request: GPUDispatchRequest):
             for c in controls
             if isinstance(c, dict)
         }
-        if "canny" not in control_types or "depth" not in control_types:
+        if "canny" not in control_types:
             raise HTTPException(
                 status_code=400,
-                detail="sd35_sketch_controlnet requires both canny and depth controls in meta.controlnet.controls.",
+                detail="sd35_sketch_controlnet requires a canny control in meta.controlnet.controls.",
+            )
+
+        use_depth_control = bool(merged_meta.get("use_depth_control", False))
+        merged_meta["use_depth_control"] = use_depth_control
+        if use_depth_control and "depth" not in control_types:
+            raise HTTPException(
+                status_code=400,
+                detail="meta.use_depth_control=true requires a depth control in meta.controlnet.controls.",
             )
 
         try:

@@ -47,8 +47,10 @@ NEW SKETCH RULE:
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -113,6 +115,7 @@ class SD35Runtime:
 
         self.pipe: Optional[Any] = None
         self._sketch_pipe: Optional[Any] = None
+        self._sketch_pipe_dual: Optional[Any] = None
         self._torch: Optional[Any] = None
         self._np: Optional[Any] = None
         self._loaded: bool = False
@@ -231,6 +234,7 @@ class SD35Runtime:
         self._active_adapters = ()
         self.pipe = None
         self._sketch_pipe = None
+        self._sketch_pipe_dual = None
         self._depth_image_processor = None
         self._depth_model = None
         self._loaded = False
@@ -242,6 +246,52 @@ class SD35Runtime:
                 pass
 
         logger.info("SD35Runtime unloaded.")
+
+    def _job_meta_path(self, job_folder: str) -> str:
+        return os.path.join(job_folder, "meta.json")
+
+    def _atomic_write_job_meta(self, job_folder: str, data: Dict[str, Any]) -> None:
+        path = self._job_meta_path(job_folder)
+        parent = os.path.dirname(path) or job_folder
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="meta_runtime_", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def _stage_meta_writer(self, job_folder: str, base_meta: Dict[str, Any]):
+        def _writer(stage: str, patch: Dict[str, Any]) -> None:
+            merged = dict(base_meta)
+            try:
+                path = self._job_meta_path(job_folder)
+                if os.path.isfile(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        raw = f.read().strip()
+                    if raw:
+                        disk_meta = json.loads(raw)
+                        if isinstance(disk_meta, dict):
+                            merged.update(disk_meta)
+            except Exception:
+                pass
+
+            merged.update(base_meta)
+            merged.setdefault("dispatch", {})
+            merged["status"] = "running"
+            merged["sketch_stage"] = stage
+            merged["sketch_stage_detail"] = patch
+            merged.update(patch)
+            self._atomic_write_job_meta(job_folder, merged)
+
+        return _writer
 
     # ------------------------------------------------------------------
     # Adapter (LyCORIS + GEO) handling
@@ -817,12 +867,13 @@ class SD35Runtime:
     # Sketch / ControlNet helpers
     # ------------------------------------------------------------------
 
-    def _load_sketch_pipe(self) -> Any:
+    def _load_sketch_pipe(self, use_depth_control: bool = False) -> Any:
         """
-        Lazy-load dedicated SD3.5 dual-ControlNet pipeline.
+        Lazy-load dedicated SD3.5 ControlNet pipeline.
 
-        This is intentionally separate from base text2img/img2img execution
-        because sketch mode requires official SD3.5 ControlNet models.
+        Production rule for now:
+        - Canny-only is the default presentable path.
+        - Dual Canny+Depth is opt-in via meta.use_depth_control = true.
         """
         if self.mode != "real":
             raise RuntimeError("Sketch ControlNet runtime requested in non-real mode.")
@@ -830,14 +881,16 @@ class SD35Runtime:
         if self._torch is None:
             raise RuntimeError("Torch is unavailable; SD35Runtime base load must happen first.")
 
-        if self._sketch_pipe is not None:
+        if use_depth_control and self._sketch_pipe_dual is not None:
+            return self._sketch_pipe_dual
+        if not use_depth_control and self._sketch_pipe is not None:
             return self._sketch_pipe
 
         if not os.path.isdir(self.model_path):
             raise RuntimeError(f"Base SD3.5 model path missing: {self.model_path}")
         if not os.path.isdir(self.controlnet_canny_path):
             raise RuntimeError(f"SD3.5 ControlNet Canny path missing: {self.controlnet_canny_path}")
-        if not os.path.isdir(self.controlnet_depth_path):
+        if use_depth_control and not os.path.isdir(self.controlnet_depth_path):
             raise RuntimeError(f"SD3.5 ControlNet Depth path missing: {self.controlnet_depth_path}")
 
         try:
@@ -850,9 +903,10 @@ class SD35Runtime:
         torch = self._torch
 
         logger.info(
-            "Loading SD3.5 sketch ControlNet pipeline base=%s canny=%s depth=%s",
+            "Loading SD3.5 sketch ControlNet pipeline base=%s canny=%s depth_enabled=%s depth=%s",
             self.model_path,
             self.controlnet_canny_path,
+            bool(use_depth_control),
             self.controlnet_depth_path,
         )
 
@@ -860,14 +914,17 @@ class SD35Runtime:
             self.controlnet_canny_path,
             torch_dtype=torch.float16,
         )
-        depth_cn = SD3ControlNetModel.from_pretrained(
-            self.controlnet_depth_path,
-            torch_dtype=torch.float16,
-        )
+        controlnets: Any = [canny_cn]
+        if use_depth_control:
+            depth_cn = SD3ControlNetModel.from_pretrained(
+                self.controlnet_depth_path,
+                torch_dtype=torch.float16,
+            )
+            controlnets.append(depth_cn)
 
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
             self.model_path,
-            controlnet=[canny_cn, depth_cn],
+            controlnet=controlnets[0] if len(controlnets) == 1 else controlnets,
             torch_dtype=torch.float16,
         )
 
@@ -884,8 +941,11 @@ class SD35Runtime:
         else:
             pipe = pipe.to(self.device)
 
-        self._sketch_pipe = pipe
-        logger.info("Loaded SD3.5 sketch ControlNet pipeline.")
+        if use_depth_control:
+            self._sketch_pipe_dual = pipe
+        else:
+            self._sketch_pipe = pipe
+        logger.info("Loaded SD3.5 sketch ControlNet pipeline. use_depth_control=%s", bool(use_depth_control))
         return pipe
 
     def _get_depth_estimator(self) -> Tuple[Any, Any]:
@@ -930,8 +990,44 @@ class SD35Runtime:
     ) -> Tuple[int, int, bool]:
         """
         For sketch mode, preserve the uploaded sketch aspect ratio unless explicit dimensions are requested.
+
+        IMPORTANT:
+        - Unlike generic img2img, sketch mode should work as close to the original uploaded
+          frame size as practical, rounded down to multiples of 64.
+        - Final delivery will still return to the exact input size.
         """
-        return self._resolve_img2img_target_size(meta, input_size)
+        iw, ih = input_size
+        if iw <= 0 or ih <= 0:
+            raise RuntimeError(f"Invalid sketch input size: {iw}x{ih}")
+
+        explicit_flag = bool(meta.get("explicit_dimensions", False))
+        raw_w = meta.get("width", iw)
+        raw_h = meta.get("height", ih)
+
+        try:
+            req_w = int(raw_w)
+        except Exception:
+            req_w = iw
+
+        try:
+            req_h = int(raw_h)
+        except Exception:
+            req_h = ih
+
+        if explicit_flag:
+            target_w = self._round_down_to_multiple(req_w, base=64, minimum=64)
+            target_h = self._round_down_to_multiple(req_h, base=64, minimum=64)
+            return target_w, target_h, True
+
+        # Sketch mode default: use near-original size, rounded down to multiples of 64
+        target_w = self._round_down_to_multiple(iw, base=64, minimum=64)
+        target_h = self._round_down_to_multiple(ih, base=64, minimum=64)
+
+        if target_w <= 0 or target_h <= 0:
+            raise RuntimeError(f"Resolved invalid sketch target size: {target_w}x{target_h}")
+
+        return target_w, target_h, False
+
 
     # ------------------------------------------------------------------
     # Text2Img
@@ -1267,14 +1363,11 @@ class SD35Runtime:
 
     def generate_sketch_controlnet(self, job_folder: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Real SD3.5 sketch execution using dual ControlNet.
+        Real SD3.5 sketch execution using ControlNet.
 
-        REQUIRED FLOW:
-            sketch.png -> canny.png + depth.png -> SD3.5 Large dual ControlNet -> output.png
-
-        IMPORTANT:
-        - This is NOT plain img2img.
-        - Prompt is for materials / lighting / realism, not primary geometry invention.
+        Production rule for now:
+        - Canny-first path is the default shipping path.
+        - Depth is optional and only enabled when meta.use_depth_control is truthy.
         """
         if not self.is_loaded:
             raise RuntimeError(
@@ -1302,13 +1395,34 @@ class SD35Runtime:
         meta["width"] = int(width)
         meta["height"] = int(height)
 
-        sketch_pipe = self._load_sketch_pipe()
-        depth_image_processor, depth_model = self._get_depth_estimator()
+        use_depth_control = bool(meta.get("use_depth_control", False))
+        meta["use_depth_control"] = use_depth_control
+
+        stage_writer = self._stage_meta_writer(job_folder, meta)
+        stage_writer("entered_generate_sketch_controlnet", {
+            "input_image": os.path.basename(str(input_path)),
+            "use_depth_control": use_depth_control,
+            "width": int(width),
+            "height": int(height),
+        })
+
+        sketch_pipe = self._load_sketch_pipe(use_depth_control=use_depth_control)
+        stage_writer("loaded_sketch_pipe", {"use_depth_control": use_depth_control})
+
+        depth_image_processor = None
+        depth_model = None
+        if use_depth_control:
+            depth_image_processor, depth_model = self._get_depth_estimator()
+            stage_writer("loaded_depth_estimator", {"depth_model_id": self.depth_model_id})
 
         old_pipe = self.pipe
         try:
             self.pipe = sketch_pipe
             self._apply_locked_adapters(meta)
+            stage_writer("applied_adapters", {
+                "adapters_applied": bool(meta.get("adapters_applied", False)),
+                "adapters": meta.get("adapters", []),
+            })
 
             updated_meta = run_sketch_controlnet_generation(
                 pipe=sketch_pipe,
@@ -1325,17 +1439,29 @@ class SD35Runtime:
                 upscale_if_enabled_fn=self._upscale_if_enabled,
                 resize_exact_fn=self._resize_to_exact_output_dimensions,
                 enforce_output_size_fn=self._enforce_output_size,
+                stage_callback=stage_writer,
             )
 
             updated_meta["completed_at"] = datetime.utcnow().isoformat()
+            stage_writer("completed", {
+                "output_image": updated_meta.get("output_image"),
+                "canny_image": updated_meta.get("canny_image"),
+                "depth_image": updated_meta.get("depth_image"),
+                "completed_at": updated_meta.get("completed_at"),
+            })
 
             logger.info(
-                "SD3.5 sketch-controlnet completed. output=%s canny=%s depth=%s",
+                "SD3.5 sketch-controlnet completed. output=%s canny=%s depth=%s use_depth=%s",
                 updated_meta.get("output_image"),
                 updated_meta.get("canny_image"),
                 updated_meta.get("depth_image"),
+                use_depth_control,
             )
             return updated_meta
+
+        except Exception as exc:
+            stage_writer("failed", {"status": "error", "error": str(exc)})
+            raise
 
         finally:
             try:

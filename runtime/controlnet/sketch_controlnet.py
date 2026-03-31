@@ -190,6 +190,18 @@ def _resolve_final_delivery_size(
     return int(original_size[0]), int(original_size[1])
 
 
+def _emit_stage(stage_callback: Any, stage: str, **extra: Any) -> None:
+    if not callable(stage_callback):
+        return
+    payload: Dict[str, Any] = {"sketch_stage": stage}
+    payload.update(extra)
+    try:
+        stage_callback(stage, payload)
+    except Exception:
+        pass
+
+
+
 def run_sketch_controlnet_generation(
     *,
     pipe: Any,
@@ -206,14 +218,14 @@ def run_sketch_controlnet_generation(
     upscale_if_enabled_fn: Any,
     resize_exact_fn: Any,
     enforce_output_size_fn: Any,
+    stage_callback: Any = None,
 ) -> Dict[str, Any]:
     """
-    Execute the full sketch -> canny + depth -> dual ControlNet -> output pipeline.
+    Execute the sketch -> ControlNet -> output pipeline.
 
-    Required caller responsibilities:
-    - pipe is already the SD3.5 dual-ControlNet pipeline
-    - adapters, if any, are already applied before calling this
-    - helper callbacks come from SD35Runtime instance
+    Production rule for now:
+    - Canny is the primary structural control.
+    - Depth is optional and disabled unless explicitly enabled in meta.
     """
     _require_pil()
 
@@ -229,8 +241,6 @@ def run_sketch_controlnet_generation(
         raise RuntimeError("Sketch ControlNet pipeline is missing.")
     if torch_module is None:
         raise RuntimeError("Torch module is required.")
-    if depth_image_processor is None or depth_model is None:
-        raise RuntimeError("Depth preprocessor objects are required.")
 
     os.makedirs(job_folder, exist_ok=True)
 
@@ -243,22 +253,30 @@ def run_sketch_controlnet_generation(
     canny_cfg = _extract_canny_config(canny_control)
     depth_cfg = _extract_depth_config(depth_control)
 
-    # Build preprocess artifacts
+    use_depth_control = bool(meta.get("use_depth_control", False))
+    meta["use_depth_control"] = use_depth_control
+
+    _emit_stage(stage_callback, "building_canny", target_width=target_w, target_height=target_h)
     canny_image = build_canny_image(
         sketch_image,
         config=canny_cfg,
         target_size=(target_w, target_h),
     )
 
-    depth_image = build_depth_image(
-        sketch_image,
-        image_processor=depth_image_processor,
-        depth_model=depth_model,
-        device=device,
-        torch_module=torch_module,
-        config=depth_cfg,
-        target_size=(target_w, target_h),
-    )
+    depth_image = None
+    if use_depth_control:
+        if depth_image_processor is None or depth_model is None:
+            raise RuntimeError("Depth control was enabled but depth preprocessor objects are missing.")
+        _emit_stage(stage_callback, "building_depth")
+        depth_image = build_depth_image(
+            sketch_image,
+            image_processor=depth_image_processor,
+            depth_model=depth_model,
+            device=device,
+            torch_module=torch_module,
+            config=depth_cfg,
+            target_size=(target_w, target_h),
+        )
 
     sketch_name = _resolve_output_name(meta, "sketch_image", cfg.default_sketch_name)
     canny_name = _resolve_output_name(meta, "canny_image", cfg.default_canny_name)
@@ -272,9 +290,9 @@ def run_sketch_controlnet_generation(
     if cfg.save_preprocessed_images:
         _save_image(prepared_sketch, os.path.join(job_folder, sketch_name))
         _save_image(canny_image, os.path.join(job_folder, canny_name))
-        _save_image(depth_image, os.path.join(job_folder, depth_name))
+        if depth_image is not None:
+            _save_image(depth_image, os.path.join(job_folder, depth_name))
 
-    # Build generation kwargs
     prompt = str(meta.get("prompt") or "").strip()
     if not prompt:
         raise RuntimeError("Sketch ControlNet requires a non-empty prompt.")
@@ -288,11 +306,17 @@ def run_sketch_controlnet_generation(
 
     generator = _resolve_generator(torch_module, device, meta)
 
+    control_images = [canny_image]
+    control_scales = [canny_scale]
+    if use_depth_control and depth_image is not None:
+        control_images.append(depth_image)
+        control_scales.append(depth_scale)
+
     candidate_kwargs: Dict[str, Any] = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
-        "control_image": [canny_image, depth_image],
-        "controlnet_conditioning_scale": [canny_scale, depth_scale],
+        "control_image": control_images,
+        "controlnet_conditioning_scale": control_scales,
         "num_inference_steps": num_steps,
         "guidance_scale": guidance_scale,
         "width": target_w,
@@ -303,6 +327,7 @@ def run_sketch_controlnet_generation(
 
     kwargs = _filter_supported_call_kwargs(pipe.__call__, candidate_kwargs)
 
+    _emit_stage(stage_callback, "running_inference", control_count=len(control_images))
     images = pipe(**kwargs).images
     if not images:
         raise RuntimeError("Sketch ControlNet pipeline returned no images.")
@@ -343,6 +368,7 @@ def run_sketch_controlnet_generation(
             f"got {getattr(image, 'size', None)}"
         )
 
+    _emit_stage(stage_callback, "detail_pass")
     image = detail_pass_fn(image, meta)
 
     final_delivery_size = _resolve_final_delivery_size(
@@ -370,6 +396,7 @@ def run_sketch_controlnet_generation(
 
     final_up2x_name: Optional[str] = None
     if _optional_polish_enabled(meta):
+        _emit_stage(stage_callback, "optional_polish")
         upscaled = upscale_if_enabled_fn(image, meta)
         if getattr(upscaled, "size", None) != getattr(image, "size", None):
             final_up2x_name = "final_up2x.png"
@@ -380,7 +407,6 @@ def run_sketch_controlnet_generation(
     meta["output_image"] = output_name
     meta["output_base_image"] = base_out_name
     meta["canny_image"] = canny_name
-    meta["depth_image"] = depth_name
     meta["sketch_image"] = sketch_name
     meta["sketch_input_size"] = {"width": original_size[0], "height": original_size[1]}
     meta["sketch_working_size"] = {"width": target_w, "height": target_h}
@@ -391,7 +417,13 @@ def run_sketch_controlnet_generation(
     }
     meta["final_delivery_resize_applied"] = final_delivery_size != (target_w, target_h)
 
+    if use_depth_control and depth_image is not None:
+        meta["depth_image"] = depth_name
+    else:
+        meta.pop("depth_image", None)
+
     if final_up2x_name:
         meta["final_up2x_image"] = final_up2x_name
 
+    _emit_stage(stage_callback, "completed", output_image=output_name)
     return meta
