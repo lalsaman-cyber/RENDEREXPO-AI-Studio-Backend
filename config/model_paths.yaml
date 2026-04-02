@@ -1,19 +1,23 @@
 # ======================================================
 # RENDEREXPO AI STUDIO - Model Paths
-# NOTE:
-# - We are currently testing on RunPod (pod environment).
-# - Therefore sd35_large_dir points to the pod's mounted model path.
-# - Local laptop dev can change this back to a relative path later.
 # ======================================================
 
-# SD3.5 Large model folder (pod testing)
+# ------------------------------------------------------
+# SD3.5 Large model folder (existing text-to-image path)
+# ------------------------------------------------------
 sd35_large_dir: "/workspace-data/models/sd35-large"
 
-# Future custom finetunes will live here
-renderexpo_ultra_dir: "models/renderexpo-ultra"   # future
+# ------------------------------------------------------
+# SDXL sketch engine (new sketch-only path)
+# ------------------------------------------------------
+# These can be local paths later if you download them locally.
+# For now they can stay as model IDs.
+sdxl_base_dir: "stabilityai/stable-diffusion-xl-base-1.0"
+mistoline_controlnet_dir: "TheMistoAI/MistoLine"
 
-# Future LoRA directory (assets)
-lora_dir: "models/lora"                            # future
-
-# ControlNet directory (if you want copies locally)
-controlnet_dir: "models/controlnet"                # future
+# ------------------------------------------------------
+# Existing / future asset folders
+# ------------------------------------------------------
+renderexpo_ultra_dir: "models/renderexpo-ultra"
+lora_dir: "models/lora"
+controlnet_dir: "models/controlnet"
