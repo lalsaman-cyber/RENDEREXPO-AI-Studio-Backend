@@ -69,6 +69,7 @@ class SDXLMistoLineRuntime:
         self.device = device
         self._pipe = None
         self._controlnet = None
+        self._vae = None
 
         paths = _read_model_paths()
         self.sdxl_base_path = os.getenv(
@@ -78,6 +79,10 @@ class SDXLMistoLineRuntime:
         self.mistoline_path = os.getenv(
             "MISTOLINE_CONTROLNET_PATH",
             paths.get("mistoline_controlnet_dir", "TheMistoAI/MistoLine"),
+        )
+        self.sdxl_vae_path = os.getenv(
+            "SDXL_VAE_PATH",
+            "madebyollin/sdxl-vae-fp16-fix",
         )
 
     @property
@@ -89,32 +94,43 @@ class SDXLMistoLineRuntime:
             return
 
         logger.info(
-            "Loading SDXL + MistoLine runtime. base=%s controlnet=%s device=%s",
+            "Loading SDXL + MistoLine runtime. base=%s controlnet=%s vae=%s device=%s",
             self.sdxl_base_path,
             self.mistoline_path,
+            self.sdxl_vae_path,
             self.device,
         )
 
         import torch
-        from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
+        from diffusers import AutoencoderKL, ControlNetModel, StableDiffusionXLControlNetPipeline
 
         dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
 
+        # IMPORTANT:
+        # MistoLine's Diffusers usage requires variant="fp16".
+        # Without that, diffusers looks for the default weight filename and fails.
         self._controlnet = ControlNetModel.from_pretrained(
             self.mistoline_path,
             torch_dtype=dtype,
-            use_safetensors=True,
+            variant="fp16",
+        )
+
+        self._vae = AutoencoderKL.from_pretrained(
+            self.sdxl_vae_path,
+            torch_dtype=dtype,
         )
 
         self._pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             self.sdxl_base_path,
             controlnet=self._controlnet,
+            vae=self._vae,
             torch_dtype=dtype,
-            use_safetensors=True,
         )
 
         if self.device.startswith("cuda"):
-            self._pipe = self._pipe.to(self.device)
+            # VRAM-friendly default:
+            # keep pipeline offloaded instead of fully resident.
+            self._pipe.enable_model_cpu_offload()
         else:
             self._pipe = self._pipe.to("cpu")
 
@@ -144,6 +160,13 @@ class SDXLMistoLineRuntime:
             except Exception:
                 pass
             self._controlnet = None
+
+        if self._vae is not None:
+            try:
+                del self._vae
+            except Exception:
+                pass
+            self._vae = None
 
         try:
             import torch
@@ -186,16 +209,14 @@ class SDXLMistoLineRuntime:
         seed = _to_int(meta.get("seed"), 0)
         width = _to_int(meta.get("width"), 1024)
         height = _to_int(meta.get("height"), 1024)
-        steps = _to_int(meta.get("num_inference_steps"), 40)
-        guidance = _to_float(meta.get("guidance_scale"), 5.5)
+        steps = _to_int(meta.get("num_inference_steps"), 46)
+        guidance = _to_float(meta.get("guidance_scale"), 5.6)
 
         import torch
 
         generator = None
         if seed > 0:
-            generator = torch.Generator(
-                device=self.device if self.device.startswith("cuda") else "cpu"
-            ).manual_seed(seed)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
 
         control_image = Image.open(control_png).convert("RGB")
 
@@ -207,6 +228,7 @@ class SDXLMistoLineRuntime:
             height=height,
             num_inference_steps=steps,
             guidance_scale=guidance,
+            controlnet_conditioning_scale=1.0,
             generator=generator,
         )
 
@@ -237,6 +259,7 @@ class SDXLMistoLineRuntime:
             "runtime": "SDXLMistoLineRuntime",
             "base_model": self.sdxl_base_path,
             "controlnet_model": self.mistoline_path,
+            "vae_model": self.sdxl_vae_path,
             "generated_at": datetime.utcnow().isoformat(),
         }
 
