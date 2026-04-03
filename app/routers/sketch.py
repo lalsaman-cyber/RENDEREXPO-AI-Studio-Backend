@@ -4,12 +4,12 @@ RENDEREXPO AI STUDIO - Sketch Router (Planner -> GPU worker)
 
 SKETCH-ONLY UPDATED PURPOSE:
 - Keep the same planner/session/upload/output flow.
-- Move sketch generation to a dedicated SDXL + MistoLine engine path.
-- Do NOT route sketch through SD3.5 anymore.
-- Do NOT touch text2img or any other generation family.
+- Route sketch generation only to the dedicated SDXL + MistoLine engine path.
+- Do NOT route sketch through SD3.5.
+- Do NOT disturb text2img or any other working generation family.
 
-NEW LOCKED SKETCH PIPELINE:
-    uploaded sketch -> preprocess -> MistoLine control image -> SDXL base -> output.png
+LOCKED SKETCH PIPELINE:
+    uploaded sketch -> stronger preprocess -> MistoLine control image -> SDXL base -> output.png
 
 PLANNER RULE:
 - This file NEVER loads models.
@@ -28,12 +28,10 @@ import shutil
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, cast
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-
-from app.presets_sd35 import apply_preset_to_meta
 
 router = APIRouter(prefix="/api/sketch", tags=["Sketch Realtime"])
 
@@ -48,9 +46,9 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return str(v).strip()
 
 
-OUTPUTS_ROOT = _env("RENDEREXPO_OUTPUTS_ROOT", "outputs")
-OUTPUTS_MOUNT = _env("RENDEREXPO_OUTPUTS_MOUNT", "/outputs")
-GPU_BASE_URL = _env("GPU_BASE_URL", "http://127.0.0.1:8002")
+OUTPUTS_ROOT = _env("RENDEREXPO_OUTPUTS_ROOT", "outputs") or "outputs"
+OUTPUTS_MOUNT = _env("RENDEREXPO_OUTPUTS_MOUNT", "/outputs") or "/outputs"
+GPU_BASE_URL = _env("GPU_BASE_URL", "http://127.0.0.1:8002") or "http://127.0.0.1:8002"
 GPU_TIMEOUT_SECONDS = int(_env("GPU_TIMEOUT_SECONDS", "600") or "600")
 
 
@@ -84,10 +82,25 @@ def _clean_prompt(value: Optional[str]) -> str:
 
 def _default_negative_prompt() -> str:
     return (
-        "low quality, blurry, distorted geometry, warped building massing, crooked structure, "
-        "extra buildings, duplicate windows, bad perspective, deformed facade, messy roofline, "
-        "cartoon, anime, painting, illustration, low detail, oversaturated, noisy image"
+        "bloom, glow, haze, fog, dreamy softness, blurry edges, washed out contrast, "
+        "low contrast, soft focus, painterly, illustration, cartoon, warped geometry, "
+        "distorted windows, melted facade details, extra balconies, extra windows, "
+        "deformed massing, oversmoothed surfaces, noisy image, fake siding, ghosting"
     )
+
+
+def _normalize_category(value: Any) -> Category:
+    s = str(value or "").strip().lower()
+    if s in {"urban", "suburban", "interior", "wide_hero"}:
+        return cast(Category, s)
+    return "urban"
+
+
+def _normalize_shot(value: Any) -> Shot:
+    s = str(value or "").strip().lower()
+    if s in {"wide", "close"}:
+        return cast(Shot, s)
+    return "wide"
 
 
 def _ensure_png_jpg_only(upload: UploadFile) -> None:
@@ -137,16 +150,26 @@ def _create_job_folder() -> str:
 
 
 def _job_public_urls(job_folder: str) -> Dict[str, str]:
-    rel = job_folder.replace("\\", "/")
-    if rel.startswith("./"):
-        rel = rel[2:]
+    abs_job = os.path.abspath(job_folder)
+    abs_root = os.path.abspath(OUTPUTS_ROOT)
+
+    try:
+        rel = os.path.relpath(abs_job, abs_root).replace("\\", "/")
+    except Exception:
+        rel = os.path.basename(abs_job)
+
+    if rel.startswith("../"):
+        rel = os.path.basename(abs_job)
+
+    mount_root = OUTPUTS_MOUNT.rstrip("/")
+
     return {
-        "job_folder": f"{OUTPUTS_MOUNT}/{rel}",
-        "meta_json": f"{OUTPUTS_MOUNT}/{rel}/meta.json",
-        "sketch_png": f"{OUTPUTS_MOUNT}/{rel}/sketch.png",
-        "control_png": f"{OUTPUTS_MOUNT}/{rel}/mistoline_control.png",
-        "output_png": f"{OUTPUTS_MOUNT}/{rel}/output.png",
-        "final_up2x_png": f"{OUTPUTS_MOUNT}/{rel}/final_up2x.png",
+        "job_folder": f"{mount_root}/{rel}",
+        "meta_json": f"{mount_root}/{rel}/meta.json",
+        "sketch_png": f"{mount_root}/{rel}/sketch.png",
+        "control_png": f"{mount_root}/{rel}/mistoline_control.png",
+        "output_png": f"{mount_root}/{rel}/output.png",
+        "final_up2x_png": f"{mount_root}/{rel}/final_up2x.png",
     }
 
 
@@ -193,15 +216,97 @@ def _cleanup_defaults() -> Dict[str, Any]:
         "enabled": True,
         "grayscale": True,
         "autocontrast": True,
-        "contrast_boost": 1.25,
+        "contrast_boost": 1.45,
         "median_blur_ksize": 3,
         "adaptive_threshold": False,
-        "threshold_value": 180,
-        "thicken_lines": False,
-        "thicken_kernel": 2,
+        "threshold_value": 165,
+        "thicken_lines": True,
+        "thicken_iterations": 1,
         "invert_to_white_bg_black_lines": True,
-        "canny_low_threshold": 100,
-        "canny_high_threshold": 200,
+        "canny_low_threshold": 70,
+        "canny_high_threshold": 150,
+        "final_contrast_boost": 1.35,
+        "final_threshold_value": 175,
+    }
+
+
+def _apply_sketch_preset(meta: Dict[str, Any], *, category: Category, shot: Shot, upscale_2x: Optional[bool]) -> None:
+    """
+    Local locked preset mapping for sketch mode.
+
+    IMPORTANT:
+    - This prevents sketch sessions from drifting into the wrong preset family.
+    - If the user asks for urban, the sketch session stays urban.
+    - wide_hero is only used when explicitly requested.
+    """
+    width = 1024
+    height = 1024
+
+    if shot == "wide":
+        steps = 46
+        cfg = 5.6
+    else:
+        steps = 48
+        cfg = 6.0
+
+    profile_name_map: Dict[tuple[Category, Shot], str] = {
+        ("urban", "wide"): "r1_urban_wide",
+        ("urban", "close"): "r1_urban_close",
+        ("suburban", "wide"): "r1_suburban_wide",
+        ("suburban", "close"): "r1_suburban_close",
+        ("interior", "wide"): "r1_interior_wide",
+        ("interior", "close"): "r1_interior_close",
+        ("wide_hero", "wide"): "r1_wide_hero",
+        ("wide_hero", "close"): "r1_wide_hero_close",
+    }
+
+    profile_name = profile_name_map[(category, shot)]
+    upscale_enabled = bool(upscale_2x) if isinstance(upscale_2x, bool) else False
+
+    meta["width"] = width
+    meta["height"] = height
+    meta["resolution_policy"] = "preset_default"
+    meta["preset_resolution"] = {
+        "width": width,
+        "height": height,
+        "source": "preset_default",
+    }
+    meta["explicit_dimensions"] = False
+    meta["preserve_input_aspect_ratio"] = True
+    meta["num_inference_steps"] = steps
+    meta["guidance_scale"] = cfg
+
+    # Keep these locked to current approved sketch baseline unless changed later.
+    meta["lora_config"] = {
+        "path": "models/lycoris/RENDEREXPO_PRO21.safetensors",
+        "strength": 0.05,
+        "scale": 0.05,
+        "label": "LYCORIS_PRO21",
+    }
+    meta["geo_config"] = {
+        "path": "models/geo/RENDEREXPO_GEO.safetensors",
+        "strength": 0.01,
+        "scale": 0.01,
+        "label": "GEO",
+    }
+    meta["upscale"] = {
+        "enabled": upscale_enabled,
+        "factor": 2,
+        "method": "lanczos",
+        "denoise": 0.0,
+    }
+    meta["preset"] = {
+        "profile_name": profile_name,
+        "category": category,
+        "shot": shot,
+        "steps": steps,
+        "cfg": cfg,
+        "lycoris_multiplier": 0.05,
+        "geo_multiplier": 0.01,
+        "upscale_default": False,
+        "upscale_enabled": upscale_enabled,
+        "width": width,
+        "height": height,
     }
 
 
@@ -273,13 +378,10 @@ def _build_sketch_meta(
         },
     }
 
-    apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=upscale_2x)
+    _apply_sketch_preset(meta, category=category, shot=shot, upscale_2x=upscale_2x)
 
     meta["denoise"] = 0.0
     meta.pop("strength", None)
-
-    if isinstance(meta.get("upscale"), dict):
-        meta["upscale"]["denoise"] = 0.0
 
     return meta
 
@@ -287,7 +389,7 @@ def _build_sketch_meta(
 class StartSketchSessionRequest(BaseModel):
     category: Category = Field(..., description="Preset category: urban/suburban/interior/wide_hero")
     shot: Shot = Field(..., description="Preset shot: wide/close")
-    upscale_2x: Optional[bool] = Field(None, description="Optional override. If omitted, preset default applies.")
+    upscale_2x: Optional[bool] = Field(None, description="Optional override. If omitted, default stays disabled.")
     seed: Optional[int] = Field(None, description="Optional seed. If omitted, a seed is generated.")
     notes: Optional[str] = Field(None, description="Optional notes for this session.")
 
@@ -297,6 +399,8 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
     session_id = uuid.uuid4().hex
     root = _create_session_folder(session_id)
 
+    category = _normalize_category(request.category)
+    shot = _normalize_shot(request.shot)
     seed = request.seed if request.seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
     preset_probe: Dict[str, Any] = {
@@ -306,8 +410,8 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
         "engine": "sdxl_base_1_0",
         "model_name": "sdxl_base_1_0",
         "control_model": "TheMistoAI/MistoLine",
-        "category": request.category,
-        "shot": request.shot,
+        "category": category,
+        "shot": shot,
         "seed": seed,
         "prompt": "probe",
         "planned_output_image": "output.png",
@@ -315,16 +419,14 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
         "mode_runtime": "probe",
         "pipeline_key": "sdxl::mistoline_sketch",
     }
-    apply_preset_to_meta(
+    _apply_sketch_preset(
         preset_probe,
-        category=request.category,
-        shot=request.shot,
+        category=category,
+        shot=shot,
         upscale_2x=request.upscale_2x,
     )
     preset_probe["denoise"] = 0.0
     preset_probe.pop("strength", None)
-    if isinstance(preset_probe.get("upscale"), dict):
-        preset_probe["upscale"]["denoise"] = 0.0
 
     session_meta: Dict[str, Any] = {
         "session_id": session_id,
@@ -334,8 +436,8 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
         "model_name": "sdxl_base_1_0",
         "control_model": "TheMistoAI/MistoLine",
         "route_mode": "sdxl_mistoline_sketch",
-        "category": request.category,
-        "shot": request.shot,
+        "category": category,
+        "shot": shot,
         "seed": seed,
         "notes": request.notes,
         "upscale_2x": request.upscale_2x,
@@ -350,6 +452,8 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
             "guidance_scale": preset_probe.get("guidance_scale"),
             "upscale": preset_probe.get("upscale"),
             "pipeline_key": "sdxl::mistoline_sketch",
+            "category": category,
+            "shot": shot,
         },
     }
 
@@ -406,8 +510,8 @@ async def upload_sketch_frame(
     sketch_path = os.path.join(job_folder, "sketch.png")
     shutil.copyfile(frame_path, sketch_path)
 
-    category = str(session_meta.get("category") or "urban")
-    shot = str(session_meta.get("shot") or "wide")
+    category = _normalize_category(session_meta.get("category"))
+    shot = _normalize_shot(session_meta.get("shot"))
     seed = int(session_meta.get("seed") or 0)
     upscale_2x = session_meta.get("upscale_2x")
 
@@ -415,8 +519,8 @@ async def upload_sketch_frame(
         job_id=job_id,
         prompt=prompt,
         negative_prompt=negative_prompt,
-        category=category,  # type: ignore[arg-type]
-        shot=shot,          # type: ignore[arg-type]
+        category=category,
+        shot=shot,
         seed=seed,
         upscale_2x=upscale_2x if isinstance(upscale_2x, bool) else None,
         sketch_filename="sketch.png",
