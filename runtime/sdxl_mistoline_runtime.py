@@ -57,11 +57,21 @@ def _upscale_png(src_path: str, dst_path: str, factor: int = 2) -> str:
 
 class SDXLMistoLineRuntime:
     """
-    Separate sketch-only runtime:
-    - loads SDXL base
-    - loads MistoLine ControlNet
-    - owns the sketch generation call
-    - intentionally does NOT know anything about SD35 internals
+    Separate sketch-only runtime for:
+    - SDXL base
+    - MistoLine ControlNet
+    - madebyollin SDXL VAE fix
+
+    This implementation is intentionally aligned with the published
+    MistoLine Diffusers route and recommended parameter direction:
+    - SDXL base 1.0
+    - MistoLine with variant='fp16'
+    - madebyollin/sdxl-vae-fp16-fix
+    - recommended defaults:
+        steps=30
+        cfg=7.0
+        control strength=1.0
+        control guidance end=0.9
     """
 
     def __init__(self, mode: str = "real", device: str = "cuda") -> None:
@@ -89,6 +99,26 @@ class SDXLMistoLineRuntime:
     def is_loaded(self) -> bool:
         return self._pipe is not None
 
+    def _configure_scheduler(self) -> None:
+        if self._pipe is None:
+            return
+
+        try:
+            from diffusers import DPMSolverMultistepScheduler
+
+            # Closest Diffusers analog to the recommended DPM++ 2M SDE Karras path.
+            self._pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                self._pipe.scheduler.config,
+                algorithm_type="sde-dpmsolver++",
+                use_karras_sigmas=True,
+            )
+            logger.info(
+                "Configured scheduler: DPMSolverMultistepScheduler("
+                "algorithm_type='sde-dpmsolver++', use_karras_sigmas=True)"
+            )
+        except Exception as exc:
+            logger.warning("Failed to set DPM++ SDE Karras-like scheduler. Keeping default. detail=%s", exc)
+
     def load(self) -> None:
         if self.is_loaded:
             return
@@ -106,9 +136,8 @@ class SDXLMistoLineRuntime:
 
         dtype = torch.float16 if self.device.startswith("cuda") else torch.float32
 
-        # IMPORTANT:
-        # MistoLine's Diffusers usage requires variant="fp16".
-        # Without that, diffusers looks for the default weight filename and fails.
+        # Published MistoLine Diffusers route:
+        # ControlNetModel.from_pretrained(..., variant="fp16")
         self._controlnet = ControlNetModel.from_pretrained(
             self.mistoline_path,
             torch_dtype=dtype,
@@ -127,9 +156,10 @@ class SDXLMistoLineRuntime:
             torch_dtype=dtype,
         )
 
+        self._configure_scheduler()
+
         if self.device.startswith("cuda"):
-            # VRAM-friendly default:
-            # keep pipeline offloaded instead of fully resident.
+            # Keep this VRAM-friendly unless you later decide to trade memory for speed.
             self._pipe.enable_model_cpu_offload()
         else:
             self._pipe = self._pipe.to("cpu")
@@ -179,6 +209,36 @@ class SDXLMistoLineRuntime:
         gc.collect()
         logger.info("SDXL + MistoLine runtime unloaded.")
 
+    def _resolve_generation_settings(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Use MistoLine's published settings by default unless explicitly overridden.
+
+        MistoLine page:
+        - steps: 30
+        - CFG: 7.0
+        - controlnet_strength: 1.0
+        - end_percent: 0.9
+
+        We map these into the current Diffusers runtime.
+        """
+        user_cfg = meta.get("mistoline_generation")
+        if not isinstance(user_cfg, dict):
+            user_cfg = {}
+
+        width = _to_int(meta.get("width"), 1024)
+        height = _to_int(meta.get("height"), 1024)
+
+        settings = {
+            "width": width,
+            "height": height,
+            "num_inference_steps": _to_int(user_cfg.get("num_inference_steps"), 30),
+            "guidance_scale": _to_float(user_cfg.get("guidance_scale"), 7.0),
+            "controlnet_conditioning_scale": _to_float(user_cfg.get("controlnet_conditioning_scale"), 1.0),
+            "control_guidance_start": _to_float(user_cfg.get("control_guidance_start"), 0.0),
+            "control_guidance_end": _to_float(user_cfg.get("control_guidance_end"), 0.9),
+        }
+        return settings
+
     def generate_mistoline_sketch(self, job_folder: str, meta: Dict[str, Any]) -> Dict[str, str]:
         if not self.is_loaded:
             self.load()
@@ -207,10 +267,15 @@ class SDXLMistoLineRuntime:
 
         negative_prompt = str(meta.get("negative_prompt") or "").strip()
         seed = _to_int(meta.get("seed"), 0)
-        width = _to_int(meta.get("width"), 1024)
-        height = _to_int(meta.get("height"), 1024)
-        steps = _to_int(meta.get("num_inference_steps"), 46)
-        guidance = _to_float(meta.get("guidance_scale"), 5.6)
+
+        settings = self._resolve_generation_settings(meta)
+        width = settings["width"]
+        height = settings["height"]
+        steps = settings["num_inference_steps"]
+        guidance = settings["guidance_scale"]
+        control_strength = settings["controlnet_conditioning_scale"]
+        control_guidance_start = settings["control_guidance_start"]
+        control_guidance_end = settings["control_guidance_end"]
 
         import torch
 
@@ -220,6 +285,19 @@ class SDXLMistoLineRuntime:
 
         control_image = Image.open(control_png).convert("RGB")
 
+        logger.info(
+            "Running MistoLine sketch generation: steps=%s cfg=%s control_strength=%s "
+            "control_guidance_start=%s control_guidance_end=%s size=%sx%s seed=%s",
+            steps,
+            guidance,
+            control_strength,
+            control_guidance_start,
+            control_guidance_end,
+            width,
+            height,
+            seed,
+        )
+
         result = self._pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or None,
@@ -228,7 +306,9 @@ class SDXLMistoLineRuntime:
             height=height,
             num_inference_steps=steps,
             guidance_scale=guidance,
-            controlnet_conditioning_scale=1.0,
+            controlnet_conditioning_scale=control_strength,
+            control_guidance_start=control_guidance_start,
+            control_guidance_end=control_guidance_end,
             generator=generator,
         )
 
@@ -261,6 +341,19 @@ class SDXLMistoLineRuntime:
             "controlnet_model": self.mistoline_path,
             "vae_model": self.sdxl_vae_path,
             "generated_at": datetime.utcnow().isoformat(),
+            "scheduler": "DPMSolverMultistepScheduler",
+            "scheduler_algorithm_type": "sde-dpmsolver++",
+            "use_karras_sigmas": True,
+        }
+        meta["mistoline_generation_applied"] = {
+            "num_inference_steps": steps,
+            "guidance_scale": guidance,
+            "controlnet_conditioning_scale": control_strength,
+            "control_guidance_start": control_guidance_start,
+            "control_guidance_end": control_guidance_end,
+            "width": width,
+            "height": height,
+            "source": "runtime_defaults_aligned_to_mistoline_page",
         }
 
         meta_path = os.path.join(job_folder, "meta.json")
