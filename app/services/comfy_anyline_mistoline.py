@@ -56,9 +56,17 @@ class AnylineMistolineSketchService:
             width, height = img.size
         return cls._round_dimension(width), cls._round_dimension(height)
 
+    @staticmethod
+    def _build_uploaded_image_value(uploaded_filename: str, uploaded_subfolder: str) -> str:
+        uploaded_subfolder = (uploaded_subfolder or "").strip().strip("/\\")
+        if uploaded_subfolder:
+            return f"{uploaded_subfolder}/{uploaded_filename}"
+        return uploaded_filename
+
     def _build_prompt_workflow(
         self,
         uploaded_filename: str,
+        uploaded_subfolder: str,
         width: int,
         height: int,
         prompt: str,
@@ -67,6 +75,10 @@ class AnylineMistolineSketchService:
     ) -> Dict[str, Any]:
         seed_value = seed if seed is not None else random.randint(1, 2**31 - 1)
         neg = negative_prompt or DEFAULT_NEGATIVE_PROMPT
+        uploaded_image_value = self._build_uploaded_image_value(
+            uploaded_filename=uploaded_filename,
+            uploaded_subfolder=uploaded_subfolder,
+        )
 
         return {
             "4": {
@@ -92,7 +104,7 @@ class AnylineMistolineSketchService:
             "10": {
                 "class_type": "LoadImage",
                 "inputs": {
-                    "image": uploaded_filename,
+                    "image": uploaded_image_value,
                     "upload": "image",
                 },
             },
@@ -193,9 +205,11 @@ class AnylineMistolineSketchService:
         )
 
         uploaded_filename = upload_info["name"]
+        uploaded_subfolder = upload_info.get("subfolder", "")
 
         workflow = self._build_prompt_workflow(
             uploaded_filename=uploaded_filename,
+            uploaded_subfolder=uploaded_subfolder,
             width=width,
             height=height,
             prompt=prompt,
