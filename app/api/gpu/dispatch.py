@@ -187,6 +187,22 @@ def _ensure_meta_exists(job_folder: str) -> None:
         _write_meta(job_folder, {"status": "queued", "job_folder": job_folder})
 
 
+def _merge_request_meta_into_job(req: GPUDispatchRequest) -> None:
+    lock = _get_job_lock(req.job_folder)
+    with lock:
+        meta = _read_meta(req.job_folder)
+        meta.update(req.meta or {})
+        meta["job_folder"] = req.job_folder
+
+        if req.pipeline_key:
+            meta["pipeline_key"] = req.pipeline_key
+        if req.vr_mode:
+            meta["vr_mode"] = req.vr_mode
+
+        meta.setdefault("status", "queued")
+        _write_meta(req.job_folder, meta)
+
+
 def _enforce_locked_multipliers(meta: Dict[str, Any]) -> None:
     default_ly = 0.05
     default_ge = 0.01
@@ -321,14 +337,23 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 raise RuntimeError("sdxl_mistoline_sketch requires meta.prompt (string).")
 
             sketch_input = None
-            for n in ("sketch.png", "input.png", "image.png"):
-                p = os.path.join(job_folder, n)
-                if os.path.isfile(p):
-                    sketch_input = p
-                    break
+
+            meta_input_image = meta.get("input_image")
+            if isinstance(meta_input_image, str) and meta_input_image.strip():
+                candidate = meta_input_image.strip()
+                if os.path.isfile(candidate):
+                    sketch_input = candidate
+
+            if not sketch_input:
+                for n in ("sketch.png", "input.png", "image.png"):
+                    p = os.path.join(job_folder, n)
+                    if os.path.isfile(p):
+                        sketch_input = p
+                        break
+
             if not sketch_input:
                 raise RuntimeError(
-                    "sdxl_mistoline_sketch requires one of: sketch.png, input.png, image.png inside job_folder."
+                    "sdxl_mistoline_sketch requires meta.input_image or one of: sketch.png, input.png, image.png inside job_folder."
                 )
 
             payload = {**meta, "job_folder": job_folder, "input_image": sketch_input}
@@ -340,20 +365,22 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             if not isinstance(result_obj, dict):
                 raise RuntimeError("SDXL MistoLine sketch runner must return a dict.")
 
-            control_path = result_obj.get("control_png")
             output_path = result_obj.get("output_png")
-            _assert_artifact_exists(control_path, "MistoLine control image")
             _assert_artifact_exists(output_path, "SDXL MistoLine final output")
 
             result = {
                 "input_image": sketch_input,
-                "control_png": control_path,
                 "output_png": output_path,
                 "engine_family": "sdxl",
                 "engine": "sdxl_base_1_0",
                 "control_model": "TheMistoAI/MistoLine",
                 "pipeline_key": "sdxl::mistoline_sketch",
             }
+
+            optional_control = result_obj.get("control_png")
+            if optional_control:
+                _assert_artifact_exists(optional_control, "MistoLine control image")
+                result["control_png"] = optional_control
 
             optional_upscaled = result_obj.get("final_up2x_png")
             if optional_upscaled:
@@ -438,6 +465,7 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
 async def dispatch(req: GPUDispatchRequest) -> GPUDispatchResponse:
     _ensure_job_folder(req.job_folder)
     _ensure_meta_exists(req.job_folder)
+    _merge_request_meta_into_job(req)
 
     run_id = f"{_now_epoch()}_{uuid.uuid4().hex[:12]}"
 
