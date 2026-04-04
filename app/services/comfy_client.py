@@ -111,12 +111,12 @@ class ComfyUIClient:
             if item is not None:
                 status = item.get("status", {})
                 status_str = status.get("status_str", "")
+                completed = bool(status.get("completed", False))
 
                 if status_str == "error":
                     raise ComfyUIError(f"ComfyUI prompt failed: {item}")
 
-                outputs = item.get("outputs")
-                if outputs:
+                if completed or status_str == "success":
                     return item
 
             time.sleep(self.poll_interval)
