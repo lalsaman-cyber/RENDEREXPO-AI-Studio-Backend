@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,9 @@ class AnylineMistolineSketchService:
             return f"{uploaded_subfolder}/{uploaded_filename}"
         return uploaded_filename
 
+    def _build_unique_output_prefix(self) -> str:
+        return f"{self.config.output_prefix}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
     def _build_prompt_workflow(
         self,
         uploaded_filename: str,
@@ -72,6 +76,7 @@ class AnylineMistolineSketchService:
         prompt: str,
         negative_prompt: Optional[str],
         seed: Optional[int],
+        output_prefix: str,
     ) -> Dict[str, Any]:
         seed_value = seed if seed is not None else random.randint(1, 2**31 - 1)
         neg = negative_prompt or DEFAULT_NEGATIVE_PROMPT
@@ -165,7 +170,7 @@ class AnylineMistolineSketchService:
             "9": {
                 "class_type": "SaveImage",
                 "inputs": {
-                    "filename_prefix": self.config.output_prefix,
+                    "filename_prefix": output_prefix,
                     "images": ["8", 0],
                 },
             },
@@ -206,6 +211,7 @@ class AnylineMistolineSketchService:
 
         uploaded_filename = upload_info["name"]
         uploaded_subfolder = upload_info.get("subfolder", "")
+        output_prefix = self._build_unique_output_prefix()
 
         workflow = self._build_prompt_workflow(
             uploaded_filename=uploaded_filename,
@@ -215,6 +221,7 @@ class AnylineMistolineSketchService:
             prompt=prompt,
             negative_prompt=negative_prompt,
             seed=seed,
+            output_prefix=output_prefix,
         )
 
         prompt_id = self.client.queue_prompt(workflow)
