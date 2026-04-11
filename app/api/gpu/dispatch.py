@@ -2,17 +2,17 @@
 """
 RENDEREXPO AI STUDIO - GPU Dispatch Handler (REAL, Production)
 
-UPDATED PURPOSE:
+PURPOSE
+-------
 - Keep existing GPU dispatch behavior for all non-sketch jobs.
-- Move sketch execution to a dedicated SDXL + MistoLine route.
+- Keep the working Sketch to Render path untouched:
+      job_type     = "sdxl_mistoline_sketch"
+      pipeline_key = "sdxl::mistoline_sketch"
+- Add a NEW parallel MistoLine-based Sketch to Redesign path:
+      job_type     = "sdxl_mistoline_sketch_redesign"
+      pipeline_key = "sdxl::mistoline_sketch_redesign"
+- Do NOT revive SD3.5 sketch redesign.
 - Do NOT disturb text2img or other working paths.
-
-NEW SKETCH RULE:
-    job_type     = "sdxl_mistoline_sketch"
-    pipeline_key = "sdxl::mistoline_sketch"
-
-That route is NOT plain img2img.
-That route is NOT SD3.5.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from app.gpu.sdxl_mistoline import run_sdxl_mistoline_sketch
 from app.gpu.upscale import run_upscale_2x
 from app.gpu.video.between_frames import run_video_between_frames
 from app.gpu.video.from_image import run_video_from_image
+from app.services.sketch_redesign_runner import run_anyline_mistoline_sketch_redesign
 
 router = APIRouter(prefix="/api/gpu", tags=["GPU Dispatch"])
 
@@ -45,6 +46,7 @@ JobType = Literal[
     "sd35_text2img",
     "sd35_img2img",
     "sdxl_mistoline_sketch",
+    "sdxl_mistoline_sketch_redesign",
     "upscale_2x",
     "vr_reconstruct",
     "video_from_image",
@@ -177,6 +179,8 @@ def _route_key(job_type: str, vr_mode: Optional[str], pipeline_key: Optional[str
         return "sd35::img2img"
     if job_type == "sdxl_mistoline_sketch":
         return "sdxl::mistoline_sketch"
+    if job_type == "sdxl_mistoline_sketch_redesign":
+        return "sdxl::mistoline_sketch_redesign"
     if job_type == "upscale_2x":
         return "upscale::2x"
     return f"job::{job_type}"
@@ -264,6 +268,23 @@ def _assert_artifact_exists(path: Any, description: str) -> None:
         raise RuntimeError(f"{description} output file is empty: {path}")
 
 
+def _resolve_input_image_for_sketch_job(job_folder: str, meta: Dict[str, Any]) -> str:
+    meta_input_image = meta.get("input_image")
+    if isinstance(meta_input_image, str) and meta_input_image.strip():
+        candidate = meta_input_image.strip()
+        if os.path.isfile(candidate):
+            return candidate
+
+    for n in ("sketch.png", "input.png", "image.png"):
+        p = os.path.join(job_folder, n)
+        if os.path.isfile(p):
+            return p
+
+    raise RuntimeError(
+        "Sketch job requires meta.input_image or one of: sketch.png, input.png, image.png inside job_folder."
+    )
+
+
 def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
     job_type: str = req["job_type"]
     job_folder: str = req["job_folder"]
@@ -336,25 +357,7 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             if not prompt or not isinstance(prompt, str):
                 raise RuntimeError("sdxl_mistoline_sketch requires meta.prompt (string).")
 
-            sketch_input = None
-
-            meta_input_image = meta.get("input_image")
-            if isinstance(meta_input_image, str) and meta_input_image.strip():
-                candidate = meta_input_image.strip()
-                if os.path.isfile(candidate):
-                    sketch_input = candidate
-
-            if not sketch_input:
-                for n in ("sketch.png", "input.png", "image.png"):
-                    p = os.path.join(job_folder, n)
-                    if os.path.isfile(p):
-                        sketch_input = p
-                        break
-
-            if not sketch_input:
-                raise RuntimeError(
-                    "sdxl_mistoline_sketch requires meta.input_image or one of: sketch.png, input.png, image.png inside job_folder."
-                )
+            sketch_input = _resolve_input_image_for_sketch_job(job_folder, meta)
 
             payload = {**meta, "job_folder": job_folder, "input_image": sketch_input}
             result_obj = run_sdxl_mistoline_sketch(
@@ -385,6 +388,55 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             optional_upscaled = result_obj.get("final_up2x_png")
             if optional_upscaled:
                 _assert_artifact_exists(optional_upscaled, "MistoLine optional upscale")
+                result["final_up2x_png"] = optional_upscaled
+
+        elif job_type == "sdxl_mistoline_sketch_redesign":
+            sketch_input = _resolve_input_image_for_sketch_job(job_folder, meta)
+
+            result_obj = run_anyline_mistoline_sketch_redesign(
+                input_image_path=sketch_input,
+                output_dir=job_folder,
+                style_preset=meta.get("style_preset"),
+                materials_notes=meta.get("materials_notes"),
+                atmosphere_notes=meta.get("atmosphere_notes"),
+                background_notes=meta.get("background_notes"),
+                mood_notes=meta.get("mood_notes"),
+                style_notes=meta.get("style_notes"),
+                aesthetic_notes=meta.get("aesthetic_notes"),
+                negative_prompt_override=meta.get("negative_prompt_override"),
+                seed=meta.get("seed"),
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("Sketch redesign runner must return a dict.")
+
+            output_path = result_obj.get("output_png")
+            _assert_artifact_exists(output_path, "SDXL MistoLine redesign output")
+
+            result = {
+                "input_image": sketch_input,
+                "output_png": output_path,
+                "engine_family": "sdxl",
+                "engine": "sdxl_base_1_0",
+                "control_model": "TheMistoAI/MistoLine",
+                "pipeline_key": "sdxl::mistoline_sketch_redesign",
+                "mode": "sketch_to_redesign",
+                "product_promise": result_obj.get("product_promise"),
+                "warning_text": result_obj.get("warning_text"),
+                "style_preset": result_obj.get("style_preset"),
+                "prompt": result_obj.get("prompt"),
+                "negative_prompt": result_obj.get("negative_prompt"),
+                "allowed_client_fields": result_obj.get("allowed_client_fields"),
+            }
+
+            optional_control = result_obj.get("control_png")
+            if optional_control:
+                _assert_artifact_exists(optional_control, "MistoLine redesign control image")
+                result["control_png"] = optional_control
+
+            optional_upscaled = result_obj.get("final_up2x_png")
+            if optional_upscaled:
+                _assert_artifact_exists(optional_upscaled, "MistoLine redesign optional upscale")
                 result["final_up2x_png"] = optional_upscaled
 
         elif job_type == "upscale_2x":

@@ -36,9 +36,13 @@ IMPORTANT:
 SKETCH PIPELINE NOTE:
 - Sketch routing is planner-side only.
 - Real sketch execution happens on the GPU worker through dedicated dispatch.
-- Sketch mode is no longer intended to be plain img2img.
-- The intended GPU job path is:
-    sketch -> canny + depth -> SD3.5 dual ControlNet -> output
+- Sketch to Render uses the working MistoLine path:
+    job_type     = "sdxl_mistoline_sketch"
+    pipeline_key = "sdxl::mistoline_sketch"
+- Sketch to Redesign uses the NEW parallel MistoLine path:
+    job_type     = "sdxl_mistoline_sketch_redesign"
+    pipeline_key = "sdxl::mistoline_sketch_redesign"
+- DO NOT route sketch through the removed SD3.5 redesign path.
 """
 
 from __future__ import annotations
@@ -68,6 +72,7 @@ from app.routers import (
     product,
     product_insert,
     sketch,
+    sketch_redesign,
     text2img,
     upscale,
     video_between_frames,
@@ -215,7 +220,7 @@ app = FastAPI(
         "This is NOT client-facing. Wix UI will be client-facing. "
         "All endpoints (except /api/health) require HMAC authentication."
     ),
-    version="0.3.0",
+    version="0.4.0",
 )
 
 # Serve outputs so /outputs/... URLs work
@@ -330,6 +335,7 @@ app.include_router(product_insert.router)
 app.include_router(insert_object.router)
 app.include_router(floorplan.router)
 app.include_router(sketch.router)
+app.include_router(sketch_redesign.router)
 app.include_router(pipeline.router)
 
 # Real generation routes that dispatch to GPU worker
@@ -354,7 +360,10 @@ async def root():
     NOTE: This endpoint is protected by HMAC.
     """
     return {
-        "message": "RENDEREXPO AI STUDIO - PLANNER API (HMAC protected). Use /api/health for unauthenticated health."
+        "message": (
+            "RENDEREXPO AI STUDIO - PLANNER API (HMAC protected). "
+            "Use /api/health for unauthenticated health."
+        )
     }
 
 
