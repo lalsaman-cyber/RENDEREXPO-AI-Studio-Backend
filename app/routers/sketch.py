@@ -2,14 +2,14 @@
 """
 RENDEREXPO AI STUDIO - Sketch Router (Planner -> GPU worker)
 
-SKETCH-ONLY UPDATED PURPOSE:
+SKETCH-ONLY PURPOSE:
 - Keep the same planner/session/upload/output flow.
 - Route sketch generation only to the dedicated SDXL + MistoLine engine path.
 - Do NOT route sketch through SD3.5.
 - Do NOT disturb text2img or any other working generation family.
 
 LOCKED SKETCH PIPELINE:
-    uploaded sketch -> stronger preprocess -> MistoLine control image -> SDXL base -> output.png
+    uploaded sketch -> Anyline preprocess -> MistoLine control -> SDXL base -> output.png
 
 PLANNER RULE:
 - This file NEVER loads models.
@@ -17,6 +17,11 @@ PLANNER RULE:
 
 LOCKED PIPELINE KEY:
     sdxl::mistoline_sketch
+
+IMPORTANT ROLLBACK:
+- This file is rolled back to the older/reference sketch settings that matched
+  the real-sketch-from-input-001 recipe.
+- This rollback is SKETCH-ONLY and must NOT affect text2img.
 """
 
 from __future__ import annotations
@@ -81,11 +86,10 @@ def _clean_prompt(value: Optional[str]) -> str:
 
 
 def _default_negative_prompt() -> str:
+    # Rolled back to the strict preservation-style negative used by the older reference flow.
     return (
-        "bloom, glow, haze, fog, dreamy softness, blurry edges, washed out contrast, "
-        "low contrast, soft focus, painterly, illustration, cartoon, warped geometry, "
-        "distorted windows, melted facade details, extra balconies, extra windows, "
-        "deformed massing, oversmoothed surfaces, noisy image, fake siding, ghosting"
+        "redesign, altered structure, changed windows, changed balconies, changed roof, "
+        "changed composition, distorted architecture, blurry, low quality, messy facade, unrealistic"
     )
 
 
@@ -232,32 +236,39 @@ def _cleanup_defaults() -> Dict[str, Any]:
 
 def _apply_sketch_preset(meta: Dict[str, Any], *, category: Category, shot: Shot, upscale_2x: Optional[bool]) -> None:
     """
-    Local locked preset mapping for sketch mode.
+    Sketch-only rollback to the older/reference MistoLine recipe.
 
     IMPORTANT:
-    - This prevents sketch sessions from drifting into the wrong preset family.
-    - If the user asks for urban, the sketch session stays urban.
-    - wide_hero is only used when explicitly requested.
+    - This is intentionally NOT the newer 46 / 5.6 / LyCORIS / GEO planner profile.
+    - This is the older/reference sketch recipe aligned with input-001:
+        steps = 30
+        cfg = 7.0
+        denoise = 0.93
+        control strength = 1.0
+        start = 0.0
+        end = 0.9
+
+    This is SKETCH-ONLY.
     """
     width = 1024
     height = 1024
 
-    if shot == "wide":
-        steps = 46
-        cfg = 5.6
-    else:
-        steps = 48
-        cfg = 6.0
+    steps = 30
+    cfg = 7.0
+    denoise = 0.93
+    control_strength = 1.0
+    start_percent = 0.0
+    end_percent = 0.9
 
     profile_name_map: Dict[tuple[Category, Shot], str] = {
-        ("urban", "wide"): "r1_urban_wide",
-        ("urban", "close"): "r1_urban_close",
-        ("suburban", "wide"): "r1_suburban_wide",
-        ("suburban", "close"): "r1_suburban_close",
-        ("interior", "wide"): "r1_interior_wide",
-        ("interior", "close"): "r1_interior_close",
-        ("wide_hero", "wide"): "r1_wide_hero",
-        ("wide_hero", "close"): "r1_wide_hero_close",
+        ("urban", "wide"): "mistoline_reference_urban_wide",
+        ("urban", "close"): "mistoline_reference_urban_close",
+        ("suburban", "wide"): "mistoline_reference_suburban_wide",
+        ("suburban", "close"): "mistoline_reference_suburban_close",
+        ("interior", "wide"): "mistoline_reference_interior_wide",
+        ("interior", "close"): "mistoline_reference_interior_close",
+        ("wide_hero", "wide"): "mistoline_reference_wide_hero",
+        ("wide_hero", "close"): "mistoline_reference_wide_hero_close",
     }
 
     profile_name = profile_name_map[(category, shot)]
@@ -275,34 +286,34 @@ def _apply_sketch_preset(meta: Dict[str, Any], *, category: Category, shot: Shot
     meta["preserve_input_aspect_ratio"] = True
     meta["num_inference_steps"] = steps
     meta["guidance_scale"] = cfg
+    meta["denoise"] = denoise
 
-    # Keep these locked to current approved sketch baseline unless changed later.
-    meta["lora_config"] = {
-        "path": "models/lycoris/RENDEREXPO_PRO21.safetensors",
-        "strength": 0.05,
-        "scale": 0.05,
-        "label": "LYCORIS_PRO21",
-    }
-    meta["geo_config"] = {
-        "path": "models/geo/RENDEREXPO_GEO.safetensors",
-        "strength": 0.01,
-        "scale": 0.01,
-        "label": "GEO",
-    }
+    # These are sketch-control recipe fields, not SD35 multipliers.
+    meta["control_strength"] = control_strength
+    meta["control_guidance_start"] = start_percent
+    meta["control_guidance_end"] = end_percent
+
+    # Remove newer SD35-style sketch metadata so this path stays aligned with the reference recipe.
+    meta.pop("lora_config", None)
+    meta.pop("geo_config", None)
+
     meta["upscale"] = {
         "enabled": upscale_enabled,
         "factor": 2,
         "method": "lanczos",
         "denoise": 0.0,
     }
+
     meta["preset"] = {
         "profile_name": profile_name,
         "category": category,
         "shot": shot,
         "steps": steps,
         "cfg": cfg,
-        "lycoris_multiplier": 0.05,
-        "geo_multiplier": 0.01,
+        "denoise": denoise,
+        "control_strength": control_strength,
+        "start_percent": start_percent,
+        "end_percent": end_percent,
         "upscale_default": False,
         "upscale_enabled": upscale_enabled,
         "width": width,
@@ -379,10 +390,6 @@ def _build_sketch_meta(
     }
 
     _apply_sketch_preset(meta, category=category, shot=shot, upscale_2x=upscale_2x)
-
-    meta["denoise"] = 0.0
-    meta.pop("strength", None)
-
     return meta
 
 
@@ -401,6 +408,8 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
 
     category = _normalize_category(request.category)
     shot = _normalize_shot(request.shot)
+
+    # Use provided seed if given; otherwise keep the older behavior of generating one.
     seed = request.seed if request.seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
     preset_probe: Dict[str, Any] = {
@@ -425,8 +434,6 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
         shot=shot,
         upscale_2x=request.upscale_2x,
     )
-    preset_probe["denoise"] = 0.0
-    preset_probe.pop("strength", None)
 
     session_meta: Dict[str, Any] = {
         "session_id": session_id,
@@ -450,6 +457,10 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
             "height": preset_probe.get("height"),
             "num_inference_steps": preset_probe.get("num_inference_steps"),
             "guidance_scale": preset_probe.get("guidance_scale"),
+            "denoise": preset_probe.get("denoise"),
+            "control_strength": preset_probe.get("control_strength"),
+            "control_guidance_start": preset_probe.get("control_guidance_start"),
+            "control_guidance_end": preset_probe.get("control_guidance_end"),
             "upscale": preset_probe.get("upscale"),
             "pipeline_key": "sdxl::mistoline_sketch",
             "category": category,
@@ -461,7 +472,7 @@ async def start_sketch_session(request: StartSketchSessionRequest) -> Dict[str, 
 
     return {
         "status": "ok",
-        "message": "Sketch session created. SDXL + MistoLine sketch routing is locked for this session.",
+        "message": "Sketch session created. Reference MistoLine sketch routing is locked for this session.",
         "session_id": session_id,
         "session_folder": root,
         "session_meta_path": _session_meta_path(session_id),
