@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from PIL import Image
 
 from app.services.comfy_client import ComfyUIClient, ComfyUIError
@@ -46,6 +47,7 @@ class AnylineMistolineSketchService:
             base_url=config.comfy_url,
             poll_timeout=config.poll_timeout,
         )
+        self._resolved_anyline_node_type: Optional[str] = None
 
     @staticmethod
     def _round_dimension(value: int) -> int:
@@ -67,6 +69,39 @@ class AnylineMistolineSketchService:
     def _build_unique_output_prefix(self) -> str:
         return f"{self.config.output_prefix}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
+    def _resolve_anyline_node_type(self) -> str:
+        if self._resolved_anyline_node_type:
+            return self._resolved_anyline_node_type
+
+        try:
+            response = requests.get(
+                f"{self.config.comfy_url.rstrip('/')}/object_info",
+                timeout=(10, 60),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            raise ComfyUIError(f"Failed to read ComfyUI /object_info for AnyLine node detection: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ComfyUIError("ComfyUI /object_info returned an invalid payload.")
+
+        # Prefer the original node first to get as close as possible to the older 04-05 reference behavior.
+        preferred = [
+            "AnyLinePreprocessor",
+            "AnyLineArtPreprocessor_aux",
+        ]
+
+        for node_name in preferred:
+            if node_name in data:
+                self._resolved_anyline_node_type = node_name
+                return node_name
+
+        raise ComfyUIError(
+            "Could not find a supported AnyLine node in ComfyUI. "
+            "Expected one of: AnyLinePreprocessor, AnyLineArtPreprocessor_aux"
+        )
+
     def _build_prompt_workflow(
         self,
         uploaded_filename: str,
@@ -84,6 +119,7 @@ class AnylineMistolineSketchService:
             uploaded_filename=uploaded_filename,
             uploaded_subfolder=uploaded_subfolder,
         )
+        anyline_node_type = self._resolve_anyline_node_type()
 
         return {
             "4": {
@@ -114,7 +150,7 @@ class AnylineMistolineSketchService:
                 },
             },
             "38": {
-                "class_type": "AnyLinePreprocessor",
+                "class_type": anyline_node_type,
                 "inputs": {
                     "image": ["10", 0],
                 },
