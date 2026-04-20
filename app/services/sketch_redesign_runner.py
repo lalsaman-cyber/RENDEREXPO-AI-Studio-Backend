@@ -22,8 +22,43 @@ It is only for the new Sketch to Redesign mode.
 from typing import Any, Dict, Optional
 
 from app.config.sketch_runtime import get_anyline_mistoline_config
-from app.services.comfy_anyline_mistoline import AnylineMistolineSketchService
+from app.services.comfy_anyline_mistoline import (
+    AnylineMistolineSketchService,
+    SketchJobConfig,
+)
 from app.services.sketch_redesign_prompt import build_sketch_redesign_prompt_package
+
+
+def _build_redesign_config() -> SketchJobConfig:
+    """
+    Redesign-only runtime looseners.
+
+    IMPORTANT:
+    - We intentionally do NOT modify get_anyline_mistoline_config().
+    - Sketch to Render keeps using the locked shared runtime.
+    - Sketch to Redesign gets a derived config with looser sketch anchoring.
+
+    Why:
+    - render is preservation-first
+    - redesign should allow more reinterpretation of facade and structure
+    """
+    base = get_anyline_mistoline_config()
+
+    return SketchJobConfig(
+        comfy_url=base.comfy_url,
+        sdxl_checkpoint_name=base.sdxl_checkpoint_name,
+        controlnet_name=base.controlnet_name,
+        sampler_name=base.sampler_name,
+        scheduler=base.scheduler,
+        steps=base.steps,
+        cfg=base.cfg,
+        denoise=0.88,
+        control_strength=0.72,
+        start_percent=0.0,
+        end_percent=0.55,
+        output_prefix=base.output_prefix,
+        poll_timeout=base.poll_timeout,
+    )
 
 
 def run_anyline_mistoline_sketch_redesign(
@@ -62,7 +97,7 @@ def run_anyline_mistoline_sketch_redesign(
         aesthetic_notes=aesthetic_notes,
     )
 
-    config = get_anyline_mistoline_config()
+    config = _build_redesign_config()
     service = AnylineMistolineSketchService(config=config)
 
     negative_prompt = (
@@ -89,5 +124,14 @@ def run_anyline_mistoline_sketch_redesign(
     result["prompt"] = prompt_package.prompt
     result["negative_prompt"] = negative_prompt
     result["allowed_client_fields"] = prompt_package.allowed_client_fields
+
+    result["redesign_runtime"] = {
+        "steps": config.steps,
+        "cfg": config.cfg,
+        "denoise": config.denoise,
+        "control_strength": config.control_strength,
+        "start_percent": config.start_percent,
+        "end_percent": config.end_percent,
+    }
 
     return result
