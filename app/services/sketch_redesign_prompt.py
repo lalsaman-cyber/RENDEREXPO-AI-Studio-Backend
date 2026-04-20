@@ -109,15 +109,18 @@ STYLE_PRESET_BLOCKS: Dict[str, str] = {
 LOCKED_BASE_REDESIGN_PROMPT = (
     "architectural redesign concept render based on the uploaded sketch, "
     "photorealistic architectural visualization, realistic facade materialization, "
-    "credible massing and perspective continuity from the source sketch, "
+    "allow meaningful architectural reinterpretation of massing articulation, facade depth, "
+    "balcony geometry, pergola form, opening hierarchy, and compositional emphasis, "
+    "while keeping the project believable as the same development family, "
     "high-quality architectural presentation, realistic daylight, site realism, "
     "refined residential design expression"
 )
 
 LOCKED_REDESIGN_FREEDOM_BLOCK = (
-    "allow reinterpretation of facade style, balcony language, material palette, "
-    "architectural detailing, presentation mood, and design character while still using "
-    "the uploaded sketch as the structural starting point"
+    "allow strong reinterpretation of facade style, balcony language, material palette, "
+    "architectural detailing, structural emphasis, projections and recesses, vertical and horizontal composition, "
+    "window hierarchy, and design character, using the uploaded sketch only as a loose architectural guide "
+    "rather than a strict structural constraint"
 )
 
 LOCKED_NEGATIVE_PROMPT = (
@@ -155,10 +158,6 @@ class SketchRedesignPromptPackage:
 
 def _clean(value: Optional[str]) -> str:
     return " ".join(str(value or "").strip().split())
-
-
-def _is_blank(value: Optional[str]) -> bool:
-    return _clean(value) == ""
 
 
 def _normalize_style_preset(value: Optional[str]) -> str:
@@ -206,8 +205,8 @@ def build_sketch_redesign_prompt_package(
     Notes:
     - Redesign is intentionally looser than Sketch to Render.
     - This prompt should encourage reinterpretation, not strict 1:1 preservation.
-    - The uploaded sketch is still the structural starting point, but exact fidelity
-      is not guaranteed in this mode.
+    - The uploaded sketch is still the starting point, but this mode should
+      allow stronger architectural change than render mode.
     """
     normalized_preset = _normalize_style_preset(style_preset)
     preset_block = STYLE_PRESET_BLOCKS[normalized_preset]
