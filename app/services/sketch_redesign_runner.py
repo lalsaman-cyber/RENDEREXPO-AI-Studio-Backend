@@ -52,10 +52,10 @@ def _build_redesign_config() -> SketchJobConfig:
         scheduler=base.scheduler,
         steps=base.steps,
         cfg=base.cfg,
-        denoise=0.88,
-        control_strength=0.72,
+        denoise=0.84,
+        control_strength=0.58,
         start_percent=0.0,
-        end_percent=0.55,
+        end_percent=0.40,
         output_prefix=base.output_prefix,
         poll_timeout=base.poll_timeout,
     )
