@@ -17,11 +17,27 @@ IMPORTANT:
   those fields must pass through unchanged
 - This client signs and forwards payloads only
 
-NEW SKETCH RULE:
-- Sketch is no longer plain img2img as the primary architecture.
-- Dedicated sketch jobs must dispatch with:
-    job_type = "sd35_sketch_controlnet"
-    pipeline_key = "sd35::sd35_sketch_controlnet"
+PROTECTED EXISTING SERVICES:
+- text2img
+- img2img
+- upscale
+- Sketch to Render
+- Sketch to Redesign
+- video
+- CAD
+- mesh
+- VR
+
+MOODBOARD RULE:
+- Moodboard is a separate internal lane.
+- This file only resolves and forwards moodboard job types.
+- It does NOT implement moodboard generation.
+- It does NOT change other services.
+
+MOODBOARD JOB TYPES:
+- space_to_moodboard
+- sd35_moodboard_to_space
+- sd35_apply_moodboard_to_render
 """
 
 from __future__ import annotations
@@ -42,7 +58,7 @@ import requests
 # GPU worker base URL (inside the pod)
 # -------------------------------------------------------------------
 # Canonical mapping:
-#   Planner = 8012
+#   Planner    = 8012
 #   GPU worker = 8002
 #
 # Override with:
@@ -134,34 +150,70 @@ def _resolve_job_type(meta: Dict[str, Any]) -> str:
     if isinstance(raw_type, str) and raw_type.strip():
         t = raw_type.strip().lower()
 
-        # Planner-side types sometimes differ from GPU dispatch labels
+        # Planner-side types sometimes differ from GPU dispatch labels.
         if t == "text2img":
             return "sd35_text2img"
+
         if t == "img2img":
             return "sd35_img2img"
+
         if t == "inpaint":
-            # Current GPU path shares img2img-style execution contract
+            # Current GPU path shares img2img-style execution contract.
             return "sd35_img2img"
+
         if t == "controlnet":
             pipeline_key = str(meta.get("pipeline_key") or "").strip().lower()
             if pipeline_key == "sd35::sd35_sketch_controlnet":
                 return "sd35_sketch_controlnet"
 
+        # Moodboard planner types.
+        if t == "space_to_moodboard":
+            return "space_to_moodboard"
+
+        if t == "moodboard_to_space":
+            return "sd35_moodboard_to_space"
+
+        if t == "apply_moodboard_to_render":
+            return "sd35_apply_moodboard_to_render"
+
+        if t == "sd35_moodboard_to_space":
+            return "sd35_moodboard_to_space"
+
+        if t == "sd35_apply_moodboard_to_render":
+            return "sd35_apply_moodboard_to_render"
+
     pipeline_key = str(meta.get("pipeline_key") or "").strip().lower()
+
     if pipeline_key == "sd35::text2img":
         return "sd35_text2img"
+
     if pipeline_key == "sd35::img2img":
         return "sd35_img2img"
+
     if pipeline_key == "sd35::sd35_sketch_controlnet":
         return "sd35_sketch_controlnet"
+
+    if pipeline_key == "moodboard::space_to_moodboard":
+        return "space_to_moodboard"
+
+    if pipeline_key == "sd35::moodboard_to_space":
+        return "sd35_moodboard_to_space"
+
+    if pipeline_key == "sd35::apply_moodboard_to_render":
+        return "sd35_apply_moodboard_to_render"
+
     if pipeline_key == "upscale::2x":
         return "upscale_2x"
+
     if pipeline_key == "video::from_image":
         return "video_from_image"
+
     if pipeline_key == "video::between_frames":
         return "video_between_frames"
+
     if pipeline_key == "cad::from_image":
         return "cad_from_image"
+
     if pipeline_key == "mesh::from_image":
         return "mesh_from_image"
 
@@ -181,7 +233,11 @@ def _resolve_pipeline_key(meta: Dict[str, Any]) -> Optional[str]:
 def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """
     Shared dispatcher to GPU worker.
-    Contract: POST /api/gpu/dispatch with:
+
+    Contract:
+        POST /api/gpu/dispatch
+
+    Payload:
         {
           "job_type": ...,
           "job_folder": ...,
@@ -193,7 +249,7 @@ def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, An
 
     CRITICAL:
     - meta must be forwarded as-is
-    - do NOT strip or rewrite img2img/sketch geometry/aspect keys here
+    - do NOT strip or rewrite img2img/sketch/moodboard geometry/aspect keys here
     """
     job_folder_abs = _normalize_job_folder(job_folder)
     url = f"{GPU_BASE_URL}/api/gpu/dispatch"
@@ -282,7 +338,8 @@ def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, An
 
 
 # -------------------------------------------------------------------
-# SD3.5 Dispatchers (routers import these names)
+# SD3.5 Dispatchers
+# Routers import these names.
 # All of them share the same dispatch contract.
 # -------------------------------------------------------------------
 
@@ -304,17 +361,28 @@ def dispatch_sd35_sketch_controlnet(job_folder: str, meta: Dict[str, Any]) -> Tu
 
 # -------------------------------------------------------------------
 # Moodboard / Space
+# These are planner-side dispatch functions only.
+# They do not implement generation.
 # -------------------------------------------------------------------
 
 def dispatch_sd35_moodboard_to_space(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    meta = dict(meta)
+    meta.setdefault("job_type", "sd35_moodboard_to_space")
+    meta.setdefault("pipeline_key", "sd35::moodboard_to_space")
     return _dispatch(job_folder, meta)
 
 
 def dispatch_space_to_moodboard(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    meta = dict(meta)
+    meta.setdefault("job_type", "space_to_moodboard")
+    meta.setdefault("pipeline_key", "moodboard::space_to_moodboard")
     return _dispatch(job_folder, meta)
 
 
 def dispatch_sd35_apply_moodboard_to_render(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    meta = dict(meta)
+    meta.setdefault("job_type", "sd35_apply_moodboard_to_render")
+    meta.setdefault("pipeline_key", "sd35::apply_moodboard_to_render")
     return _dispatch(job_folder, meta)
 
 

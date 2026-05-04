@@ -4,15 +4,23 @@ RENDEREXPO AI STUDIO - GPU Dispatch Handler (REAL, Production)
 
 PURPOSE
 -------
-- Keep existing GPU dispatch behavior for all non-sketch jobs.
+- Keep existing GPU dispatch behavior for all existing working jobs.
 - Keep the working Sketch to Render path untouched:
       job_type     = "sdxl_mistoline_sketch"
       pipeline_key = "sdxl::mistoline_sketch"
-- Add a NEW parallel MistoLine-based Sketch to Redesign path:
+- Keep the working Sketch to Redesign path untouched:
       job_type     = "sdxl_mistoline_sketch_redesign"
       pipeline_key = "sdxl::mistoline_sketch_redesign"
-- Do NOT revive SD3.5 sketch redesign.
-- Do NOT disturb text2img or other working paths.
+- Add a NEW isolated Moodboard lane:
+      job_type     = "space_to_moodboard"
+      job_type     = "sd35_moodboard_to_space"
+      job_type     = "sd35_apply_moodboard_to_render"
+- Do NOT disturb text2img, img2img, upscale, sketch, redesign, video, CAD, mesh, or VR.
+
+IMPORTANT SAFETY RULE
+---------------------
+Moodboard is added as a separate lane.
+Existing branches are preserved.
 """
 
 from __future__ import annotations
@@ -31,6 +39,11 @@ from pydantic import BaseModel, Field
 
 from app.gpu.cad.from_image import run_cad_from_image
 from app.gpu.mesh.from_image import run_mesh_from_image
+from app.gpu.moodboard import (
+    run_sd35_apply_moodboard_to_render,
+    run_sd35_moodboard_to_space,
+    run_space_to_moodboard,
+)
 from app.gpu.sd35 import run_sd35_img2img, run_sd35_txt2img
 from app.gpu.sdxl_mistoline import run_sdxl_mistoline_sketch
 from app.gpu.upscale import run_upscale_2x
@@ -47,6 +60,11 @@ JobType = Literal[
     "sd35_img2img",
     "sdxl_mistoline_sketch",
     "sdxl_mistoline_sketch_redesign",
+    "space_to_moodboard",
+    "moodboard_to_space",
+    "sd35_moodboard_to_space",
+    "apply_moodboard_to_render",
+    "sd35_apply_moodboard_to_render",
     "upscale_2x",
     "vr_reconstruct",
     "video_from_image",
@@ -181,6 +199,12 @@ def _route_key(job_type: str, vr_mode: Optional[str], pipeline_key: Optional[str
         return "sdxl::mistoline_sketch"
     if job_type == "sdxl_mistoline_sketch_redesign":
         return "sdxl::mistoline_sketch_redesign"
+    if job_type == "space_to_moodboard":
+        return "moodboard::space_to_moodboard"
+    if job_type in ("moodboard_to_space", "sd35_moodboard_to_space"):
+        return "sd35::moodboard_to_space"
+    if job_type in ("apply_moodboard_to_render", "sd35_apply_moodboard_to_render"):
+        return "sd35::apply_moodboard_to_render"
     if job_type == "upscale_2x":
         return "upscale::2x"
     return f"job::{job_type}"
@@ -311,7 +335,16 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
         with lock:
             meta = _read_meta(job_folder)
 
-        if job_type in ("sd35_txt2img", "sd35_text2img", "sd35_img2img", "upscale_2x"):
+        if job_type in (
+            "sd35_txt2img",
+            "sd35_text2img",
+            "sd35_img2img",
+            "sd35_moodboard_to_space",
+            "moodboard_to_space",
+            "sd35_apply_moodboard_to_render",
+            "apply_moodboard_to_render",
+            "upscale_2x",
+        ):
             with lock:
                 _enforce_locked_multipliers(meta)
                 _write_meta(job_folder, meta)
@@ -438,6 +471,74 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             if optional_upscaled:
                 _assert_artifact_exists(optional_upscaled, "MistoLine redesign optional upscale")
                 result["final_up2x_png"] = optional_upscaled
+
+        elif job_type == "space_to_moodboard":
+            result_obj = run_space_to_moodboard(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload={**meta, "job_folder": job_folder},
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("Space to Moodboard runner must return a dict.")
+
+            _assert_artifact_exists(result_obj.get("moodboard_grid_png"), "Space to Moodboard grid")
+            _assert_artifact_exists(result_obj.get("palette_json"), "Space to Moodboard palette")
+            _assert_artifact_exists(result_obj.get("extracted_assets_json"), "Space to Moodboard assets")
+
+            result = {
+                "moodboard_grid_png": result_obj.get("moodboard_grid_png"),
+                "palette_json": result_obj.get("palette_json"),
+                "extracted_assets_json": result_obj.get("extracted_assets_json"),
+                "mode": "space_to_moodboard",
+                "engine_family": "analysis",
+                "pipeline_key": "moodboard::space_to_moodboard",
+            }
+
+        elif job_type in ("moodboard_to_space", "sd35_moodboard_to_space"):
+            result_obj = run_sd35_moodboard_to_space(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload={**meta, "job_folder": job_folder},
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("SD35 Moodboard to Space runner must return a dict.")
+
+            _assert_artifact_exists(result_obj.get("output_png"), "SD35 Moodboard to Space output")
+            _assert_artifact_exists(result_obj.get("moodboard_grid_png"), "SD35 Moodboard to Space grid")
+            _assert_artifact_exists(result_obj.get("palette_json"), "SD35 Moodboard to Space palette")
+            _assert_artifact_exists(result_obj.get("extracted_assets_json"), "SD35 Moodboard to Space assets")
+
+            result = {
+                "output_png": result_obj.get("output_png"),
+                "moodboard_grid_png": result_obj.get("moodboard_grid_png"),
+                "palette_json": result_obj.get("palette_json"),
+                "extracted_assets_json": result_obj.get("extracted_assets_json"),
+                "mode": "sd35_moodboard_to_space",
+                "engine_family": "sd35",
+                "pipeline_key": "sd35::moodboard_to_space",
+                "conditioning_mode": result_obj.get("conditioning_mode"),
+            }
+
+        elif job_type in ("apply_moodboard_to_render", "sd35_apply_moodboard_to_render"):
+            result_obj = run_sd35_apply_moodboard_to_render(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload={**meta, "job_folder": job_folder},
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("SD35 Apply Moodboard to Render runner must return a dict.")
+
+            _assert_artifact_exists(result_obj.get("output_png"), "SD35 Apply Moodboard to Render output")
+
+            result = {
+                "output_png": result_obj.get("output_png"),
+                "input_image": result_obj.get("input_image"),
+                "moodboard_folder": result_obj.get("moodboard_folder"),
+                "mode": "sd35_apply_moodboard_to_render",
+                "engine_family": "sd35",
+                "pipeline_key": "sd35::apply_moodboard_to_render",
+                "conditioning_mode": result_obj.get("conditioning_mode"),
+            }
 
         elif job_type == "upscale_2x":
             inp = None

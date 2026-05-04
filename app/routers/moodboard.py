@@ -9,8 +9,9 @@ Flows:
    - Planner creates job folder, saves files, writes meta.json
    - Planner dispatches to GPU worker to generate:
         - output.png
-        - palette.json (optional)
-        - extracted_assets.json (optional)
+        - moodboard_grid.png
+        - palette.json
+        - extracted_assets.json
         - meta.json updated by worker
 
 2) Space -> Moodboard
@@ -22,7 +23,7 @@ Flows:
         - meta.json updated
 
 3) Moodboard -> Apply to Render
-   - User references a moodboard job + references or uploads a target image
+   - User references a moodboard job + references a target image
    - Planner dispatches to GPU worker to apply materials/style from moodboard to target render:
         - output.png
         - meta.json updated
@@ -35,6 +36,11 @@ IMPORTANT:
 - Any SD3.5 stage uses locked preset logic through apply_preset_to_meta(...)
 - Planner only writes jobs/meta and dispatches
 - No local inference here
+
+SAFETY:
+- This file only handles Moodboard planner jobs.
+- It does NOT alter text2img, img2img, upscale, Sketch to Render,
+  Sketch to Redesign, video, CAD, mesh, or VR.
 """
 
 from __future__ import annotations
@@ -49,12 +55,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app.presets_sd35 import apply_preset_to_meta
 from app.clients.gpu_client import (
     dispatch_sd35_apply_moodboard_to_render,
     dispatch_sd35_moodboard_to_space,
     dispatch_space_to_moodboard,
 )
+from app.presets_sd35 import apply_preset_to_meta
 
 router = APIRouter(prefix="/api/moodboard", tags=["Moodboard"])
 
@@ -68,8 +74,26 @@ DEFAULT_SHOT = "wide"
 
 
 # ---------------------------------------------------------------------------
+# Locked moodboard job identities
+# ---------------------------------------------------------------------------
+
+JOB_TYPE_MOODBOARD_TO_SPACE = "sd35_moodboard_to_space"
+PIPELINE_KEY_MOODBOARD_TO_SPACE = "sd35::moodboard_to_space"
+
+JOB_TYPE_SPACE_TO_MOODBOARD = "space_to_moodboard"
+PIPELINE_KEY_SPACE_TO_MOODBOARD = "moodboard::space_to_moodboard"
+
+JOB_TYPE_APPLY_MOODBOARD_TO_RENDER = "sd35_apply_moodboard_to_render"
+PIPELINE_KEY_APPLY_MOODBOARD_TO_RENDER = "sd35::apply_moodboard_to_render"
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _utc_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
 
 def _today_utc_str() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
@@ -121,7 +145,7 @@ def _outputs_public_urls(job_folder: str) -> Dict[str, Optional[str]]:
 def _write_meta(job_folder: str, meta: Dict[str, Any]) -> str:
     meta_path = os.path.join(job_folder, "meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
+        json.dump(meta, f, indent=4, ensure_ascii=False)
     return meta_path
 
 
@@ -209,7 +233,7 @@ async def moodboard_to_space_render(
 
     job_folder = _create_job_folder(job_type="moodboard_to_space")
     job_id = os.path.basename(job_folder)
-    created_at = datetime.datetime.utcnow().isoformat()
+    created_at = _utc_iso()
     final_seed = seed if seed is not None else int(uuid.uuid4().int % 1_000_000_000)
 
     saved_files: Dict[str, Any] = {"moodboard_images": []}
@@ -229,9 +253,15 @@ async def moodboard_to_space_render(
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": created_at,
+        "updated_at": created_at,
         "type": "moodboard_to_space",
+        "job_type": JOB_TYPE_MOODBOARD_TO_SPACE,
+        "pipeline_key": PIPELINE_KEY_MOODBOARD_TO_SPACE,
         "status": "planned",
         "mode_runtime": "gpu-dispatch",
+        "engine_family": "sd35",
+        "engine": "sd35_large",
+        "moodboard_mode": "moodboard_to_space",
         "prompt": prompt,
         "seed": final_seed,
         "files": saved_files,
@@ -239,8 +269,16 @@ async def moodboard_to_space_render(
         "shot": shot,
         "outputs": {
             "output_image": "output.png",
+            "moodboard_grid": "moodboard_grid.png",
             "palette_json": "palette.json",
             "extracted_assets": "extracted_assets.json",
+        },
+        "moodboard": {
+            "service": "moodboard_to_space",
+            "input_count": len(saved_files["moodboard_images"]),
+            "reference_conditioning": "text_prompt_from_moodboard_analysis",
+            "ip_adapter_enabled": False,
+            "future_target": "sd35_ip_adapter_reference_conditioning",
         },
     }
 
@@ -254,6 +292,7 @@ async def moodboard_to_space_render(
         try:
             meta["status"] = "gpu_error"
             meta["gpu_error"] = gpu_resp
+            meta["updated_at"] = _utc_iso()
             _write_meta(job_folder, meta)
         except Exception:
             pass
@@ -269,6 +308,7 @@ async def moodboard_to_space_render(
     try:
         meta["status"] = "dispatched"
         meta["gpu_response"] = gpu_resp
+        meta["updated_at"] = _utc_iso()
         _write_meta(job_folder, meta)
     except Exception:
         pass
@@ -276,6 +316,7 @@ async def moodboard_to_space_render(
     return {
         "status": "dispatched",
         "message": "Moodboard to Space dispatched to GPU worker.",
+        "job_id": job_id,
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,
@@ -301,16 +342,22 @@ async def space_to_moodboard_render(
 
     job_folder = _create_job_folder(job_type="space_to_moodboard")
     job_id = os.path.basename(job_folder)
-    created_at = datetime.datetime.utcnow().isoformat()
+    created_at = _utc_iso()
 
     await _save_upload_stream(space_image, os.path.join(job_folder, "space.png"))
 
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": created_at,
+        "updated_at": created_at,
         "type": "space_to_moodboard",
+        "job_type": JOB_TYPE_SPACE_TO_MOODBOARD,
+        "pipeline_key": PIPELINE_KEY_SPACE_TO_MOODBOARD,
         "status": "planned",
         "mode_runtime": "gpu-dispatch",
+        "engine_family": "analysis",
+        "engine": "pillow_palette_layout",
+        "moodboard_mode": "space_to_moodboard",
         "prompt": prompt,
         "num_tiles": int(num_tiles),
         "files": {"space_image": "space.png"},
@@ -318,6 +365,11 @@ async def space_to_moodboard_render(
             "moodboard_grid": "moodboard_grid.png",
             "palette_json": "palette.json",
             "extracted_assets": "extracted_assets.json",
+        },
+        "moodboard": {
+            "service": "space_to_moodboard",
+            "reference_conditioning": "analysis_and_board_layout",
+            "sd35_required": False,
         },
     }
 
@@ -329,6 +381,7 @@ async def space_to_moodboard_render(
         try:
             meta["status"] = "gpu_error"
             meta["gpu_error"] = gpu_resp
+            meta["updated_at"] = _utc_iso()
             _write_meta(job_folder, meta)
         except Exception:
             pass
@@ -344,6 +397,7 @@ async def space_to_moodboard_render(
     try:
         meta["status"] = "dispatched"
         meta["gpu_response"] = gpu_resp
+        meta["updated_at"] = _utc_iso()
         _write_meta(job_folder, meta)
     except Exception:
         pass
@@ -351,6 +405,7 @@ async def space_to_moodboard_render(
     return {
         "status": "dispatched",
         "message": "Space to Moodboard dispatched to GPU worker.",
+        "job_id": job_id,
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,
@@ -377,6 +432,7 @@ class ApplyMoodboardFromJobRequest(BaseModel):
 async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) -> Dict[str, Any]:
     mb_id = (req.moodboard_job_id or "").strip()
     tgt_id = (req.target_source_job_id or "").strip()
+
     if not mb_id or not tgt_id:
         raise HTTPException(status_code=400, detail="moodboard_job_id and target_source_job_id are required")
 
@@ -395,7 +451,7 @@ async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) 
 
     job_folder = _create_job_folder(job_type="apply_moodboard_to_render")
     job_id = os.path.basename(job_folder)
-    created_at = datetime.datetime.utcnow().isoformat()
+    created_at = _utc_iso()
 
     dst_img = os.path.join(job_folder, "input.png")
     try:
@@ -411,11 +467,21 @@ async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) 
     meta: Dict[str, Any] = {
         "job_id": job_id,
         "created_at": created_at,
+        "updated_at": created_at,
         "type": "apply_moodboard_to_render",
+        "job_type": JOB_TYPE_APPLY_MOODBOARD_TO_RENDER,
+        "pipeline_key": PIPELINE_KEY_APPLY_MOODBOARD_TO_RENDER,
         "status": "planned",
         "mode_runtime": "gpu-dispatch",
+        "engine_family": "sd35",
+        "engine": "sd35_large_img2img",
+        "moodboard_mode": "apply_moodboard_to_render",
         "moodboard_job_id": mb_id,
         "moodboard_folder_ref": os.path.basename(mb_folder),
+        "moodboard_folder_abs": os.path.abspath(mb_folder),
+        "target_source_job_id": tgt_id,
+        "target_source_folder_ref": os.path.basename(tgt_folder),
+        "target_source_image_path": safe_rel,
         "prompt": req.prompt,
         "negative_prompt": req.negative_prompt,
         "seed": final_seed,
@@ -425,12 +491,26 @@ async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) 
             "moodboard_job_id": mb_id,
         },
         "planned_output_image": "output.png",
+        "outputs": {
+            "output_image": "output.png",
+        },
         "category": category,
         "shot": shot,
+        "moodboard": {
+            "service": "apply_moodboard_to_render",
+            "reference_conditioning": "text_prompt_from_moodboard_analysis",
+            "ip_adapter_enabled": False,
+            "future_target": "sd35_img2img_ip_adapter_controlnet",
+            "preserve_existing_render_structure": True,
+        },
     }
 
     apply_preset_to_meta(meta, category=category, shot=shot, upscale_2x=req.upscale_2x)
+
+    # Keep the client-requested img2img strength after preset application.
     meta["strength"] = float(req.strength)
+    meta.setdefault("preserve_input_aspect_ratio", True)
+    meta.setdefault("explicit_dimensions", False)
 
     meta_path = _write_meta(job_folder, meta)
     public_urls = _outputs_public_urls(job_folder)
@@ -438,12 +518,13 @@ async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) 
     ok, gpu_resp = dispatch_sd35_apply_moodboard_to_render(
         job_folder=job_folder,
         meta=meta,
-        moodboard_job_folder=mb_folder,
     )
+
     if not ok:
         try:
             meta["status"] = "gpu_error"
             meta["gpu_error"] = gpu_resp
+            meta["updated_at"] = _utc_iso()
             _write_meta(job_folder, meta)
         except Exception:
             pass
@@ -459,6 +540,7 @@ async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) 
     try:
         meta["status"] = "dispatched"
         meta["gpu_response"] = gpu_resp
+        meta["updated_at"] = _utc_iso()
         _write_meta(job_folder, meta)
     except Exception:
         pass
@@ -466,6 +548,7 @@ async def apply_moodboard_to_render_from_job(req: ApplyMoodboardFromJobRequest) 
     return {
         "status": "dispatched",
         "message": "Apply Moodboard to Render dispatched to GPU worker.",
+        "job_id": job_id,
         "job_folder": job_folder,
         "meta_path": meta_path,
         "public_urls": public_urls,
