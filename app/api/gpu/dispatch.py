@@ -11,7 +11,7 @@ PURPOSE
 - Keep the working Sketch to Redesign path untouched:
       job_type     = "sdxl_mistoline_sketch_redesign"
       pipeline_key = "sdxl::mistoline_sketch_redesign"
-- Add a NEW isolated Moodboard lane:
+- Keep the new isolated Moodboard lane:
       job_type     = "space_to_moodboard"
       job_type     = "sd35_moodboard_to_space"
       job_type     = "sd35_apply_moodboard_to_render"
@@ -21,6 +21,15 @@ IMPORTANT SAFETY RULE
 ---------------------
 Moodboard is added as a separate lane.
 Existing branches are preserved.
+
+STARTUP SAFETY
+--------------
+Heavy service imports are intentionally lazy.
+Do NOT import CAD, mesh, video, SD3.5, SDXL, Comfy, or other heavy runners
+at module startup. Import them only inside the branch that needs them.
+
+This prevents GPU worker port 8002 from hanging during startup when an unrelated
+heavy module import stalls.
 """
 
 from __future__ import annotations
@@ -36,20 +45,6 @@ from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-
-from app.gpu.cad.from_image import run_cad_from_image
-from app.gpu.mesh.from_image import run_mesh_from_image
-from app.gpu.moodboard import (
-    run_sd35_apply_moodboard_to_render,
-    run_sd35_moodboard_to_space,
-    run_space_to_moodboard,
-)
-from app.gpu.sd35 import run_sd35_img2img, run_sd35_txt2img
-from app.gpu.sdxl_mistoline import run_sdxl_mistoline_sketch
-from app.gpu.upscale import run_upscale_2x
-from app.gpu.video.between_frames import run_video_between_frames
-from app.gpu.video.from_image import run_video_from_image
-from app.services.sketch_redesign_runner import run_anyline_mistoline_sketch_redesign
 
 router = APIRouter(prefix="/api/gpu", tags=["GPU Dispatch"])
 
@@ -354,6 +349,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             if not prompt or not isinstance(prompt, str):
                 raise RuntimeError("sd35_text2img requires meta.prompt (string).")
 
+            from app.gpu.sd35 import run_sd35_txt2img
+
             result_path = run_sd35_txt2img(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -377,6 +374,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             if not prompt or not isinstance(prompt, str):
                 raise RuntimeError("sd35_img2img requires meta.prompt (string).")
 
+            from app.gpu.sd35 import run_sd35_img2img
+
             payload = {**meta, "job_folder": job_folder, "input_image": input_path}
             result_path = run_sd35_img2img(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
@@ -389,6 +388,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             prompt = meta.get("prompt")
             if not prompt or not isinstance(prompt, str):
                 raise RuntimeError("sdxl_mistoline_sketch requires meta.prompt (string).")
+
+            from app.gpu.sdxl_mistoline import run_sdxl_mistoline_sketch
 
             sketch_input = _resolve_input_image_for_sketch_job(job_folder, meta)
 
@@ -424,6 +425,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 result["final_up2x_png"] = optional_upscaled
 
         elif job_type == "sdxl_mistoline_sketch_redesign":
+            from app.services.sketch_redesign_runner import run_anyline_mistoline_sketch_redesign
+
             sketch_input = _resolve_input_image_for_sketch_job(job_folder, meta)
 
             result_obj = run_anyline_mistoline_sketch_redesign(
@@ -473,6 +476,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 result["final_up2x_png"] = optional_upscaled
 
         elif job_type == "space_to_moodboard":
+            from app.gpu.moodboard import run_space_to_moodboard
+
             result_obj = run_space_to_moodboard(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -495,6 +500,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             }
 
         elif job_type in ("moodboard_to_space", "sd35_moodboard_to_space"):
+            from app.gpu.moodboard import run_sd35_moodboard_to_space
+
             result_obj = run_sd35_moodboard_to_space(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -520,6 +527,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             }
 
         elif job_type in ("apply_moodboard_to_render", "sd35_apply_moodboard_to_render"):
+            from app.gpu.moodboard import run_sd35_apply_moodboard_to_render
+
             result_obj = run_sd35_apply_moodboard_to_render(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -550,6 +559,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             if not inp:
                 raise RuntimeError("upscale_2x requires an input image inside job_folder.")
 
+            from app.gpu.upscale import run_upscale_2x
+
             result_path = run_upscale_2x(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder, "input_image": inp},
@@ -558,6 +569,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             result = {"upscaled_png": result_path, "input_image": inp}
 
         elif job_type == "cad_from_image":
+            from app.gpu.cad.from_image import run_cad_from_image
+
             result_path = run_cad_from_image(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -566,6 +579,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             result = {"cad_output": result_path}
 
         elif job_type == "mesh_from_image":
+            from app.gpu.mesh.from_image import run_mesh_from_image
+
             result_path = run_mesh_from_image(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -574,6 +589,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             result = {"mesh_output": result_path}
 
         elif job_type == "video_from_image":
+            from app.gpu.video.from_image import run_video_from_image
+
             result_path = run_video_from_image(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
@@ -582,6 +599,8 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
             result = {"video_output": result_path}
 
         elif job_type == "video_between_frames":
+            from app.gpu.video.between_frames import run_video_between_frames
+
             result_path = run_video_between_frames(
                 job={"date": meta.get("date"), "job_id": meta.get("job_id")},
                 payload={**meta, "job_folder": job_folder},
