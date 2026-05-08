@@ -655,6 +655,182 @@ def _fallback_family_from_metrics(metrics: Dict[str, Any]) -> str:
     return "stone"
 
 
+
+def _safe_rgb_from_sample(sample: Dict[str, Any], fallback: Tuple[int, int, int] = (150, 140, 128)) -> Tuple[int, int, int]:
+    avg = sample.get("average_color") or {}
+    rgb_obj = avg.get("rgb") if isinstance(avg, dict) else None
+    if isinstance(rgb_obj, dict):
+        try:
+            return (
+                max(0, min(255, int(rgb_obj.get("r", fallback[0])))),
+                max(0, min(255, int(rgb_obj.get("g", fallback[1])))),
+                max(0, min(255, int(rgb_obj.get("b", fallback[2])))),
+            )
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _mix_rgb(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    t = _clamp(t)
+    return (
+        int(a[0] * (1.0 - t) + b[0] * t),
+        int(a[1] * (1.0 - t) + b[1] * t),
+        int(a[2] * (1.0 - t) + b[2] * t),
+    )
+
+
+def _adjust_rgb(rgb: Tuple[int, int, int], amount: float) -> Tuple[int, int, int]:
+    if amount >= 0:
+        return _mix_rgb(rgb, (255, 255, 255), amount)
+    return _mix_rgb(rgb, (0, 0, 0), abs(amount))
+
+
+def _draw_soft_noise(draw: Any, width: int, height: int, base: Tuple[int, int, int], *, step: int = 18) -> None:
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            n = ((x * 37 + y * 19 + width * 11 + height * 7) % 31) / 30.0
+            color = _adjust_rgb(base, (n - 0.5) * 0.18)
+            draw.rectangle((x, y, min(width, x + step), min(height, y + step)), fill=color)
+
+
+def _generate_material_swatch(
+    *,
+    sample: Dict[str, Any],
+    output_path: str,
+    width: int = 520,
+    height: int = 340,
+) -> str:
+    """
+    Generate clean material-style swatches for the visible moodboard.
+
+    PIL-only: no SD3.5, no ComfyUI, no external material library, no changes to
+    pinned generation settings. The detected crop remains recorded in JSON as
+    reference_crop_file, while the visible tile becomes a clean material card.
+    """
+    Image, ImageDraw, _, _ = _require_pil()
+
+    family = str(sample.get("material_family") or "material").lower()
+    base = _safe_rgb_from_sample(sample)
+    canvas = Image.new("RGB", (width, height), _adjust_rgb(base, 0.10))
+    draw = ImageDraw.Draw(canvas)
+
+    if family == "stone":
+        mortar = _adjust_rgb(base, 0.28)
+        _draw_soft_noise(draw, width, height, _adjust_rgb(base, 0.02), step=22)
+        block_h = max(34, height // 7)
+        y = 0
+        row = 0
+        while y < height:
+            offset = 0 if row % 2 == 0 else -(width // 8)
+            block_w = max(70, width // 4)
+            x = offset
+            while x < width:
+                n = ((x * 13 + y * 17 + row * 23) % 17) / 16.0
+                color = _adjust_rgb(base, (n - 0.5) * 0.20)
+                draw.rectangle((x, y, x + block_w, y + block_h), fill=color, outline=mortar, width=3)
+                for k in range(2):
+                    lx = x + 10 + ((k * 41 + row * 23) % max(16, block_w - 20))
+                    ly = y + 8 + ((k * 17 + row * 11) % max(12, block_h - 16))
+                    draw.line((lx, ly, min(x + block_w - 8, lx + block_w // 3), ly + ((k % 2) * 8 - 4)), fill=_adjust_rgb(color, -0.18), width=1)
+                x += block_w
+            y += block_h
+            row += 1
+
+    elif family == "wood":
+        warm_base = _mix_rgb(base, (150, 82, 36), 0.30)
+        draw.rectangle((0, 0, width, height), fill=_adjust_rgb(warm_base, 0.03))
+        slat_w = max(38, width // 10)
+        for x in range(0, width + slat_w, slat_w):
+            n = ((x * 29 + 17) % 23) / 22.0
+            color = _adjust_rgb(warm_base, (n - 0.5) * 0.22)
+            draw.rectangle((x, 0, x + slat_w - 4, height), fill=color)
+            draw.line((x + slat_w - 3, 0, x + slat_w - 3, height), fill=_adjust_rgb(warm_base, -0.24), width=2)
+            for yy in range(14, height, 22):
+                wave = int(7 * math.sin((yy + x) / 38.0))
+                draw.line((x + 6, yy, min(width, x + slat_w - 12), yy + wave), fill=_adjust_rgb(color, -0.16), width=1)
+                draw.line((x + 8, yy + 7, min(width, x + slat_w - 16), yy + 7 + wave), fill=_adjust_rgb(color, 0.14), width=1)
+
+    elif family == "glass":
+        top = _mix_rgb(base, (198, 235, 245), 0.55)
+        bottom = _mix_rgb(base, (75, 105, 120), 0.35)
+        for y in range(height):
+            t = y / float(max(1, height - 1))
+            draw.line((0, y, width, y), fill=_mix_rgb(top, bottom, t))
+        for x in range(-width // 2, width, 76):
+            draw.line((x, height, x + width // 2, 0), fill=_adjust_rgb(top, 0.25), width=4)
+            draw.line((x + 18, height, x + width // 2 + 18, 0), fill=_adjust_rgb(bottom, -0.18), width=1)
+        draw.rectangle((0, 0, width - 1, height - 1), outline=_adjust_rgb(base, -0.18), width=3)
+
+    elif family == "water":
+        aqua = _mix_rgb(base, (30, 185, 190), 0.45)
+        deep = _mix_rgb(base, (8, 55, 75), 0.45)
+        for y in range(height):
+            t = y / float(max(1, height - 1))
+            draw.line((0, y, width, y), fill=_mix_rgb(_adjust_rgb(aqua, 0.25), deep, t))
+        for y in range(22, height, 28):
+            amp = 7 + (y % 17)
+            points = []
+            for x in range(0, width + 8, 8):
+                yy = y + int(math.sin(x / 28.0 + y / 23.0) * amp)
+                points.append((x, yy))
+            draw.line(points, fill=_adjust_rgb(aqua, 0.42), width=2)
+            draw.line([(x, yy + 5) for x, yy in points], fill=_adjust_rgb(deep, -0.12), width=1)
+
+    elif family == "paving":
+        stone = _mix_rgb(base, (205, 190, 165), 0.36)
+        draw.rectangle((0, 0, width, height), fill=_adjust_rgb(stone, 0.10))
+        tile_w = max(86, width // 5)
+        tile_h = max(54, height // 5)
+        grout = _adjust_rgb(stone, -0.12)
+        for y in range(-tile_h, height + tile_h, tile_h):
+            offset = 0 if (y // tile_h) % 2 == 0 else -tile_w // 2
+            for x in range(offset, width + tile_w, tile_w):
+                n = ((x * 17 + y * 23) % 29) / 28.0
+                color = _adjust_rgb(stone, (n - 0.5) * 0.16)
+                draw.rectangle((x, y, x + tile_w, y + tile_h), fill=color, outline=grout, width=3)
+                draw.line((x + 10, y + tile_h // 2, x + tile_w - 12, y + tile_h // 2 + ((x + y) % 7 - 3)), fill=_adjust_rgb(color, -0.10), width=1)
+
+    elif family == "metal":
+        metal = _mix_rgb(base, (36, 36, 34), 0.55)
+        for y in range(height):
+            t = y / float(max(1, height - 1))
+            draw.line((0, y, width, y), fill=_mix_rgb(_adjust_rgb(metal, 0.22), _adjust_rgb(metal, -0.18), t))
+        for y in range(0, height, 5):
+            n = ((y * 31) % 19) / 18.0
+            draw.line((0, y, width, y), fill=_adjust_rgb(metal, (n - 0.5) * 0.18), width=1)
+        for x in range(0, width, 80):
+            draw.line((x, 0, x + width // 4, height), fill=_adjust_rgb(metal, 0.18), width=2)
+
+    elif family == "planting":
+        green = _mix_rgb(base, (45, 105, 55), 0.50)
+        draw.rectangle((0, 0, width, height), fill=_adjust_rgb(green, -0.05))
+        for i in range(180):
+            x = (i * 47 + 19) % width
+            y = (i * 29 + 31) % height
+            leaf_w = 8 + (i % 18)
+            leaf_h = 14 + (i % 26)
+            n = ((i * 13) % 31) / 30.0
+            color = _adjust_rgb(green, (n - 0.5) * 0.38)
+            draw.ellipse((x, y, x + leaf_w, y + leaf_h), fill=color, outline=_adjust_rgb(color, -0.12))
+            if i % 3 == 0:
+                draw.line((x + leaf_w // 2, y + 2, x + leaf_w // 2, y + leaf_h - 2), fill=_adjust_rgb(color, 0.16), width=1)
+
+    elif family == "fabric":
+        textile = _mix_rgb(base, (178, 170, 155), 0.35)
+        draw.rectangle((0, 0, width, height), fill=textile)
+        for x in range(0, width, 8):
+            draw.line((x, 0, x, height), fill=_adjust_rgb(textile, 0.12 if (x // 8) % 2 == 0 else -0.10), width=2)
+        for y in range(0, height, 8):
+            draw.line((0, y, width, y), fill=_adjust_rgb(textile, -0.08 if (y // 8) % 2 == 0 else 0.10), width=2)
+
+    else:
+        _draw_soft_noise(draw, width, height, base, step=18)
+
+    _ensure_dir(os.path.dirname(output_path))
+    canvas.save(output_path)
+    return output_path
+
 def _extract_palette_from_image(
     path: str,
     max_colors: int = 8,
@@ -975,19 +1151,32 @@ def _extract_material_crops(
             family=family,
             source_file=str(sample.get("source_file") or f"sample_{idx}.png"),
         )
-        sample_name = f"material_{idx:02d}_{family}.png"
-        sample_path = os.path.join(sample_dir, sample_name)
-        refined_crop.save(sample_path)
+
+        reference_name = f"reference_{idx:02d}_{family}.png"
+        reference_path = os.path.join(sample_dir, reference_name)
+        refined_crop.save(reference_path)
 
         refined_avg = refined_metrics.get("average_color") or sample.get("average_color")
         refined_lum = float(refined_metrics.get("luminance", sample.get("luminance", 0.5)) or 0.5)
         refined_warm = float(refined_metrics.get("warmth", sample.get("warmth", 0.0)) or 0.0)
         refined_sat = float(refined_metrics.get("saturation", sample.get("saturation", 0.0)) or 0.0)
 
+        sample_name = f"material_{idx:02d}_{family}.png"
+        sample_path = os.path.join(sample_dir, sample_name)
+        swatch_sample = dict(sample)
+        swatch_sample["average_color"] = refined_avg
+        swatch_sample["luminance"] = round(refined_lum, 4)
+        swatch_sample["warmth"] = round(refined_warm, 4)
+        swatch_sample["saturation"] = round(refined_sat, 4)
+        swatch_sample["hue_name"] = refined_metrics.get("hue_name", sample.get("hue_name"))
+        swatch_sample["material_family"] = family
+        _generate_material_swatch(sample=swatch_sample, output_path=sample_path, width=520, height=340)
+
         output_samples.append(
             {
                 "file": os.path.relpath(sample_path, job_folder),
                 "source_file": sample.get("source_file"),
+                "reference_crop_file": os.path.relpath(reference_path, job_folder),
                 "material_family": family,
                 "label": sample.get("material_label"),
                 "confidence": sample.get("confidence"),
@@ -1005,7 +1194,7 @@ def _extract_material_crops(
                 "sample_crop_box": refined_box,
                 "sample_norm_box": refined_metrics.get("norm_box"),
                 "family_scores": sample.get("family_scores"),
-                "sample_role": "texture_patch",
+                "sample_role": "generated_material_swatch",
             }
         )
 
@@ -1112,7 +1301,7 @@ def _make_moodboard_grid(
         small_font = ImageFont.load_default()
 
     _draw_label(draw, (margin, 28), title, title_font, ink)
-    _draw_label(draw, (margin, 84), "Material palette, extracted textures, curated surface direction", subtitle_font, muted)
+    _draw_label(draw, (margin, 84), "Material palette, generated swatches, curated surface direction", subtitle_font, muted)
 
     hero_x = margin
     hero_y = 132
@@ -1352,7 +1541,7 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
             "material_samples": analysis["material_samples"],
             "summary": analysis["summary"],
             "analyzed_files": analysis["analyzed_files"],
-            "layout_version": "moodboard_v4_texture_samples",
+            "layout_version": "moodboard_v5_generated_material_swatches",
         },
     )
 
