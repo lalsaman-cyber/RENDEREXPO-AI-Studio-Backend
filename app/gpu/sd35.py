@@ -103,6 +103,11 @@ def _get_runtime() -> SD35Runtime:
     a compatibility fallback runtime.
 
     This function must not eagerly preload on import.
+
+    IMPORTANT:
+    - Do not force-load the injected runtime here globally.
+    - Sketch/controlnet routes may use dedicated runtime loading internally.
+    - Text2img/img2img load checks are handled only inside their own public runners.
     """
     global _FALLBACK_RUNTIME
 
@@ -126,6 +131,22 @@ def _get_runtime() -> SD35Runtime:
         raise RuntimeError("Fallback SD35Runtime failed to load in real mode.")
 
     return _FALLBACK_RUNTIME
+
+
+def _ensure_base_runtime_loaded(runtime: SD35Runtime, caller: str) -> None:
+    """
+    Ensure the base SD3.5 pipeline is loaded before text2img/img2img generation.
+
+    SAFETY:
+    - This helper is intentionally called only by run_sd35_txt2img() and run_sd35_img2img().
+    - It is NOT called by run_sd35_sketch_controlnet(), so the protected sketch/controlnet
+      behavior is not changed.
+    """
+    if not runtime.is_loaded:
+        runtime.load()
+
+    if not runtime.is_loaded:
+        raise RuntimeError(f"{caller} requires a loaded SD35Runtime in real mode.")
 
 
 # -------------------------------------------------------------------
@@ -377,6 +398,7 @@ def run_sd35_txt2img(job: Any, payload: Dict[str, Any]) -> str:
     """
     job_folder = _job_folder_from_payload(payload)
     runtime = _get_runtime()
+    _ensure_base_runtime_loaded(runtime, "run_sd35_txt2img")
     meta = _build_runtime_meta_for_text2img(job_folder, payload)
 
     result_meta = runtime.generate_text2img(job_folder, meta)
@@ -393,6 +415,7 @@ def run_sd35_img2img(job: Any, payload: Dict[str, Any]) -> str:
     """
     job_folder = _job_folder_from_payload(payload)
     runtime = _get_runtime()
+    _ensure_base_runtime_loaded(runtime, "run_sd35_img2img")
     meta = _build_runtime_meta_for_img2img(job_folder, payload)
 
     result_meta = runtime.generate_img2img(job_folder, meta)
