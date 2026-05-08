@@ -83,6 +83,7 @@ MOODBOARD_GRID_NAME = "moodboard_grid.png"
 PALETTE_JSON_NAME = "palette.json"
 EXTRACTED_ASSETS_JSON_NAME = "extracted_assets.json"
 OUTPUT_IMAGE_NAME = "output.png"
+MATERIAL_SAMPLES_DIR_NAME = "material_samples"
 
 
 # ---------------------------------------------------------------------
@@ -213,37 +214,73 @@ def _warmth_score(rgb: Tuple[int, int, int]) -> float:
     return float(r - b) / 255.0
 
 
-def _extract_palette_from_image(path: str, max_colors: int = 8) -> List[Dict[str, Any]]:
+def _hex_to_rgb(hex_value: str) -> Tuple[int, int, int]:
+    hx = str(hex_value or "").strip().lstrip("#")
+    if len(hx) != 6:
+        return (204, 204, 204)
+    try:
+        return tuple(int(hx[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    except Exception:
+        return (204, 204, 204)
+
+
+def _color_saturation(rgb: Tuple[int, int, int]) -> float:
+    r, g, b = [v / 255.0 for v in rgb]
+    mx = max(r, g, b)
+    mn = min(r, g, b)
+    if mx <= 0:
+        return 0.0
+    return (mx - mn) / mx
+
+
+def _is_board_background_color(rgb: Tuple[int, int, int]) -> bool:
+    lum = _relative_luminance(rgb)
+    sat = _color_saturation(rgb)
+    if lum >= 0.91 and sat <= 0.08:
+        return True
+    if min(rgb) >= 235 and max(rgb) >= 242:
+        return True
+    return False
+
+
+def _extract_palette_from_image(
+    path: str,
+    max_colors: int = 8,
+    *,
+    filter_board_background: bool = True,
+) -> List[Dict[str, Any]]:
     Image, _, _, ImageStat = _require_pil()
     img = _open_rgb(path)
 
-    # Small image for stable color extraction.
     small = img.copy()
-    small.thumbnail((240, 240))
+    small.thumbnail((260, 260))
 
-    # Adaptive quantization gives us a simple dominant palette without extra dependencies.
-    pal_img = small.convert("P", palette=Image.ADAPTIVE, colors=max_colors)
+    pal_img = small.convert("P", palette=Image.ADAPTIVE, colors=max(max_colors * 3, 12))
     palette_raw = pal_img.getpalette() or []
-    counts = pal_img.getcolors(maxcolors=240 * 240) or []
+    counts = pal_img.getcolors(maxcolors=260 * 260) or []
 
     items: List[Tuple[int, Tuple[int, int, int]]] = []
-
     for count, idx in counts:
         base = int(idx) * 3
         if base + 2 >= len(palette_raw):
             continue
-        rgb = (
-            int(palette_raw[base]),
-            int(palette_raw[base + 1]),
-            int(palette_raw[base + 2]),
-        )
+        rgb = (int(palette_raw[base]), int(palette_raw[base + 1]), int(palette_raw[base + 2]))
+        if filter_board_background and _is_board_background_color(rgb):
+            continue
         items.append((int(count), rgb))
 
+    if not items:
+        for count, idx in counts:
+            base = int(idx) * 3
+            if base + 2 >= len(palette_raw):
+                continue
+            rgb = (int(palette_raw[base]), int(palette_raw[base + 1]), int(palette_raw[base + 2]))
+            items.append((int(count), rgb))
+
     items.sort(key=lambda x: x[0], reverse=True)
-
     total = sum(c for c, _ in items) or 1
-    result: List[Dict[str, Any]] = []
 
+    result: List[Dict[str, Any]] = []
     for count, rgb in items[:max_colors]:
         result.append(
             {
@@ -252,10 +289,10 @@ def _extract_palette_from_image(path: str, max_colors: int = 8) -> List[Dict[str
                 "percentage": round(float(count) / float(total), 4),
                 "luminance": round(_relative_luminance(rgb), 4),
                 "warmth": round(_warmth_score(rgb), 4),
+                "saturation": round(_color_saturation(rgb), 4),
             }
         )
 
-    # Fallback average if quantization returns nothing.
     if not result:
         stat = ImageStat.Stat(img)
         avg = tuple(int(v) for v in stat.mean[:3])
@@ -266,6 +303,7 @@ def _extract_palette_from_image(path: str, max_colors: int = 8) -> List[Dict[str
                 "percentage": 1.0,
                 "luminance": round(_relative_luminance(avg), 4),  # type: ignore[arg-type]
                 "warmth": round(_warmth_score(avg), 4),  # type: ignore[arg-type]
+                "saturation": round(_color_saturation(avg), 4),  # type: ignore[arg-type]
             }
         )
 
@@ -317,7 +355,7 @@ def _merge_palettes(image_paths: List[str], max_colors: int = 10) -> List[Dict[s
 
     for path in image_paths:
         try:
-            colors = _extract_palette_from_image(path, max_colors=6)
+            colors = _extract_palette_from_image(path, max_colors=8, filter_board_background=True)
             for c in colors:
                 c = dict(c)
                 c["source_file"] = os.path.basename(path)
@@ -325,13 +363,11 @@ def _merge_palettes(image_paths: List[str], max_colors: int = 10) -> List[Dict[s
         except Exception:
             continue
 
-    # Simple de-duplication by hex, keeping highest percentage.
     by_hex: Dict[str, Dict[str, Any]] = {}
     for c in all_colors:
         hx = str(c.get("hex") or "").upper()
         if not hx:
             continue
-
         if hx not in by_hex:
             by_hex[hx] = c
         else:
@@ -343,7 +379,148 @@ def _merge_palettes(image_paths: List[str], max_colors: int = 10) -> List[Dict[s
     merged = list(by_hex.values())
     merged.sort(key=lambda x: float(x.get("percentage", 0.0)), reverse=True)
 
-    return merged[:max_colors]
+    selected = merged[:max_colors]
+    total = sum(float(c.get("percentage", 0.0)) for c in selected) or 1.0
+    for c in selected:
+        c["percentage_normalized"] = round(float(c.get("percentage", 0.0)) / total, 4)
+
+    return selected
+
+
+def _material_label_from_region(region_name: str, feature: Dict[str, Any]) -> str:
+    lum = float(feature.get("luminance", 0.5) or 0.5)
+    warm = float(feature.get("warmth", 0.0) or 0.0)
+    temp = str(feature.get("temperature") or "neutral")
+    brightness = str(feature.get("brightness") or "medium")
+
+    lower = region_name.lower()
+    if "ceiling" in lower or "top" in lower:
+        return "Ceiling / wood tone"
+    if "floor" in lower or "bottom" in lower:
+        return "Floor / ground finish"
+    if "left" in lower:
+        return "Wall / facade finish"
+    if "right" in lower:
+        return "Glass / side material"
+    if "center" in lower:
+        return "Primary surface"
+    if "detail" in lower:
+        return "Detail texture"
+
+    if warm > 0.12:
+        return "Warm material sample"
+    if temp == "cool":
+        return "Cool accent sample"
+    if lum < 0.35:
+        return "Dark contrast sample"
+    if brightness == "bright":
+        return "Light neutral sample"
+    return "Material sample"
+
+
+def _extract_material_crops(
+    *,
+    job_folder: str,
+    image_paths: List[str],
+    max_samples: int = 8,
+) -> List[Dict[str, Any]]:
+    sample_dir = os.path.join(job_folder, MATERIAL_SAMPLES_DIR_NAME)
+    _ensure_dir(sample_dir)
+
+    regions = [
+        ("center_material", (0.24, 0.22, 0.76, 0.78)),
+        ("upper_ceiling_sky", (0.18, 0.02, 0.82, 0.34)),
+        ("lower_floor_ground", (0.16, 0.64, 0.84, 0.98)),
+        ("left_surface", (0.00, 0.20, 0.36, 0.86)),
+        ("right_surface", (0.64, 0.20, 1.00, 0.86)),
+        ("detail_top_left", (0.06, 0.08, 0.44, 0.46)),
+        ("detail_top_right", (0.56, 0.08, 0.94, 0.46)),
+        ("detail_bottom_right", (0.54, 0.54, 0.94, 0.94)),
+    ]
+
+    samples: List[Dict[str, Any]] = []
+
+    for img_idx, path in enumerate(image_paths):
+        try:
+            img = _open_rgb(path)
+        except Exception:
+            continue
+
+        w, h = img.size
+        for region_name, box_norm in regions:
+            if len(samples) >= max_samples:
+                break
+
+            x1 = max(0, min(w - 1, int(box_norm[0] * w)))
+            y1 = max(0, min(h - 1, int(box_norm[1] * h)))
+            x2 = max(x1 + 1, min(w, int(box_norm[2] * w)))
+            y2 = max(y1 + 1, min(h, int(box_norm[3] * h)))
+
+            crop = img.crop((x1, y1, x2, y2))
+            crop.thumbnail((420, 300))
+
+            tmp_path = os.path.join(sample_dir, f"_tmp_{img_idx}_{region_name}.png")
+            crop.save(tmp_path)
+
+            try:
+                feature = _extract_basic_image_features(tmp_path)
+                avg_rgb_dict = feature.get("average_color", {}).get("rgb", {})
+                avg_rgb = (
+                    int(avg_rgb_dict.get("r", 204)),
+                    int(avg_rgb_dict.get("g", 204)),
+                    int(avg_rgb_dict.get("b", 204)),
+                )
+                if _is_board_background_color(avg_rgb) and len(samples) >= 3:
+                    os.remove(tmp_path)
+                    continue
+            except Exception:
+                feature = {}
+
+            sample_name = f"material_{len(samples) + 1:02d}_{region_name}.png"
+            sample_path = os.path.join(sample_dir, sample_name)
+            os.replace(tmp_path, sample_path)
+
+            samples.append(
+                {
+                    "file": os.path.relpath(sample_path, job_folder),
+                    "source_file": os.path.basename(path),
+                    "region": region_name,
+                    "label": _material_label_from_region(region_name, feature),
+                    "crop_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "average_color": feature.get("average_color"),
+                    "brightness": feature.get("brightness"),
+                    "temperature": feature.get("temperature"),
+                    "luminance": feature.get("luminance"),
+                    "warmth": feature.get("warmth"),
+                }
+            )
+
+        if len(samples) >= max_samples:
+            break
+
+    return samples
+
+
+def _fit_crop_to_box(img: Any, box_w: int, box_h: int) -> Any:
+    Image, _, _, _ = _require_pil()
+    src_w, src_h = img.size
+    if src_w <= 0 or src_h <= 0:
+        return Image.new("RGB", (box_w, box_h), (230, 228, 222))
+
+    scale = max(box_w / float(src_w), box_h / float(src_h))
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
+    resized = img.resize((new_w, new_h))
+    left = max(0, (new_w - box_w) // 2)
+    top = max(0, (new_h - box_h) // 2)
+    return resized.crop((left, top, left + box_w, top + box_h))
+
+
+def _draw_label(draw: Any, xy: Tuple[int, int], text: str, font: Any, fill: Tuple[int, int, int] = (45, 45, 45)) -> None:
+    try:
+        draw.text(xy, text, fill=fill, font=font)
+    except Exception:
+        draw.text(xy, str(text), fill=fill)
 
 
 def _make_moodboard_grid(
@@ -353,86 +530,168 @@ def _make_moodboard_grid(
     output_path: str,
     title: str = "RENDEREXPO Moodboard",
     max_tiles: int = 12,
+    material_samples: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     Image, ImageDraw, ImageFont, _ = _require_pil()
 
     if not image_paths and not palette:
         raise RuntimeError("Cannot create moodboard grid without images or palette.")
 
-    canvas_w = 1600
-    canvas_h = 1100
-    margin = 48
-    gap = 22
-    title_h = 84
-    palette_h = 150
+    material_samples = material_samples or []
 
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (245, 244, 241))
+    canvas_w = 1800
+    canvas_h = 1200
+    margin = 52
+    gap = 22
+
+    bg = (244, 242, 236)
+    ink = (35, 35, 33)
+    muted = (104, 101, 95)
+    line = (206, 202, 194)
+    card = (251, 250, 246)
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
     draw = ImageDraw.Draw(canvas)
 
     try:
-        title_font = ImageFont.truetype("DejaVuSans.ttf", 42)
-        small_font = ImageFont.truetype("DejaVuSans.ttf", 18)
+        title_font = ImageFont.truetype("DejaVuSans.ttf", 44)
+        subtitle_font = ImageFont.truetype("DejaVuSans.ttf", 22)
+        label_font = ImageFont.truetype("DejaVuSans.ttf", 18)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 15)
     except Exception:
         title_font = ImageFont.load_default()
+        subtitle_font = ImageFont.load_default()
+        label_font = ImageFont.load_default()
         small_font = ImageFont.load_default()
 
-    draw.text((margin, 28), title, fill=(35, 35, 35), font=title_font)
+    _draw_label(draw, (margin, 28), title, title_font, ink)
+    _draw_label(draw, (margin, 84), "Material palette, extracted surfaces, atmospheric direction", subtitle_font, muted)
 
-    # Image tile area.
-    tile_area_top = margin + title_h
-    tile_area_bottom = canvas_h - margin - palette_h
-    tile_area_h = tile_area_bottom - tile_area_top
-    tile_area_w = canvas_w - margin * 2
+    hero_x = margin
+    hero_y = 132
+    hero_w = 1030
+    hero_h = 700
 
-    selected_images = image_paths[:max_tiles]
+    draw.rounded_rectangle(
+        (hero_x - 12, hero_y - 12, hero_x + hero_w + 12, hero_y + hero_h + 54),
+        radius=18,
+        fill=card,
+        outline=line,
+        width=2,
+    )
 
-    if selected_images:
-        n = len(selected_images)
-        cols = min(4, max(2, int(math.ceil(math.sqrt(n)))))
-        rows = int(math.ceil(n / cols))
+    if image_paths:
+        try:
+            hero = _open_rgb(image_paths[0])
+            hero_img = _fit_crop_to_box(hero, hero_w, hero_h)
+            canvas.paste(hero_img, (hero_x, hero_y))
+        except Exception:
+            draw.rectangle((hero_x, hero_y, hero_x + hero_w, hero_y + hero_h), fill=(225, 222, 216))
+            _draw_label(draw, (hero_x + 20, hero_y + 20), os.path.basename(image_paths[0]), label_font, muted)
 
-        tile_w = int((tile_area_w - gap * (cols - 1)) / cols)
-        tile_h = int((tile_area_h - gap * (rows - 1)) / rows)
+    _draw_label(draw, (hero_x, hero_y + hero_h + 18), "HERO REFERENCE", label_font, ink)
 
-        for idx, path in enumerate(selected_images):
-            row = idx // cols
-            col = idx % cols
-            x = margin + col * (tile_w + gap)
-            y = tile_area_top + row * (tile_h + gap)
+    stack_x = hero_x + hero_w + 46
+    stack_y = hero_y
+    stack_w = canvas_w - margin - stack_x
+    card_h = 188
 
+    resolved_samples: List[Dict[str, Any]] = []
+    for sample in material_samples[:5]:
+        rel = str(sample.get("file") or "")
+        if not rel:
+            continue
+        abs_path = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(output_path), rel)
+        if os.path.isfile(abs_path):
+            s = dict(sample)
+            s["_abs_path"] = abs_path
+            resolved_samples.append(s)
+
+    for idx in range(5):
+        y = stack_y + idx * (card_h + gap)
+        draw.rounded_rectangle(
+            (stack_x, y, stack_x + stack_w, y + card_h),
+            radius=16,
+            fill=card,
+            outline=line,
+            width=2,
+        )
+
+        label = "Material sample"
+        sample_img = None
+
+        if idx < len(resolved_samples):
+            sample = resolved_samples[idx]
+            label = str(sample.get("label") or sample.get("region") or label)
             try:
-                img = _open_rgb(path)
-                img.thumbnail((tile_w, tile_h))
-                bg = Image.new("RGB", (tile_w, tile_h), (232, 230, 225))
-                ox = (tile_w - img.width) // 2
-                oy = (tile_h - img.height) // 2
-                bg.paste(img, (ox, oy))
-                canvas.paste(bg, (x, y))
-                draw.rectangle((x, y, x + tile_w, y + tile_h), outline=(210, 208, 202), width=2)
+                sample_img = _open_rgb(str(sample["_abs_path"]))
             except Exception:
-                draw.rectangle((x, y, x + tile_w, y + tile_h), fill=(225, 220, 214), outline=(210, 208, 202), width=2)
-                draw.text((x + 12, y + 12), os.path.basename(path), fill=(80, 80, 80), font=small_font)
+                sample_img = None
+        elif image_paths:
+            try:
+                ref = _open_rgb(image_paths[0])
+                w, h = ref.size
+                fx1 = int((0.08 + 0.11 * idx) * w) % max(1, w - 1)
+                fy1 = int((0.12 + 0.13 * idx) * h) % max(1, h - 1)
+                fx2 = min(w, fx1 + max(80, int(0.36 * w)))
+                fy2 = min(h, fy1 + max(80, int(0.24 * h)))
+                sample_img = ref.crop((fx1, fy1, fx2, fy2))
+                label = ["Surface", "Stone / wall", "Wood / ceiling", "Glass / light", "Water / accent"][idx]
+            except Exception:
+                sample_img = None
 
-    # Palette strip.
-    pal_top = canvas_h - margin - palette_h + 26
-    swatch_count = max(1, min(len(palette), 10))
-    swatch_w = int((canvas_w - margin * 2 - gap * (swatch_count - 1)) / swatch_count)
-    swatch_h = 82
+        img_x = stack_x + 16
+        img_y = y + 16
+        img_w = 190
+        img_h = card_h - 32
+
+        if sample_img is not None:
+            fitted = _fit_crop_to_box(sample_img, img_w, img_h)
+            canvas.paste(fitted, (img_x, img_y))
+        else:
+            draw.rounded_rectangle((img_x, img_y, img_x + img_w, img_y + img_h), radius=12, fill=(226, 223, 217))
+
+        _draw_label(draw, (stack_x + 230, y + 38), label.upper(), label_font, ink)
+        _draw_label(draw, (stack_x + 230, y + 72), "extracted finish cue", small_font, muted)
+        _draw_label(draw, (stack_x + 230, y + 102), "RENDEREXPO material direction", small_font, muted)
+
+    lower_y = hero_y + hero_h + 92
+    draw.rounded_rectangle(
+        (margin, lower_y, canvas_w - margin, canvas_h - margin),
+        radius=18,
+        fill=card,
+        outline=line,
+        width=2,
+    )
+
+    _draw_label(draw, (margin + 24, lower_y + 22), "COLOR + ATMOSPHERE", label_font, ink)
+
+    pal_x = margin + 24
+    pal_y = lower_y + 64
+    pal_w = canvas_w - margin * 2 - 48
+    swatch_count = max(1, min(len(palette), 8))
+    swatch_gap = 16
+    swatch_w = int((pal_w - swatch_gap * (swatch_count - 1)) / swatch_count)
+    swatch_h = 104
 
     for idx, color in enumerate(palette[:swatch_count]):
         hx = str(color.get("hex") or "#CCCCCC").upper()
-        x = margin + idx * (swatch_w + gap)
-        y = pal_top
+        x = pal_x + idx * (swatch_w + swatch_gap)
+        y = pal_y
 
-        try:
-            rgb = tuple(int(hx.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-        except Exception:
-            rgb = (204, 204, 204)
-
-        draw.rectangle((x, y, x + swatch_w, y + swatch_h), fill=rgb, outline=(160, 160, 160), width=1)
+        rgb = _hex_to_rgb(hx)
+        draw.rounded_rectangle((x, y, x + swatch_w, y + swatch_h), radius=14, fill=rgb, outline=(150, 148, 142), width=1)
 
         text_fill = (20, 20, 20) if _relative_luminance(rgb) > 0.55 else (245, 245, 245)
-        draw.text((x + 12, y + 26), hx, fill=text_fill, font=small_font)
+        _draw_label(draw, (x + 14, y + 30), hx, label_font, text_fill)
+
+        pct = color.get("percentage_normalized", color.get("percentage"))
+        if pct is not None:
+            try:
+                pct_text = f"{float(pct) * 100:.0f}%"
+                _draw_label(draw, (x + 14, y + 62), pct_text, small_font, text_fill)
+            except Exception:
+                pass
 
     _ensure_dir(os.path.dirname(output_path))
     canvas.save(output_path)
@@ -482,7 +741,12 @@ def _build_style_summary(palette: List[Dict[str, Any]], assets: List[Dict[str, A
 # Analysis builders
 # ---------------------------------------------------------------------
 
-def _analyze_images(image_paths: List[str]) -> Dict[str, Any]:
+def _analyze_images(
+    image_paths: List[str],
+    *,
+    job_folder: Optional[str] = None,
+    material_samples: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     if not image_paths:
         raise RuntimeError("Moodboard analysis requires at least one image.")
 
@@ -493,25 +757,23 @@ def _analyze_images(image_paths: List[str]) -> Dict[str, Any]:
         try:
             assets.append(_extract_basic_image_features(path))
         except Exception as exc:
-            assets.append(
-                {
-                    "file": os.path.basename(path),
-                    "error": str(exc),
-                }
-            )
+            assets.append({"file": os.path.basename(path), "error": str(exc)})
 
     summary = _build_style_summary(palette, assets)
+    material_samples = material_samples or []
 
     return {
         "palette": palette,
         "assets": assets,
+        "material_samples": material_samples,
         "summary": summary,
         "analyzed_files": [os.path.basename(p) for p in image_paths],
     }
 
 
 def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str) -> Dict[str, str]:
-    analysis = _analyze_images(image_paths)
+    material_samples = _extract_material_crops(job_folder=job_folder, image_paths=image_paths, max_samples=8)
+    analysis = _analyze_images(image_paths, job_folder=job_folder, material_samples=material_samples)
 
     palette_path = os.path.join(job_folder, PALETTE_JSON_NAME)
     assets_path = os.path.join(job_folder, EXTRACTED_ASSETS_JSON_NAME)
@@ -523,6 +785,10 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
             "created_at": _utc_now(),
             "palette": analysis["palette"],
             "summary": analysis["summary"],
+            "palette_policy": {
+                "filter_board_background": True,
+                "reason": "Avoid white/off-white moodboard canvas dominating architectural material palette.",
+            },
         },
     )
 
@@ -531,8 +797,10 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
         {
             "created_at": _utc_now(),
             "assets": analysis["assets"],
+            "material_samples": analysis["material_samples"],
             "summary": analysis["summary"],
             "analyzed_files": analysis["analyzed_files"],
+            "layout_version": "moodboard_v2_material_stack",
         },
     )
 
@@ -542,6 +810,7 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
         output_path=grid_path,
         title=title,
         max_tiles=12,
+        material_samples=analysis["material_samples"],
     )
 
     return {
@@ -572,21 +841,24 @@ def _style_text_from_analysis(job_folder: str, fallback_images: List[str]) -> st
 
     if not palette_data or not assets_data:
         try:
-            _write_analysis_outputs(
-                job_folder=job_folder,
-                image_paths=fallback_images,
-                title="RENDEREXPO Moodboard Reference",
-            )
+            _write_analysis_outputs(job_folder=job_folder, image_paths=fallback_images, title="RENDEREXPO Moodboard Reference")
             palette_data = _read_json(palette_path)
             assets_data = _read_json(assets_path)
         except Exception:
             pass
 
     colors = []
-    for c in (palette_data.get("palette") or [])[:6]:
+    for c in (palette_data.get("palette") or [])[:5]:
         hx = c.get("hex")
         if hx:
             colors.append(str(hx))
+
+    material_labels: List[str] = []
+    for sample in (assets_data.get("material_samples") or [])[:6]:
+        if isinstance(sample, dict):
+            label = str(sample.get("label") or "").strip()
+            if label and label.lower() not in [x.lower() for x in material_labels]:
+                material_labels.append(label)
 
     summary = {}
     if isinstance(palette_data.get("summary"), dict):
@@ -594,15 +866,14 @@ def _style_text_from_analysis(job_folder: str, fallback_images: List[str]) -> st
     if isinstance(assets_data.get("summary"), dict):
         summary.update(assets_data.get("summary") or {})
 
-    style_summary = str(summary.get("style_summary") or "refined architectural moodboard")
     temp = str(summary.get("palette_temperature") or "neutral")
     brightness = str(summary.get("brightness") or "medium")
-
-    color_text = ", ".join(colors) if colors else "cohesive interior design palette"
+    color_text = ", ".join(colors) if colors else "cohesive architectural palette"
+    material_text = ", ".join(material_labels) if material_labels else "wood, stone, glass, fabric, metal accents"
 
     return (
-        f"{style_summary}, {brightness} {temp} palette, "
-        f"dominant colors {color_text}, coordinated materials, refined design direction"
+        f"{brightness} {temp} palette, colors {color_text}, "
+        f"materials {material_text}, refined architectural interior direction"
     )
 
 
@@ -611,13 +882,12 @@ def _build_moodboard_to_space_prompt(job_folder: str, meta: Dict[str, Any], mood
     style_text = _style_text_from_analysis(job_folder, moodboard_images)
 
     base = (
-        "photorealistic architectural interior visualization inspired by the uploaded moodboard, "
-        "cohesive material palette, realistic furniture and finishes, refined lighting, "
-        "high-end residential or hospitality design, realistic spatial depth, professional design presentation"
+        "photorealistic luxury architectural interior, cohesive moodboard-driven materials, "
+        "realistic furniture, warm ambient lighting, refined spatial depth"
     )
 
     if user_prompt:
-        return f"{base}, {style_text}, client direction: {user_prompt}"
+        return f"{base}, {style_text}, {user_prompt}"
 
     return f"{base}, {style_text}"
 
