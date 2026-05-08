@@ -297,6 +297,165 @@ def _box_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> floa
     return float(inter) / float(a_area + b_area - inter)
 
 
+
+def _iter_subboxes(width: int, height: int, scales: List[Tuple[float, float]]) -> List[Tuple[int, int, int, int]]:
+    boxes: List[Tuple[int, int, int, int]] = []
+    x_positions = [0.0, 0.12, 0.24, 0.38]
+    y_positions = [0.0, 0.12, 0.24, 0.38]
+
+    for sw, sh in scales:
+        box_w = max(56, min(width, int(width * sw)))
+        box_h = max(56, min(height, int(height * sh)))
+        if box_w >= width:
+            box_w = width
+        if box_h >= height:
+            box_h = height
+
+        for xn in x_positions:
+            for yn in y_positions:
+                x1 = int((width - box_w) * xn)
+                y1 = int((height - box_h) * yn)
+                x1 = max(0, min(width - box_w, x1))
+                y1 = max(0, min(height - box_h, y1))
+                x2 = x1 + box_w
+                y2 = y1 + box_h
+                if x2 - x1 >= 48 and y2 - y1 >= 48:
+                    boxes.append((x1, y1, x2, y2))
+
+    boxes.append((0, 0, width, height))
+
+    deduped: List[Tuple[int, int, int, int]] = []
+    seen = set()
+    for box in boxes:
+        if box not in seen:
+            seen.add(box)
+            deduped.append(box)
+    return deduped
+
+
+
+def _score_texture_patch(metrics: Dict[str, Any], family: str) -> float:
+    family_score = _score_material_family(metrics, family)
+    texture = float(metrics.get("texture_score", 0.0) or 0.0)
+    detail = float(metrics.get("detail_score", 0.0) or 0.0)
+    lum = float(metrics.get("luminance", 0.5) or 0.5)
+    sat = float(metrics.get("saturation", 0.0) or 0.0)
+    hue_name = str(metrics.get("hue_name") or "")
+    aspect = float(metrics.get("aspect_ratio", 1.0) or 1.0)
+    norm = metrics.get("norm_box") or {}
+    x1n = float(norm.get("x1n", 0.0) or 0.0)
+    y1n = float(norm.get("y1n", 0.0) or 0.0)
+    x2n = float(norm.get("x2n", 1.0) or 1.0)
+    y2n = float(norm.get("y2n", 1.0) or 1.0)
+    cx = (x1n + x2n) / 2.0
+    cy = (y1n + y2n) / 2.0
+    center_bias = 1.0 - min(1.0, abs(cx - 0.5) + abs(cy - 0.5))
+
+    score = family_score * 0.58 + center_bias * 0.08
+
+    if family == "stone":
+        score += texture * 0.22 + detail * 0.10
+        score += 0.08 * (1.0 if sat <= 0.30 else 0.0)
+        score += 0.06 * (1.0 if 0.60 <= aspect <= 1.80 else 0.0)
+    elif family == "wood":
+        score += texture * 0.18 + detail * 0.10
+        score += 0.08 * (1.0 if hue_name in {"orange", "yellow", "red", "brown"} else 0.0)
+        score += 0.06 * (1.0 if 0.55 <= aspect <= 1.90 else 0.0)
+    elif family == "glass":
+        score += 0.12 * (1.0 if sat <= 0.30 else 0.0)
+        score += 0.10 * (1.0 if 0.25 <= lum <= 0.82 else 0.0)
+        score += 0.10 * (1.0 - min(1.0, abs(detail - 0.30) / 0.50))
+    elif family == "water":
+        score += 0.18 * (1.0 if hue_name in {"cyan", "blue"} else 0.0)
+        score += texture * 0.10 + detail * 0.08 + sat * 0.10
+        score += 0.06 * (1.0 if cy >= 0.42 else 0.0)
+    elif family == "paving":
+        score += texture * 0.18 + detail * 0.10
+        score += 0.08 * (1.0 if sat <= 0.24 else 0.0)
+        score += 0.06 * (1.0 if cy >= 0.45 else 0.0)
+    elif family == "metal":
+        score += texture * 0.12 + detail * 0.16
+        score += 0.08 * (1.0 if sat <= 0.22 else 0.0)
+        score += 0.06 * (1.0 if lum <= 0.35 else 0.0)
+    elif family == "planting":
+        score += texture * 0.12 + detail * 0.10 + sat * 0.12
+        score += 0.08 * (1.0 if hue_name == "green" else 0.0)
+    elif family == "fabric":
+        score += texture * 0.10 + detail * 0.10
+        score += 0.08 * (1.0 if 0.42 <= lum <= 0.88 else 0.0)
+        score += 0.06 * (1.0 if sat <= 0.24 else 0.0)
+
+    return round(_clamp(score, 0.0, 1.0), 4)
+
+
+
+def _refine_material_patch(
+    crop: Any,
+    *,
+    family: str,
+    source_file: str,
+) -> Tuple[Any, Dict[str, Any], Dict[str, int]]:
+    src_w, src_h = crop.size
+    if src_w < 72 or src_h < 72:
+        metrics = _compute_crop_metrics(
+            crop,
+            box=(0, 0, src_w, src_h),
+            source_file=source_file,
+            norm_box={"x1n": 0.0, "y1n": 0.0, "x2n": 1.0, "y2n": 1.0},
+        )
+        return crop.copy(), metrics, {"x1": 0, "y1": 0, "x2": src_w, "y2": src_h}
+
+    if family in {"stone", "wood", "paving", "metal"}:
+        scales = [(0.52, 0.52), (0.60, 0.56), (0.68, 0.62)]
+    elif family in {"glass", "water"}:
+        scales = [(0.60, 0.48), (0.72, 0.54), (0.84, 0.58)]
+    else:
+        scales = [(0.56, 0.56), (0.68, 0.60), (0.80, 0.64)]
+
+    best_crop = crop.copy()
+    best_metrics = _compute_crop_metrics(
+        crop,
+        box=(0, 0, src_w, src_h),
+        source_file=source_file,
+        norm_box={"x1n": 0.0, "y1n": 0.0, "x2n": 1.0, "y2n": 1.0},
+    )
+    best_score = _score_texture_patch(best_metrics, family)
+    best_box = {"x1": 0, "y1": 0, "x2": src_w, "y2": src_h}
+
+    for x1, y1, x2, y2 in _iter_subboxes(src_w, src_h, scales):
+        sub = crop.crop((x1, y1, x2, y2))
+        metrics = _compute_crop_metrics(
+            sub,
+            box=(x1, y1, x2, y2),
+            source_file=source_file,
+            norm_box={
+                "x1n": round(x1 / float(src_w), 4),
+                "y1n": round(y1 / float(src_h), 4),
+                "x2n": round(x2 / float(src_w), 4),
+                "y2n": round(y2 / float(src_h), 4),
+            },
+        )
+        avg_rgb_dict = metrics.get("average_color", {}).get("rgb", {})
+        avg_rgb = (
+            int(avg_rgb_dict.get("r", 204)),
+            int(avg_rgb_dict.get("g", 204)),
+            int(avg_rgb_dict.get("b", 204)),
+        )
+        if _is_board_background_color(avg_rgb):
+            continue
+        if float(metrics.get("sky_score", 0.0) or 0.0) >= 0.72:
+            continue
+
+        score = _score_texture_patch(metrics, family)
+        if score > best_score:
+            best_score = score
+            best_crop = sub.copy()
+            best_metrics = metrics
+            best_box = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    return best_crop, best_metrics, best_box
+
+
 def _compute_crop_metrics(img: Any, *, box: Tuple[int, int, int, int], source_file: str, norm_box: Dict[str, float]) -> Dict[str, Any]:
     _, _, _, ImageStat = _require_pil()
     stat = ImageStat.Stat(img)
@@ -811,9 +970,19 @@ def _extract_material_crops(
         if crop is None:
             continue
         family = str(sample.get("material_family") or f"sample_{idx}")
+        refined_crop, refined_metrics, refined_box = _refine_material_patch(
+            crop,
+            family=family,
+            source_file=str(sample.get("source_file") or f"sample_{idx}.png"),
+        )
         sample_name = f"material_{idx:02d}_{family}.png"
         sample_path = os.path.join(sample_dir, sample_name)
-        crop.save(sample_path)
+        refined_crop.save(sample_path)
+
+        refined_avg = refined_metrics.get("average_color") or sample.get("average_color")
+        refined_lum = float(refined_metrics.get("luminance", sample.get("luminance", 0.5)) or 0.5)
+        refined_warm = float(refined_metrics.get("warmth", sample.get("warmth", 0.0)) or 0.0)
+        refined_sat = float(refined_metrics.get("saturation", sample.get("saturation", 0.0)) or 0.0)
 
         output_samples.append(
             {
@@ -822,18 +991,21 @@ def _extract_material_crops(
                 "material_family": family,
                 "label": sample.get("material_label"),
                 "confidence": sample.get("confidence"),
-                "texture_score": sample.get("texture_score"),
-                "detail_score": sample.get("detail_score"),
-                "hue_name": sample.get("hue_name"),
-                "average_color": sample.get("average_color"),
-                "brightness": "bright" if float(sample.get("luminance", 0.5) or 0.5) >= 0.58 else ("dark" if float(sample.get("luminance", 0.5) or 0.5) <= 0.28 else "medium"),
-                "temperature": "warm" if float(sample.get("warmth", 0.0) or 0.0) > 0.12 else ("cool" if float(sample.get("warmth", 0.0) or 0.0) < -0.12 else "neutral"),
-                "luminance": sample.get("luminance"),
-                "warmth": sample.get("warmth"),
-                "saturation": sample.get("saturation"),
+                "texture_score": refined_metrics.get("texture_score", sample.get("texture_score")),
+                "detail_score": refined_metrics.get("detail_score", sample.get("detail_score")),
+                "hue_name": refined_metrics.get("hue_name", sample.get("hue_name")),
+                "average_color": refined_avg,
+                "brightness": "bright" if refined_lum >= 0.58 else ("dark" if refined_lum <= 0.28 else "medium"),
+                "temperature": "warm" if refined_warm > 0.12 else ("cool" if refined_warm < -0.12 else "neutral"),
+                "luminance": round(refined_lum, 4),
+                "warmth": round(refined_warm, 4),
+                "saturation": round(refined_sat, 4),
                 "crop_box": sample.get("crop_box"),
                 "norm_box": sample.get("norm_box"),
+                "sample_crop_box": refined_box,
+                "sample_norm_box": refined_metrics.get("norm_box"),
                 "family_scores": sample.get("family_scores"),
+                "sample_role": "texture_patch",
             }
         )
 
@@ -860,6 +1032,42 @@ def _draw_label(draw: Any, xy: Tuple[int, int], text: str, font: Any, fill: Tupl
         draw.text(xy, text, fill=fill, font=font)
     except Exception:
         draw.text(xy, str(text), fill=fill)
+
+
+
+
+def _material_finish_note(sample: Dict[str, Any]) -> str:
+    family = str(sample.get("material_family") or "material").lower()
+    temperature = str(sample.get("temperature") or "neutral").lower()
+    brightness = str(sample.get("brightness") or "medium").lower()
+    hue_name = str(sample.get("hue_name") or "tone").lower()
+
+    hue_note = {
+        "gray": "neutral",
+        "black": "dark",
+        "white": "light",
+        "cyan": "aqua",
+    }.get(hue_name, hue_name)
+
+    if family == "stone":
+        if hue_note in {"neutral", "dark", "light"}:
+            return f"{hue_note} stone texture"
+        return f"{temperature} {hue_note} stone texture"
+    if family == "wood":
+        return f"{temperature} wood grain sample"
+    if family == "glass":
+        return f"{brightness} {hue_note} glazing cue"
+    if family == "water":
+        return f"{brightness} aqua reflective surface"
+    if family == "paving":
+        return f"{brightness} paving texture sample"
+    if family == "metal":
+        return f"{brightness} metal finish cue"
+    if family == "planting":
+        return f"{temperature} organic foliage texture"
+    if family == "fabric":
+        return f"{brightness} textile finish cue"
+    return "material texture sample"
 
 
 def _make_moodboard_grid(
@@ -904,7 +1112,7 @@ def _make_moodboard_grid(
         small_font = ImageFont.load_default()
 
     _draw_label(draw, (margin, 28), title, title_font, ink)
-    _draw_label(draw, (margin, 84), "Material palette, extracted textures, atmospheric direction", subtitle_font, muted)
+    _draw_label(draw, (margin, 84), "Material palette, extracted textures, curated surface direction", subtitle_font, muted)
 
     hero_x = margin
     hero_y = 132
@@ -991,16 +1199,11 @@ def _make_moodboard_grid(
             draw.rounded_rectangle((img_x, img_y, img_x + img_w, img_y + img_h), radius=12, fill=(226, 223, 217))
 
         _draw_label(draw, (stack_x + 230, y + 38), label.upper(), label_font, ink)
-        _draw_label(draw, (stack_x + 230, y + 68), str((sample.get("material_family") if idx < len(resolved_samples) else "sample") if idx < len(resolved_samples) else "material cue").replace("_", " ").title() if idx < len(resolved_samples) else "material cue", small_font, muted)
+        family_text = str((sample.get("material_family") if idx < len(resolved_samples) else "sample") if idx < len(resolved_samples) else "material cue").replace("_", " ").title() if idx < len(resolved_samples) else "material cue"
+        _draw_label(draw, (stack_x + 230, y + 68), family_text, small_font, muted)
         if idx < len(resolved_samples):
-            conf = resolved_samples[idx].get("confidence")
-            tex = resolved_samples[idx].get("texture_score")
-            detail_line = []
-            if conf is not None:
-                detail_line.append(f"conf {int(float(conf) * 100):02d}%")
-            if tex is not None:
-                detail_line.append(f"texture {int(float(tex) * 100):02d}%")
-            _draw_label(draw, (stack_x + 230, y + 96), " · ".join(detail_line) or "heuristic material extraction", small_font, muted)
+            finish_note = _material_finish_note(resolved_samples[idx])
+            _draw_label(draw, (stack_x + 230, y + 96), finish_note, small_font, muted)
         else:
             _draw_label(draw, (stack_x + 230, y + 96), "RENDEREXPO material direction", small_font, muted)
 
@@ -1149,7 +1352,7 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
             "material_samples": analysis["material_samples"],
             "summary": analysis["summary"],
             "analyzed_files": analysis["analyzed_files"],
-            "layout_version": "moodboard_v3_semantic_materials",
+            "layout_version": "moodboard_v4_texture_samples",
         },
     )
 
