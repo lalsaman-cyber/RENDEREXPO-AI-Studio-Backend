@@ -64,6 +64,7 @@ without disturbing the other services.
 
 from __future__ import annotations
 
+import colorsys
 import json
 import math
 import os
@@ -243,6 +244,258 @@ def _is_board_background_color(rgb: Tuple[int, int, int]) -> bool:
     return False
 
 
+def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, float(value)))
+
+
+def _rgb_to_hsv_tuple(rgb: Tuple[int, int, int]) -> Tuple[float, float, float]:
+    r, g, b = [max(0.0, min(1.0, v / 255.0)) for v in rgb]
+    return colorsys.rgb_to_hsv(r, g, b)
+
+
+def _hue_name(rgb: Tuple[int, int, int]) -> str:
+    h, s, v = _rgb_to_hsv_tuple(rgb)
+    if v <= 0.08:
+        return "black"
+    if s <= 0.10 and v >= 0.88:
+        return "white"
+    if s <= 0.12:
+        return "gray"
+
+    deg = h * 360.0
+    if deg < 18 or deg >= 345:
+        return "red"
+    if deg < 42:
+        return "orange"
+    if deg < 70:
+        return "yellow"
+    if deg < 165:
+        return "green"
+    if deg < 205:
+        return "cyan"
+    if deg < 255:
+        return "blue"
+    if deg < 315:
+        return "purple"
+    return "magenta"
+
+
+def _box_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+    b_area = max(1, (bx2 - bx1) * (by2 - by1))
+    return float(inter) / float(a_area + b_area - inter)
+
+
+def _compute_crop_metrics(img: Any, *, box: Tuple[int, int, int, int], source_file: str, norm_box: Dict[str, float]) -> Dict[str, Any]:
+    _, _, _, ImageStat = _require_pil()
+    stat = ImageStat.Stat(img)
+
+    avg = tuple(int(v) for v in stat.mean[:3])
+    std = stat.stddev[:3] if getattr(stat, "stddev", None) else [0.0, 0.0, 0.0]
+    std_avg = float(sum(float(v) for v in std[:3])) / 3.0
+
+    lum = _relative_luminance(avg)
+    warm = _warmth_score(avg)
+    sat = _color_saturation(avg)
+    h, _, _ = _rgb_to_hsv_tuple(avg)
+    hue_deg = h * 360.0
+    hue_name = _hue_name(avg)
+
+    r, g, b = avg
+    channel_total = max(1.0, float(r + g + b))
+    blue_ratio = b / channel_total
+    green_ratio = g / channel_total
+    red_ratio = r / channel_total
+
+    crop_w, crop_h = img.size
+    aspect = float(crop_w) / float(max(1, crop_h))
+    area = crop_w * crop_h
+
+    sky_score = 0.0
+    if norm_box["y1n"] <= 0.35:
+        if hue_name in {"blue", "cyan"} and lum >= 0.55 and sat <= 0.35:
+            sky_score += 0.65
+        if blue_ratio >= 0.36 and green_ratio >= 0.30 and red_ratio <= 0.30:
+            sky_score += 0.25
+    if lum >= 0.76 and sat <= 0.18:
+        sky_score += 0.10
+
+    texture_score = _clamp((std_avg - 10.0) / 55.0)
+    detail_score = _clamp((std_avg - 8.0) / 42.0)
+
+    return {
+        "source_file": source_file,
+        "crop_box": {"x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3]},
+        "norm_box": norm_box,
+        "width": crop_w,
+        "height": crop_h,
+        "area": area,
+        "aspect_ratio": round(aspect, 4),
+        "average_color": {
+            "hex": _rgb_to_hex(avg),
+            "rgb": {"r": avg[0], "g": avg[1], "b": avg[2]},
+        },
+        "luminance": round(lum, 4),
+        "warmth": round(warm, 4),
+        "saturation": round(sat, 4),
+        "hue_degrees": round(hue_deg, 2),
+        "hue_name": hue_name,
+        "texture_score": round(texture_score, 4),
+        "detail_score": round(detail_score, 4),
+        "sky_score": round(_clamp(sky_score), 4),
+        "rgb_stddev": [round(float(v), 3) for v in std[:3]],
+        "channel_ratios": {
+            "red": round(red_ratio, 4),
+            "green": round(green_ratio, 4),
+            "blue": round(blue_ratio, 4),
+        },
+    }
+
+
+def _score_material_family(metrics: Dict[str, Any], family: str) -> float:
+    lum = float(metrics.get("luminance", 0.5) or 0.5)
+    warm = float(metrics.get("warmth", 0.0) or 0.0)
+    sat = float(metrics.get("saturation", 0.0) or 0.0)
+    texture = float(metrics.get("texture_score", 0.0) or 0.0)
+    detail = float(metrics.get("detail_score", 0.0) or 0.0)
+    sky = float(metrics.get("sky_score", 0.0) or 0.0)
+    hue_name = str(metrics.get("hue_name") or "")
+    norm = metrics.get("norm_box") or {}
+    x1n = float(norm.get("x1n", 0.0) or 0.0)
+    y1n = float(norm.get("y1n", 0.0) or 0.0)
+    x2n = float(norm.get("x2n", 1.0) or 1.0)
+    y2n = float(norm.get("y2n", 1.0) or 1.0)
+    cx = (x1n + x2n) / 2.0
+    cy = (y1n + y2n) / 2.0
+    aspect = float(metrics.get("aspect_ratio", 1.0) or 1.0)
+
+    score = 0.02
+
+    if family == "water":
+        score += 0.34 * (1.0 if hue_name in {"cyan", "blue"} else 0.0)
+        score += 0.18 * sat
+        score += 0.16 * detail
+        score += 0.14 * texture
+        score += 0.18 * _clamp((cy - 0.50) / 0.50)
+        score += 0.06 * (1.0 if lum >= 0.22 and lum <= 0.72 else 0.0)
+        score -= 0.35 * sky
+    elif family == "wood":
+        score += 0.30 * _clamp((warm + 0.05) / 0.50)
+        score += 0.18 * texture
+        score += 0.14 * detail
+        score += 0.10 * sat
+        score += 0.16 * (1.0 if hue_name in {"orange", "yellow", "red"} else 0.0)
+        score += 0.10 * _clamp((0.55 - cy) / 0.55)
+        score -= 0.18 * sky
+    elif family == "stone":
+        score += 0.22 * texture
+        score += 0.14 * detail
+        score += 0.12 * (1.0 if 0.22 <= lum <= 0.72 else 0.0)
+        score += 0.10 * (1.0 if sat <= 0.30 else 0.0)
+        score += 0.10 * (1.0 if hue_name in {"gray", "orange", "yellow"} else 0.0)
+        score += 0.08 * (1.0 if cx <= 0.28 or cx >= 0.72 else 0.0)
+        score -= 0.12 * sky
+    elif family == "glass":
+        score += 0.24 * (1.0 if hue_name in {"cyan", "blue", "gray"} else 0.0)
+        score += 0.18 * _clamp((lum - 0.35) / 0.50)
+        score += 0.12 * (1.0 if sat <= 0.35 else 0.0)
+        score += 0.10 * detail
+        score += 0.12 * (1.0 if 0.75 <= aspect <= 2.8 else 0.0)
+        score += 0.10 * (1.0 if 0.18 <= cy <= 0.72 else 0.0)
+        score -= 0.16 * sky
+    elif family == "paving":
+        score += 0.24 * _clamp((cy - 0.45) / 0.55)
+        score += 0.16 * (1.0 if 0.45 <= lum <= 0.85 else 0.0)
+        score += 0.16 * (1.0 if sat <= 0.28 else 0.0)
+        score += 0.14 * texture
+        score += 0.10 * detail
+        score += 0.08 * (1.0 if hue_name in {"gray", "yellow", "orange"} else 0.0)
+        score -= 0.18 * sky
+    elif family == "metal":
+        score += 0.24 * (1.0 if lum <= 0.28 else 0.0)
+        score += 0.18 * (1.0 if sat <= 0.24 else 0.0)
+        score += 0.14 * detail
+        score += 0.12 * texture
+        score += 0.08 * (1.0 if hue_name in {"gray", "blue", "black"} else 0.0)
+        score += 0.08 * (1.0 if 0.15 <= cy <= 0.80 else 0.0)
+        score -= 0.10 * sky
+    elif family == "planting":
+        score += 0.34 * (1.0 if hue_name == "green" else 0.0)
+        score += 0.18 * sat
+        score += 0.12 * texture
+        score += 0.10 * detail
+        score += 0.08 * (1.0 if cx <= 0.25 or cx >= 0.75 else 0.0)
+        score -= 0.12 * sky
+    elif family == "fabric":
+        score += 0.22 * (1.0 if 0.50 <= lum <= 0.88 else 0.0)
+        score += 0.16 * (1.0 if sat <= 0.22 else 0.0)
+        score += 0.12 * detail
+        score += 0.12 * texture
+        score += 0.10 * _clamp((cy - 0.40) / 0.60)
+        score -= 0.10 * sky
+
+    if texture < 0.10 and family in {"stone", "wood", "paving", "metal"}:
+        score -= 0.15
+    if sky > 0.45:
+        score -= 0.30
+
+    return round(_clamp(score, 0.0, 1.0), 4)
+
+
+def _material_labels() -> Dict[str, str]:
+    return {
+        "stone": "Stone / masonry",
+        "wood": "Wood soffit / slats",
+        "glass": "Glass / glazing",
+        "water": "Pool water",
+        "paving": "Light stone paving",
+        "metal": "Dark metal frame",
+        "planting": "Landscape planting",
+        "fabric": "Outdoor fabric",
+    }
+
+
+def _pick_best_family(scores: Dict[str, float]) -> Tuple[str, float]:
+    if not scores:
+        return "stone", 0.0
+    fam = max(scores.items(), key=lambda kv: kv[1])[0]
+    return fam, float(scores.get(fam, 0.0))
+
+
+def _fallback_family_from_metrics(metrics: Dict[str, Any]) -> str:
+    hue_name = str(metrics.get("hue_name") or "")
+    lum = float(metrics.get("luminance", 0.5) or 0.5)
+    warm = float(metrics.get("warmth", 0.0) or 0.0)
+    sat = float(metrics.get("saturation", 0.0) or 0.0)
+    norm = metrics.get("norm_box") or {}
+    cy = (float(norm.get("y1n", 0.0) or 0.0) + float(norm.get("y2n", 1.0) or 1.0)) / 2.0
+
+    if hue_name in {"cyan", "blue"} and sat >= 0.18 and cy >= 0.45:
+        return "water"
+    if hue_name == "green":
+        return "planting"
+    if warm >= 0.12 and sat >= 0.12:
+        return "wood"
+    if lum <= 0.28 and sat <= 0.24:
+        return "metal"
+    if cy >= 0.55 and lum >= 0.45:
+        return "paving"
+    if sat <= 0.18 and lum >= 0.58:
+        return "fabric"
+    return "stone"
+
+
 def _extract_palette_from_image(
     path: str,
     max_colors: int = 8,
@@ -388,34 +641,17 @@ def _merge_palettes(image_paths: List[str], max_colors: int = 10) -> List[Dict[s
 
 
 def _material_label_from_region(region_name: str, feature: Dict[str, Any]) -> str:
-    lum = float(feature.get("luminance", 0.5) or 0.5)
-    warm = float(feature.get("warmth", 0.0) or 0.0)
-    temp = str(feature.get("temperature") or "neutral")
-    brightness = str(feature.get("brightness") or "medium")
-
-    lower = region_name.lower()
-    if "ceiling" in lower or "top" in lower:
-        return "Ceiling / wood tone"
-    if "floor" in lower or "bottom" in lower:
-        return "Floor / ground finish"
-    if "left" in lower:
-        return "Wall / facade finish"
-    if "right" in lower:
-        return "Glass / side material"
-    if "center" in lower:
-        return "Primary surface"
-    if "detail" in lower:
-        return "Detail texture"
-
-    if warm > 0.12:
-        return "Warm material sample"
-    if temp == "cool":
-        return "Cool accent sample"
-    if lum < 0.35:
-        return "Dark contrast sample"
-    if brightness == "bright":
-        return "Light neutral sample"
-    return "Material sample"
+    """
+    Backward-compatible helper retained for safety.
+    V3 extraction uses semantic family labels instead of region-only labels.
+    """
+    scores = feature.get("family_scores") or {}
+    family = str(feature.get("material_family") or "").strip().lower()
+    if not family and isinstance(scores, dict) and scores:
+        family, _ = _pick_best_family({str(k): float(v or 0.0) for k, v in scores.items()})
+    if not family:
+        family = _fallback_family_from_metrics(feature)
+    return _material_labels().get(family, "Material sample")
 
 
 def _extract_material_crops(
@@ -427,18 +663,9 @@ def _extract_material_crops(
     sample_dir = os.path.join(job_folder, MATERIAL_SAMPLES_DIR_NAME)
     _ensure_dir(sample_dir)
 
-    regions = [
-        ("center_material", (0.24, 0.22, 0.76, 0.78)),
-        ("upper_ceiling_sky", (0.18, 0.02, 0.82, 0.34)),
-        ("lower_floor_ground", (0.16, 0.64, 0.84, 0.98)),
-        ("left_surface", (0.00, 0.20, 0.36, 0.86)),
-        ("right_surface", (0.64, 0.20, 1.00, 0.86)),
-        ("detail_top_left", (0.06, 0.08, 0.44, 0.46)),
-        ("detail_top_right", (0.56, 0.08, 0.94, 0.46)),
-        ("detail_bottom_right", (0.54, 0.54, 0.94, 0.94)),
-    ]
-
-    samples: List[Dict[str, Any]] = []
+    families_order = ["stone", "wood", "glass", "water", "paving", "metal", "planting", "fabric"]
+    label_map = _material_labels()
+    candidates: List[Dict[str, Any]] = []
 
     for img_idx, path in enumerate(image_paths):
         try:
@@ -447,58 +674,170 @@ def _extract_material_crops(
             continue
 
         w, h = img.size
-        for region_name, box_norm in regions:
-            if len(samples) >= max_samples:
+        if w < 32 or h < 32:
+            continue
+
+        base_sizes = [
+            (0.16, 0.16),
+            (0.18, 0.14),
+            (0.20, 0.16),
+            (0.22, 0.18),
+            (0.24, 0.18),
+            (0.18, 0.22),
+        ]
+
+        grid_points_x = [0.04, 0.10, 0.18, 0.28, 0.40, 0.52, 0.64, 0.76]
+        grid_points_y = [0.05, 0.12, 0.22, 0.34, 0.48, 0.62, 0.74]
+
+        for bw, bh in base_sizes:
+            box_w = max(84, int(bw * w))
+            box_h = max(84, int(bh * h))
+            if box_w >= w or box_h >= h:
+                continue
+
+            for x_norm in grid_points_x:
+                for y_norm in grid_points_y:
+                    x1 = int(x_norm * w)
+                    y1 = int(y_norm * h)
+                    if x1 + box_w > w:
+                        x1 = max(0, w - box_w)
+                    if y1 + box_h > h:
+                        y1 = max(0, h - box_h)
+                    x2 = min(w, x1 + box_w)
+                    y2 = min(h, y1 + box_h)
+                    if x2 - x1 < 72 or y2 - y1 < 72:
+                        continue
+
+                    crop = img.crop((x1, y1, x2, y2))
+                    norm_box = {
+                        "x1n": round(x1 / float(w), 4),
+                        "y1n": round(y1 / float(h), 4),
+                        "x2n": round(x2 / float(w), 4),
+                        "y2n": round(y2 / float(h), 4),
+                    }
+                    metrics = _compute_crop_metrics(crop, box=(x1, y1, x2, y2), source_file=os.path.basename(path), norm_box=norm_box)
+
+                    avg_rgb_dict = metrics.get("average_color", {}).get("rgb", {})
+                    avg_rgb = (
+                        int(avg_rgb_dict.get("r", 204)),
+                        int(avg_rgb_dict.get("g", 204)),
+                        int(avg_rgb_dict.get("b", 204)),
+                    )
+                    if _is_board_background_color(avg_rgb):
+                        continue
+                    if float(metrics.get("sky_score", 0.0) or 0.0) >= 0.78:
+                        continue
+                    if float(metrics.get("detail_score", 0.0) or 0.0) <= 0.06:
+                        continue
+
+                    family_scores: Dict[str, float] = {}
+                    for family in families_order:
+                        family_scores[family] = _score_material_family(metrics, family)
+
+                    best_family, confidence = _pick_best_family(family_scores)
+                    if confidence < 0.20:
+                        best_family = _fallback_family_from_metrics(metrics)
+                        confidence = max(confidence, _score_material_family(metrics, best_family))
+
+                    preview_score = round(
+                        float(metrics.get("texture_score", 0.0) or 0.0) * 0.42
+                        + float(metrics.get("detail_score", 0.0) or 0.0) * 0.28
+                        + confidence * 0.30,
+                        4,
+                    )
+
+                    metrics["family_scores"] = family_scores
+                    metrics["material_family"] = best_family
+                    metrics["material_label"] = label_map.get(best_family, "Material sample")
+                    metrics["confidence"] = round(confidence, 4)
+                    metrics["preview_score"] = preview_score
+                    metrics["_crop_image"] = crop.copy()
+                    candidates.append(metrics)
+
+    candidates.sort(
+        key=lambda item: (
+            float(item.get("confidence", 0.0) or 0.0),
+            float(item.get("texture_score", 0.0) or 0.0),
+            float(item.get("detail_score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+
+    selected: List[Dict[str, Any]] = []
+    selected_boxes: List[Tuple[int, int, int, int]] = []
+    used_family: set[str] = set()
+
+    for family in families_order:
+        family_candidates = [c for c in candidates if str(c.get("material_family") or "") == family]
+        family_candidates.sort(
+            key=lambda item: (
+                float(item.get("confidence", 0.0) or 0.0),
+                float(item.get("preview_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        for cand in family_candidates:
+            box = cand.get("crop_box") or {}
+            tup = (int(box.get("x1", 0)), int(box.get("y1", 0)), int(box.get("x2", 1)), int(box.get("y2", 1)))
+            if any(_box_iou(tup, prev) > 0.55 for prev in selected_boxes):
+                continue
+            selected.append(cand)
+            selected_boxes.append(tup)
+            used_family.add(family)
+            if len(selected) >= max_samples:
                 break
-
-            x1 = max(0, min(w - 1, int(box_norm[0] * w)))
-            y1 = max(0, min(h - 1, int(box_norm[1] * h)))
-            x2 = max(x1 + 1, min(w, int(box_norm[2] * w)))
-            y2 = max(y1 + 1, min(h, int(box_norm[3] * h)))
-
-            crop = img.crop((x1, y1, x2, y2))
-            crop.thumbnail((420, 300))
-
-            tmp_path = os.path.join(sample_dir, f"_tmp_{img_idx}_{region_name}.png")
-            crop.save(tmp_path)
-
-            try:
-                feature = _extract_basic_image_features(tmp_path)
-                avg_rgb_dict = feature.get("average_color", {}).get("rgb", {})
-                avg_rgb = (
-                    int(avg_rgb_dict.get("r", 204)),
-                    int(avg_rgb_dict.get("g", 204)),
-                    int(avg_rgb_dict.get("b", 204)),
-                )
-                if _is_board_background_color(avg_rgb) and len(samples) >= 3:
-                    os.remove(tmp_path)
-                    continue
-            except Exception:
-                feature = {}
-
-            sample_name = f"material_{len(samples) + 1:02d}_{region_name}.png"
-            sample_path = os.path.join(sample_dir, sample_name)
-            os.replace(tmp_path, sample_path)
-
-            samples.append(
-                {
-                    "file": os.path.relpath(sample_path, job_folder),
-                    "source_file": os.path.basename(path),
-                    "region": region_name,
-                    "label": _material_label_from_region(region_name, feature),
-                    "crop_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                    "average_color": feature.get("average_color"),
-                    "brightness": feature.get("brightness"),
-                    "temperature": feature.get("temperature"),
-                    "luminance": feature.get("luminance"),
-                    "warmth": feature.get("warmth"),
-                }
-            )
-
-        if len(samples) >= max_samples:
+            break
+        if len(selected) >= max_samples:
             break
 
-    return samples
+    if len(selected) < max_samples:
+        for cand in candidates:
+            family = str(cand.get("material_family") or "")
+            if family in used_family and len(selected) >= min(5, max_samples):
+                continue
+            box = cand.get("crop_box") or {}
+            tup = (int(box.get("x1", 0)), int(box.get("y1", 0)), int(box.get("x2", 1)), int(box.get("y2", 1)))
+            if any(_box_iou(tup, prev) > 0.65 for prev in selected_boxes):
+                continue
+            selected.append(cand)
+            selected_boxes.append(tup)
+            used_family.add(family)
+            if len(selected) >= max_samples:
+                break
+
+    output_samples: List[Dict[str, Any]] = []
+    for idx, sample in enumerate(selected[:max_samples], start=1):
+        crop = sample.pop("_crop_image", None)
+        if crop is None:
+            continue
+        family = str(sample.get("material_family") or f"sample_{idx}")
+        sample_name = f"material_{idx:02d}_{family}.png"
+        sample_path = os.path.join(sample_dir, sample_name)
+        crop.save(sample_path)
+
+        output_samples.append(
+            {
+                "file": os.path.relpath(sample_path, job_folder),
+                "source_file": sample.get("source_file"),
+                "material_family": family,
+                "label": sample.get("material_label"),
+                "confidence": sample.get("confidence"),
+                "texture_score": sample.get("texture_score"),
+                "detail_score": sample.get("detail_score"),
+                "hue_name": sample.get("hue_name"),
+                "average_color": sample.get("average_color"),
+                "brightness": "bright" if float(sample.get("luminance", 0.5) or 0.5) >= 0.58 else ("dark" if float(sample.get("luminance", 0.5) or 0.5) <= 0.28 else "medium"),
+                "temperature": "warm" if float(sample.get("warmth", 0.0) or 0.0) > 0.12 else ("cool" if float(sample.get("warmth", 0.0) or 0.0) < -0.12 else "neutral"),
+                "luminance": sample.get("luminance"),
+                "warmth": sample.get("warmth"),
+                "saturation": sample.get("saturation"),
+                "crop_box": sample.get("crop_box"),
+                "norm_box": sample.get("norm_box"),
+                "family_scores": sample.get("family_scores"),
+            }
+        )
+
+    return output_samples
 
 
 def _fit_crop_to_box(img: Any, box_w: int, box_h: int) -> Any:
@@ -565,7 +904,7 @@ def _make_moodboard_grid(
         small_font = ImageFont.load_default()
 
     _draw_label(draw, (margin, 28), title, title_font, ink)
-    _draw_label(draw, (margin, 84), "Material palette, extracted surfaces, atmospheric direction", subtitle_font, muted)
+    _draw_label(draw, (margin, 84), "Material palette, extracted textures, atmospheric direction", subtitle_font, muted)
 
     hero_x = margin
     hero_y = 132
@@ -594,7 +933,7 @@ def _make_moodboard_grid(
     stack_x = hero_x + hero_w + 46
     stack_y = hero_y
     stack_w = canvas_w - margin - stack_x
-    card_h = 188
+    card_h = 150
 
     resolved_samples: List[Dict[str, Any]] = []
     for sample in material_samples[:5]:
@@ -607,7 +946,7 @@ def _make_moodboard_grid(
             s["_abs_path"] = abs_path
             resolved_samples.append(s)
 
-    for idx in range(5):
+    for idx in range(6):
         y = stack_y + idx * (card_h + gap)
         draw.rounded_rectangle(
             (stack_x, y, stack_x + stack_w, y + card_h),
@@ -652,8 +991,18 @@ def _make_moodboard_grid(
             draw.rounded_rectangle((img_x, img_y, img_x + img_w, img_y + img_h), radius=12, fill=(226, 223, 217))
 
         _draw_label(draw, (stack_x + 230, y + 38), label.upper(), label_font, ink)
-        _draw_label(draw, (stack_x + 230, y + 72), "extracted finish cue", small_font, muted)
-        _draw_label(draw, (stack_x + 230, y + 102), "RENDEREXPO material direction", small_font, muted)
+        _draw_label(draw, (stack_x + 230, y + 68), str((sample.get("material_family") if idx < len(resolved_samples) else "sample") if idx < len(resolved_samples) else "material cue").replace("_", " ").title() if idx < len(resolved_samples) else "material cue", small_font, muted)
+        if idx < len(resolved_samples):
+            conf = resolved_samples[idx].get("confidence")
+            tex = resolved_samples[idx].get("texture_score")
+            detail_line = []
+            if conf is not None:
+                detail_line.append(f"conf {int(float(conf) * 100):02d}%")
+            if tex is not None:
+                detail_line.append(f"texture {int(float(tex) * 100):02d}%")
+            _draw_label(draw, (stack_x + 230, y + 96), " · ".join(detail_line) or "heuristic material extraction", small_font, muted)
+        else:
+            _draw_label(draw, (stack_x + 230, y + 96), "RENDEREXPO material direction", small_font, muted)
 
     lower_y = hero_y + hero_h + 92
     draw.rounded_rectangle(
@@ -800,7 +1149,7 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
             "material_samples": analysis["material_samples"],
             "summary": analysis["summary"],
             "analyzed_files": analysis["analyzed_files"],
-            "layout_version": "moodboard_v2_material_stack",
+            "layout_version": "moodboard_v3_semantic_materials",
         },
     )
 
