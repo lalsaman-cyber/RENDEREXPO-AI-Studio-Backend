@@ -1573,7 +1573,72 @@ def _load_moodboard_context_from_folder(folder: str) -> Dict[str, Any]:
     }
 
 
+def _normalize_material_phrase(label: str) -> str:
+    label = (label or "").strip().lower()
+
+    mapping = {
+        "stone / masonry": "gray stone masonry walls",
+        "stone": "gray stone masonry walls",
+        "wood soffit / slats": "warm wood slat ceiling",
+        "wood": "warm wood slat ceiling",
+        "glass / glazing": "glass glazing",
+        "glass": "glass glazing",
+        "pool water": "aqua pool water reflections",
+        "water": "aqua pool water reflections",
+        "light stone paving": "light stone paving",
+        "paving": "light stone paving",
+        "dark metal frame": "dark metal frames",
+        "metal": "dark metal frames",
+        "landscape planting": "soft indoor planting",
+        "planting": "soft indoor planting",
+        "outdoor fabric": "light lounge fabric",
+        "fabric": "light lounge fabric",
+    }
+
+    if label in mapping:
+        return mapping[label]
+
+    label = label.replace("/", " ").replace("_", " ")
+    label = " ".join(label.split())
+    return label[:48]
+
+
+def _compact_client_prompt(prompt: str, max_words: int = 22) -> str:
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return ""
+
+    replacements = {
+        "generate a": "",
+        "generate an": "",
+        "inspired by this moodboard": "",
+        "using the same": "",
+        "with the same": "",
+        "and refined resort atmosphere": "resort atmosphere",
+    }
+
+    cleaned = prompt
+    lower = cleaned.lower()
+    for old, new in replacements.items():
+        if old in lower:
+            cleaned = cleaned.replace(old, new)
+            cleaned = cleaned.replace(old.capitalize(), new)
+            lower = cleaned.lower()
+
+    words = [w.strip(" ,.") for w in cleaned.split() if w.strip(" ,.")]
+    return " ".join(words[:max_words])
+
+
 def _style_text_from_analysis(job_folder: str, fallback_images: List[str]) -> str:
+    """
+    Build a compact material direction string for SD3.5.
+
+    IMPORTANT:
+    - Keep this short.
+    - Do not include hex colors here.
+    - Put material intent before general style words.
+    - The SD3.5/CLIP side can truncate long prompts, so this function must prioritize.
+    """
     palette_path = os.path.join(job_folder, PALETTE_JSON_NAME)
     assets_path = os.path.join(job_folder, EXTRACTED_ASSETS_JSON_NAME)
 
@@ -1582,24 +1647,39 @@ def _style_text_from_analysis(job_folder: str, fallback_images: List[str]) -> st
 
     if not palette_data or not assets_data:
         try:
-            _write_analysis_outputs(job_folder=job_folder, image_paths=fallback_images, title="RENDEREXPO Moodboard Reference")
+            _write_analysis_outputs(
+                job_folder=job_folder,
+                image_paths=fallback_images,
+                title="RENDEREXPO Moodboard Reference",
+            )
             palette_data = _read_json(palette_path)
             assets_data = _read_json(assets_path)
         except Exception:
             pass
 
-    colors = []
-    for c in (palette_data.get("palette") or [])[:5]:
-        hx = c.get("hex")
-        if hx:
-            colors.append(str(hx))
+    material_phrases: List[str] = []
+    for sample in (assets_data.get("material_samples") or [])[:7]:
+        if not isinstance(sample, dict):
+            continue
 
-    material_labels: List[str] = []
-    for sample in (assets_data.get("material_samples") or [])[:6]:
-        if isinstance(sample, dict):
-            label = str(sample.get("label") or "").strip()
-            if label and label.lower() not in [x.lower() for x in material_labels]:
-                material_labels.append(label)
+        label = str(sample.get("label") or "").strip()
+        family = str(sample.get("material_family") or "").strip()
+
+        phrase = _normalize_material_phrase(label or family)
+        if phrase and phrase.lower() not in [x.lower() for x in material_phrases]:
+            material_phrases.append(phrase)
+
+    if not material_phrases:
+        material_phrases = [
+            "warm wood slat ceiling",
+            "gray stone masonry walls",
+            "glass glazing",
+            "light stone paving",
+            "dark metal frames",
+        ]
+
+    # Keep only the strongest, most visual material cues.
+    material_text = ", ".join(material_phrases[:6])
 
     summary = {}
     if isinstance(palette_data.get("summary"), dict):
@@ -1607,30 +1687,36 @@ def _style_text_from_analysis(job_folder: str, fallback_images: List[str]) -> st
     if isinstance(assets_data.get("summary"), dict):
         summary.update(assets_data.get("summary") or {})
 
-    temp = str(summary.get("palette_temperature") or "neutral")
-    brightness = str(summary.get("brightness") or "medium")
-    color_text = ", ".join(colors) if colors else "cohesive architectural palette"
-    material_text = ", ".join(material_labels) if material_labels else "wood, stone, glass, fabric, metal accents"
+    temp = str(summary.get("palette_temperature") or "").strip().lower()
+    brightness = str(summary.get("brightness") or "").strip().lower()
 
-    return (
-        f"{brightness} {temp} palette, colors {color_text}, "
-        f"materials {material_text}, refined architectural interior direction"
-    )
+    atmosphere_parts: List[str] = []
+    if temp in {"warm", "cool", "neutral"}:
+        atmosphere_parts.append(f"{temp} palette")
+    if brightness in {"dark", "medium", "bright"}:
+        atmosphere_parts.append(f"{brightness} mood")
+
+    atmosphere_parts.append("luxury resort spa atmosphere")
+    atmosphere_parts.append("soft evening lighting")
+
+    return f"{material_text}, {', '.join(atmosphere_parts)}"
 
 
 def _build_moodboard_to_space_prompt(job_folder: str, meta: Dict[str, Any], moodboard_images: List[str]) -> str:
-    user_prompt = str(meta.get("prompt") or "").strip()
+    user_prompt = _compact_client_prompt(str(meta.get("prompt") or "").strip(), max_words=22)
     style_text = _style_text_from_analysis(job_folder, moodboard_images)
 
+    # Put the highest-value visual instructions first, before CLIP truncation can remove them.
     base = (
-        "photorealistic luxury architectural interior, cohesive moodboard-driven materials, "
-        "realistic furniture, warm ambient lighting, refined spatial depth"
+        "luxury interior pool lounge, "
+        f"{style_text}, "
+        "photorealistic architectural visualization, realistic furniture, refined spatial depth"
     )
 
     if user_prompt:
-        return f"{base}, {style_text}, {user_prompt}"
+        return f"{base}, {user_prompt}"
 
-    return f"{base}, {style_text}"
+    return base
 
 
 def _build_apply_moodboard_prompt(
