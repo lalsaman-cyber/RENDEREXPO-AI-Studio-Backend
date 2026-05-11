@@ -1225,6 +1225,46 @@ def _draw_label(draw: Any, xy: Tuple[int, int], text: str, font: Any, fill: Tupl
 
 
 
+def _material_display_label(sample: Dict[str, Any]) -> str:
+    family = str(sample.get("material_family") or "material").lower()
+    raw_label = str(sample.get("label") or "").strip().lower()
+
+    if family == "stone":
+        return "STONE / MASONRY"
+    if family == "wood":
+        return "WOOD SOFFIT / SLATTED CEILING"
+    if family == "glass":
+        return "AQUA-TINTED GLAZING"
+    if family == "water":
+        return "POOL TILE / CERAMIC FINISH"
+    if family == "paving":
+        return "LIGHT STONE PAVING"
+    if family == "metal":
+        return "DARK METAL FRAME"
+    if family == "planting":
+        return "GROUNDCOVER PLANTING"
+    if family == "fabric":
+        return "OUTDOOR TEXTILE / UPHOLSTERY"
+
+    if raw_label:
+        return raw_label.upper()
+    return "MATERIAL SAMPLE"
+
+
+def _material_category(sample: Dict[str, Any]) -> str:
+    family = str(sample.get("material_family") or "material").lower()
+    return {
+        "stone": "Masonry",
+        "wood": "Wood / Ceiling",
+        "glass": "Glazing",
+        "water": "Pool Finish",
+        "paving": "Paving",
+        "metal": "Metalwork",
+        "planting": "Softscape",
+        "fabric": "Textile",
+    }.get(family, "Material")
+
+
 def _material_finish_note(sample: Dict[str, Any]) -> str:
     family = str(sample.get("material_family") or "material").lower()
     temperature = str(sample.get("temperature") or "neutral").lower()
@@ -1232,31 +1272,51 @@ def _material_finish_note(sample: Dict[str, Any]) -> str:
     hue_name = str(sample.get("hue_name") or "tone").lower()
 
     hue_note = {
-        "gray": "neutral",
+        "gray": "neutral gray",
         "black": "dark",
         "white": "light",
         "cyan": "aqua",
+        "blue": "blue-gray",
+        "brown": "warm brown",
+        "green": "soft green",
     }.get(hue_name, hue_name)
 
     if family == "stone":
-        if hue_note in {"neutral", "dark", "light"}:
-            return f"{hue_note} stone texture"
-        return f"{temperature} {hue_note} stone texture"
+        return "neutral gray stacked stone texture"
     if family == "wood":
-        return f"{temperature} wood grain sample"
+        return "warm linear wood grain finish"
     if family == "glass":
-        return f"{brightness} {hue_note} glazing cue"
+        return "cool reflective blue-gray glass finish"
     if family == "water":
-        return f"{brightness} aqua reflective surface"
+        return "aqua reflective ceramic pool tile"
     if family == "paving":
-        return f"{brightness} paving texture sample"
+        return "light exterior stone paving finish"
     if family == "metal":
-        return f"{brightness} metal finish cue"
+        return "dark bronze / black metal frame finish"
     if family == "planting":
-        return f"{temperature} organic foliage texture"
+        return "soft green planted edge / groundcover"
     if family == "fabric":
-        return f"{brightness} textile finish cue"
-    return "material texture sample"
+        return "light outdoor textile finish"
+
+    return f"{brightness} {temperature} material finish"
+
+
+def _material_schedule_name(sample: Dict[str, Any]) -> str:
+    family = str(sample.get("material_family") or "material").lower()
+    return {
+        "stone": "Stacked stone wall finish",
+        "wood": "Linear wood soffit / slat finish",
+        "glass": "Aqua-tinted reflective glazing",
+        "water": "Aqua ceramic pool tile finish",
+        "paving": "Light stone pool-deck paving",
+        "metal": "Dark metal frame finish",
+        "planting": "Low green groundcover planting",
+        "fabric": "Outdoor lounge textile",
+    }.get(family, _material_display_label(sample).title())
+
+
+def _material_brand_placeholder(sample: Dict[str, Any]) -> str:
+    return "To be specified"
 
 
 def _make_moodboard_grid(
@@ -1268,6 +1328,15 @@ def _make_moodboard_grid(
     max_tiles: int = 12,
     material_samples: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
+    """
+    Moodboard V8 — premium physical flat-lay material board with matched materials schedule.
+
+    This function is presentation-only:
+    - no change to extraction
+    - no change to generated material swatches
+    - no change to JSON structure
+    - no change to SD3.5 / routes / dispatch / strength settings
+    """
     Image, ImageDraw, ImageFont, _ = _require_pil()
 
     if not image_paths and not palette:
@@ -1276,163 +1345,414 @@ def _make_moodboard_grid(
     material_samples = material_samples or []
 
     canvas_w = 1800
-    canvas_h = 1200
-    margin = 52
-    gap = 22
-
+    canvas_h = 1350
+    margin = 54
     bg = (244, 242, 236)
-    ink = (35, 35, 33)
-    muted = (104, 101, 95)
-    line = (206, 202, 194)
-    card = (251, 250, 246)
-
     canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
     draw = ImageDraw.Draw(canvas)
 
+    ink = (34, 34, 31)
+    muted = (105, 101, 94)
+    soft = (120, 116, 108)
+    line = (205, 201, 192)
+    card = (251, 250, 246)
+    shadow = (215, 211, 202)
+    warm_card = (248, 246, 239)
+
     try:
         title_font = ImageFont.truetype("DejaVuSans.ttf", 44)
-        subtitle_font = ImageFont.truetype("DejaVuSans.ttf", 22)
-        label_font = ImageFont.truetype("DejaVuSans.ttf", 18)
-        small_font = ImageFont.truetype("DejaVuSans.ttf", 15)
+        subtitle_font = ImageFont.truetype("DejaVuSans.ttf", 21)
+        section_font = ImageFont.truetype("DejaVuSans.ttf", 18)
+        label_font = ImageFont.truetype("DejaVuSans.ttf", 16)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 14)
+        tiny_font = ImageFont.truetype("DejaVuSans.ttf", 12)
     except Exception:
         title_font = ImageFont.load_default()
         subtitle_font = ImageFont.load_default()
+        section_font = ImageFont.load_default()
         label_font = ImageFont.load_default()
         small_font = ImageFont.load_default()
+        tiny_font = ImageFont.load_default()
 
-    _draw_label(draw, (margin, 28), title, title_font, ink)
-    _draw_label(draw, (margin, 84), "Material palette, generated swatches, curated surface direction", subtitle_font, muted)
+    def _text_size(txt: str, font: Any) -> Tuple[int, int]:
+        try:
+            box = draw.textbbox((0, 0), str(txt), font=font)
+            return (box[2] - box[0], box[3] - box[1])
+        except Exception:
+            return (len(str(txt)) * 7, 14)
 
-    hero_x = margin
-    hero_y = 132
-    hero_w = 1030
-    hero_h = 700
+    def _sample_abs(sample: Dict[str, Any]) -> Optional[str]:
+        rel = str(sample.get("file") or "").strip()
+        if not rel:
+            return None
+        abs_path = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(output_path), rel)
+        return abs_path if os.path.isfile(abs_path) else None
 
-    draw.rounded_rectangle(
-        (hero_x - 12, hero_y - 12, hero_x + hero_w + 12, hero_y + hero_h + 54),
-        radius=18,
-        fill=card,
-        outline=line,
-        width=2,
+    def _draw_shadow_rect(box: Tuple[int, int, int, int], radius: int = 18) -> None:
+        x1, y1, x2, y2 = box
+        # V8 premium layered shadow: physical depth without CAD/grid styling.
+        draw.rounded_rectangle((x1 + 12, y1 + 14, x2 + 12, y2 + 14), radius=radius, fill=(229, 226, 218))
+        draw.rounded_rectangle((x1 + 7, y1 + 9, x2 + 7, y2 + 9), radius=radius, fill=(216, 212, 202))
+        draw.rounded_rectangle((x1 + 3, y1 + 4, x2 + 3, y2 + 4), radius=radius, fill=(239, 237, 230))
+        draw.rounded_rectangle(box, radius=radius, fill=card, outline=line, width=2)
+
+    def _draw_tag(x: int, y: int, title_text: str, note_text: str, anchor: str = "left") -> None:
+        title_text = str(title_text or "Material").upper()
+        note_text = str(note_text or "material finish cue")
+        tw, th = _text_size(title_text, label_font)
+        nw, nh = _text_size(note_text, tiny_font)
+        w = min(310, max(tw, nw) + 28)
+        h = 58
+
+        if anchor == "right":
+            x = x - w
+
+        draw.rounded_rectangle((x, y, x + w, y + h), radius=14, fill=(255, 254, 249), outline=line, width=1)
+        _draw_label(draw, (x + 14, y + 10), title_text, label_font, ink)
+        _draw_label(draw, (x + 14, y + 34), note_text[:52], tiny_font, muted)
+
+    def _draw_material_piece(
+        *,
+        sample: Dict[str, Any],
+        box: Tuple[int, int, int, int],
+        label_xy: Tuple[int, int],
+        label_anchor: str = "left",
+        radius: int = 18,
+        rotate_hint: Optional[str] = None,
+    ) -> None:
+        x1, y1, x2, y2 = box
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+
+        abs_path = _sample_abs(sample)
+        family = str(sample.get("material_family") or "material").lower()
+        label = _material_display_label(sample)
+        finish = _material_finish_note(sample)
+
+        # V8 physical sample shadow: soft, layered, premium.
+        draw.rounded_rectangle((x1 + 14, y1 + 16, x2 + 14, y2 + 16), radius=radius, fill=(228, 224, 214))
+        draw.rounded_rectangle((x1 + 8, y1 + 10, x2 + 8, y2 + 10), radius=radius, fill=(207, 202, 192))
+        draw.rounded_rectangle((x1 + 3, y1 + 4, x2 + 3, y2 + 4), radius=radius, fill=(238, 235, 228))
+
+        if abs_path:
+            try:
+                img = _open_rgb(abs_path)
+                fitted = _fit_crop_to_box(img, w, h)
+                # PIL rounded-mask paste for a physical sample feel.
+                mask = Image.new("L", (w, h), 0)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.rounded_rectangle((0, 0, w, h), radius=radius, fill=255)
+                canvas.paste(fitted, (x1, y1), mask)
+            except Exception:
+                draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=(226, 223, 217))
+        else:
+            draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=(226, 223, 217))
+
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, outline=(170, 166, 156), width=1)
+
+        # Tiny material pin / sample mark.
+        draw.ellipse((x1 + 16, y1 + 16, x1 + 28, y1 + 28), fill=(255, 254, 248), outline=line)
+
+        _draw_tag(label_xy[0], label_xy[1], label, finish, anchor=label_anchor)
+
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+    display_title = "RENDEREXPO Curated Material Moodboard"
+    if "reference" in title.lower():
+        display_title = "RENDEREXPO Moodboard Reference"
+    elif "space" in title.lower():
+        display_title = "RENDEREXPO Curated Material Moodboard"
+
+    _draw_label(draw, (margin, 30), display_title, title_font, ink)
+    _draw_label(
+        draw,
+        (margin, 86),
+        "Premium physical material board, palette, atmosphere, and matched materials schedule",
+        subtitle_font,
+        muted,
     )
+
+    # ------------------------------------------------------------------
+    # Resolve materials
+    # ------------------------------------------------------------------
+    resolved_samples: List[Dict[str, Any]] = []
+    for sample in material_samples[:8]:
+        if not isinstance(sample, dict):
+            continue
+        if _sample_abs(sample):
+            resolved_samples.append(dict(sample))
+
+    # Fallback placeholders if no swatches are available.
+    fallback_labels = [
+        ("STONE / MASONRY", "stone"),
+        ("WOOD SOFFIT / SLATTED CEILING", "wood"),
+        ("AQUA-TINTED GLAZING", "glass"),
+        ("POOL TILE / CERAMIC FINISH", "water"),
+        ("LIGHT STONE PAVING", "paving"),
+        ("DARK METAL FRAME", "metal"),
+        ("GROUNDCOVER PLANTING", "planting"),
+    ]
+    while len(resolved_samples) < 7:
+        label, family = fallback_labels[len(resolved_samples) % len(fallback_labels)]
+        resolved_samples.append(
+            {
+                "label": label,
+                "material_family": family,
+                "brightness": "medium",
+                "temperature": "neutral",
+                "hue_name": "neutral",
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Main physical sample canvas
+    # ------------------------------------------------------------------
+    board_x = margin
+    board_y = 135
+    board_w = 1145
+    board_h = 760
+    _draw_shadow_rect((board_x, board_y, board_x + board_w, board_y + board_h), radius=24)
+
+    _draw_label(draw, (board_x + 28, board_y + 24), "PHYSICAL MATERIAL BOARD", section_font, ink)
+    _draw_label(draw, (board_x + 28, board_y + 50), "flat-lay material direction curated from the source render", small_font, muted)
+
+    # Physical-style overlapping samples.
+    s = resolved_samples
+
+    families = {str(sample.get("material_family") or "").lower() for sample in resolved_samples}
+    if {"fabric", "textile"}.intersection(families):
+        context_note = "Interior / FF&E material palette"
+    elif {"water", "paving", "planting"}.intersection(families):
+        context_note = "Exterior architectural material palette"
+    else:
+        context_note = "Architectural material palette"
+
+    _draw_label(draw, (board_x + board_w - 350, board_y + 28), context_note, small_font, muted)
+
+    # V8 tabletop surface must be drawn BEFORE the physical samples.
+    draw.rounded_rectangle(
+        (board_x + 36, board_y + 86, board_x + board_w - 36, board_y + board_h - 34),
+        radius=20,
+        fill=(252, 251, 247),
+        outline=(238, 235, 228),
+        width=1,
+    )
+
+    # Re-draw board header after tabletop surface.
+    _draw_label(draw, (board_x + 28, board_y + 24), "PHYSICAL MATERIAL BOARD", section_font, ink)
+    _draw_label(draw, (board_x + 28, board_y + 50), "flat-lay material direction curated from the source render", small_font, muted)
+    _draw_label(draw, (board_x + board_w - 350, board_y + 28), context_note, small_font, muted)
+
+    # Large stone / masonry tile
+    _draw_material_piece(
+        sample=s[0],
+        box=(board_x + 58, board_y + 135, board_x + 405, board_y + 365),
+        label_xy=(board_x + 72, board_y + 382),
+        radius=18,
+    )
+
+    # Wood plank / slat sample
+    _draw_material_piece(
+        sample=s[1],
+        box=(board_x + 420, board_y + 105, board_x + 585, board_y + 510),
+        label_xy=(board_x + 400, board_y + 528),
+        radius=16,
+    )
+
+    # Glass translucent chip
+    _draw_material_piece(
+        sample=s[2],
+        box=(board_x + 705, board_y + 112, board_x + 1058, board_y + 255),
+        label_xy=(board_x + 735, board_y + 272),
+        radius=18,
+    )
+
+    # Water tone strip
+    _draw_material_piece(
+        sample=s[3],
+        box=(board_x + 690, board_y + 365, board_x + 1068, board_y + 520),
+        label_xy=(board_x + 725, board_y + 538),
+        radius=22,
+    )
+
+    # Paving slab
+    _draw_material_piece(
+        sample=s[4],
+        box=(board_x + 70, board_y + 520, board_x + 392, board_y + 680),
+        label_xy=(board_x + 88, board_y + 694),
+        radius=18,
+    )
+
+    # Dark metal strip
+    _draw_material_piece(
+        sample=s[5],
+        box=(board_x + 445, board_y + 615, board_x + 840, board_y + 678),
+        label_xy=(board_x + 495, board_y + 696),
+        radius=14,
+    )
+
+    # Planting / organic swatch
+    _draw_material_piece(
+        sample=s[6],
+        box=(board_x + 915, board_y + 565, board_x + 1055, board_y + 705),
+        label_xy=(board_x + 850, board_y + 722),
+        label_anchor="left",
+        radius=18,
+    )
+
+    # Small physical-sample decorative circles / paint pucks.
+    puck_colors = []
+    for c in palette[:4]:
+        hx = str(c.get("hex") or "#CCCCCC")
+        puck_colors.append(_hex_to_rgb(hx))
+    while len(puck_colors) < 4:
+        puck_colors.append((210, 205, 195))
+
+    puck_y = board_y + 82
+    for i, rgb in enumerate(puck_colors[:4]):
+        px = board_x + 48 + i * 42
+        draw.ellipse((px, puck_y, px + 30, puck_y + 30), fill=rgb, outline=(150, 146, 138), width=1)
+
+    # ------------------------------------------------------------------
+    # Source reference card
+    # ------------------------------------------------------------------
+    ref_x = board_x + board_w + 30
+    ref_y = board_y
+    ref_w = canvas_w - margin - ref_x
+    ref_h = 455
+
+    _draw_shadow_rect((ref_x, ref_y, ref_x + ref_w, ref_y + ref_h), radius=22)
+    _draw_label(draw, (ref_x + 24, ref_y + 22), "SOURCE RENDER", section_font, ink)
+    _draw_label(draw, (ref_x + 24, ref_y + 48), "visual reference analyzed by RENDEREXPO", small_font, muted)
+
+    hero_x = ref_x + 24
+    hero_y = ref_y + 84
+    hero_w = ref_w - 48
+    hero_h = 295
 
     if image_paths:
         try:
             hero = _open_rgb(image_paths[0])
             hero_img = _fit_crop_to_box(hero, hero_w, hero_h)
             canvas.paste(hero_img, (hero_x, hero_y))
+            draw.rectangle((hero_x, hero_y, hero_x + hero_w, hero_y + hero_h), outline=line, width=2)
         except Exception:
-            draw.rectangle((hero_x, hero_y, hero_x + hero_w, hero_y + hero_h), fill=(225, 222, 216))
-            _draw_label(draw, (hero_x + 20, hero_y + 20), os.path.basename(image_paths[0]), label_font, muted)
+            draw.rectangle((hero_x, hero_y, hero_x + hero_w, hero_y + hero_h), fill=(225, 222, 216), outline=line)
+            _draw_label(draw, (hero_x + 18, hero_y + 18), os.path.basename(image_paths[0]), small_font, muted)
 
     _draw_label(draw, (hero_x, hero_y + hero_h + 18), "HERO REFERENCE", label_font, ink)
 
-    stack_x = hero_x + hero_w + 46
-    stack_y = hero_y
-    stack_w = canvas_w - margin - stack_x
-    card_h = 150
+    # ------------------------------------------------------------------
+    # Atmosphere notes card
+    # ------------------------------------------------------------------
+    notes_y = ref_y + ref_h + 28
+    notes_h = 277
+    _draw_shadow_rect((ref_x, notes_y, ref_x + ref_w, notes_y + notes_h), radius=22)
 
-    resolved_samples: List[Dict[str, Any]] = []
-    for sample in material_samples[:5]:
-        rel = str(sample.get("file") or "")
-        if not rel:
-            continue
-        abs_path = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(output_path), rel)
-        if os.path.isfile(abs_path):
-            s = dict(sample)
-            s["_abs_path"] = abs_path
-            resolved_samples.append(s)
+    _draw_label(draw, (ref_x + 24, notes_y + 24), "MATERIAL DIRECTION", section_font, ink)
 
-    for idx in range(6):
-        y = stack_y + idx * (card_h + gap)
-        draw.rounded_rectangle(
-            (stack_x, y, stack_x + stack_w, y + card_h),
-            radius=16,
-            fill=card,
-            outline=line,
-            width=2,
-        )
+    direction_lines = []
+    for sample in resolved_samples[:6]:
+        lbl = _material_display_label(sample)
+        note = _material_finish_note(sample)
+        direction_lines.append(f"{lbl}: {note}")
 
-        label = "Material sample"
-        sample_img = None
+    y = notes_y + 62
+    for line_text in direction_lines[:6]:
+        _draw_label(draw, (ref_x + 24, y), "• " + line_text[:66], small_font, muted)
+        y += 31
 
-        if idx < len(resolved_samples):
-            sample = resolved_samples[idx]
-            label = str(sample.get("label") or sample.get("region") or label)
-            try:
-                sample_img = _open_rgb(str(sample["_abs_path"]))
-            except Exception:
-                sample_img = None
-        elif image_paths:
-            try:
-                ref = _open_rgb(image_paths[0])
-                w, h = ref.size
-                fx1 = int((0.08 + 0.11 * idx) * w) % max(1, w - 1)
-                fy1 = int((0.12 + 0.13 * idx) * h) % max(1, h - 1)
-                fx2 = min(w, fx1 + max(80, int(0.36 * w)))
-                fy2 = min(h, fy1 + max(80, int(0.24 * h)))
-                sample_img = ref.crop((fx1, fy1, fx2, fy2))
-                label = ["Surface", "Stone / wall", "Wood / ceiling", "Glass / light", "Water / accent"][idx]
-            except Exception:
-                sample_img = None
+    # ------------------------------------------------------------------
+    # Clean color palette strip
+    # ------------------------------------------------------------------
+    palette_y = 930
+    palette_h = 88
+    _draw_shadow_rect((margin, palette_y, canvas_w - margin, palette_y + palette_h), radius=22)
 
-        img_x = stack_x + 16
-        img_y = y + 16
-        img_w = 190
-        img_h = card_h - 32
+    _draw_label(draw, (margin + 26, palette_y + 18), "COLOR PALETTE", section_font, ink)
 
-        if sample_img is not None:
-            fitted = _fit_crop_to_box(sample_img, img_w, img_h)
-            canvas.paste(fitted, (img_x, img_y))
-        else:
-            draw.rounded_rectangle((img_x, img_y, img_x + img_w, img_y + img_h), radius=12, fill=(226, 223, 217))
-
-        _draw_label(draw, (stack_x + 230, y + 38), label.upper(), label_font, ink)
-        family_text = str((sample.get("material_family") if idx < len(resolved_samples) else "sample") if idx < len(resolved_samples) else "material cue").replace("_", " ").title() if idx < len(resolved_samples) else "material cue"
-        _draw_label(draw, (stack_x + 230, y + 68), family_text, small_font, muted)
-        if idx < len(resolved_samples):
-            finish_note = _material_finish_note(resolved_samples[idx])
-            _draw_label(draw, (stack_x + 230, y + 96), finish_note, small_font, muted)
-        else:
-            _draw_label(draw, (stack_x + 230, y + 96), "RENDEREXPO material direction", small_font, muted)
-
-    lower_y = hero_y + hero_h + 92
-    draw.rounded_rectangle(
-        (margin, lower_y, canvas_w - margin, canvas_h - margin),
-        radius=18,
-        fill=card,
-        outline=line,
-        width=2,
-    )
-
-    _draw_label(draw, (margin + 24, lower_y + 22), "COLOR + ATMOSPHERE", label_font, ink)
-
-    pal_x = margin + 24
-    pal_y = lower_y + 64
-    pal_w = canvas_w - margin * 2 - 48
     swatch_count = max(1, min(len(palette), 8))
-    swatch_gap = 16
-    swatch_w = int((pal_w - swatch_gap * (swatch_count - 1)) / swatch_count)
-    swatch_h = 104
+    swatch_gap = 12
+    pal_x = margin + 220
+    swatch_y = palette_y + 20
+    swatch_w = int((canvas_w - margin - pal_x - swatch_gap * (swatch_count - 1)) / swatch_count)
+    swatch_h = 48
 
     for idx, color in enumerate(palette[:swatch_count]):
         hx = str(color.get("hex") or "#CCCCCC").upper()
-        x = pal_x + idx * (swatch_w + swatch_gap)
-        y = pal_y
-
         rgb = _hex_to_rgb(hx)
-        draw.rounded_rectangle((x, y, x + swatch_w, y + swatch_h), radius=14, fill=rgb, outline=(150, 148, 142), width=1)
+        x = pal_x + idx * (swatch_w + swatch_gap)
 
+        draw.rounded_rectangle(
+            (x, swatch_y, x + swatch_w, swatch_y + swatch_h),
+            radius=12,
+            fill=rgb,
+            outline=(150, 148, 142),
+            width=1,
+        )
         text_fill = (20, 20, 20) if _relative_luminance(rgb) > 0.55 else (245, 245, 245)
-        _draw_label(draw, (x + 14, y + 30), hx, label_font, text_fill)
+        _draw_label(draw, (x + 12, swatch_y + 10), hx, tiny_font, text_fill)
 
         pct = color.get("percentage_normalized", color.get("percentage"))
         if pct is not None:
             try:
                 pct_text = f"{float(pct) * 100:.0f}%"
-                _draw_label(draw, (x + 14, y + 62), pct_text, small_font, text_fill)
+                _draw_label(draw, (x + 12, swatch_y + 28), pct_text, tiny_font, text_fill)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Matched materials / material schedule
+    # ------------------------------------------------------------------
+    schedule_y = 1045
+    schedule_h = 250
+    _draw_shadow_rect((margin, schedule_y, canvas_w - margin, schedule_y + schedule_h), radius=22)
+
+    _draw_label(draw, (margin + 26, schedule_y + 18), "MATCHED MATERIALS", section_font, ink)
+    _draw_label(draw, (margin + 26, schedule_y + 43), "Material Sheet — suggested systems extracted from the source render", tiny_font, muted)
+
+    table_x = margin + 26
+    table_y = schedule_y + 82
+    row_h = 30
+
+    col_img = table_x
+    col_cat = table_x + 58
+    col_name = table_x + 245
+    col_finish = table_x + 660
+    col_brand = table_x + 1180
+
+    # Header row
+    header_y = table_y - 30
+    draw.rounded_rectangle((table_x - 10, header_y - 8, canvas_w - margin - 24, header_y + 18), radius=8, fill=(242, 240, 234))
+    _draw_label(draw, (col_img, header_y), "IMAGE", tiny_font, soft)
+    _draw_label(draw, (col_cat, header_y), "CATEGORY", tiny_font, soft)
+    _draw_label(draw, (col_name, header_y), "MATERIAL / PRODUCT NAME", tiny_font, soft)
+    _draw_label(draw, (col_finish, header_y), "FINISH DIRECTION", tiny_font, soft)
+    _draw_label(draw, (col_brand, header_y), "SOURCE / BRAND", tiny_font, soft)
+
+    schedule_samples = resolved_samples[:6]
+    for idx, sample in enumerate(schedule_samples):
+        y = table_y + idx * row_h
+
+        if idx % 2 == 0:
+            draw.rounded_rectangle((table_x - 10, y - 5, canvas_w - margin - 24, y + row_h - 5), radius=8, fill=(247, 246, 241))
+
+        abs_path = _sample_abs(sample)
+        if abs_path:
+            try:
+                thumb = _fit_crop_to_box(_open_rgb(abs_path), 38, 24)
+                canvas.paste(thumb, (col_img, y - 1))
+                draw.rectangle((col_img, y - 1, col_img + 38, y + 23), outline=line, width=1)
+            except Exception:
+                draw.rectangle((col_img, y - 1, col_img + 38, y + 23), fill=(220, 217, 210), outline=line)
+        else:
+            draw.rectangle((col_img, y - 1, col_img + 38, y + 23), fill=(220, 217, 210), outline=line)
+
+        _draw_label(draw, (col_cat, y + 3), _material_category(sample)[:28], tiny_font, ink)
+        _draw_label(draw, (col_name, y + 3), _material_schedule_name(sample)[:50], tiny_font, ink)
+        _draw_label(draw, (col_finish, y + 3), _material_finish_note(sample)[:58], tiny_font, muted)
+        _draw_label(draw, (col_brand, y + 3), _material_brand_placeholder(sample), tiny_font, muted)
 
     _ensure_dir(os.path.dirname(output_path))
     canvas.save(output_path)
@@ -1541,7 +1861,7 @@ def _write_analysis_outputs(job_folder: str, image_paths: List[str], title: str)
             "material_samples": analysis["material_samples"],
             "summary": analysis["summary"],
             "analyzed_files": analysis["analyzed_files"],
-            "layout_version": "moodboard_v5_generated_material_swatches",
+            "layout_version": "moodboard_v8_premium_physical_flatlay",
         },
     )
 
