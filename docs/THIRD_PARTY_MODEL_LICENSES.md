@@ -1,4 +1,4 @@
-# THIRD-PARTY MODEL LICENSES AND ATTRIBUTION
+﻿# THIRD-PARTY MODEL LICENSES AND ATTRIBUTION
 
 ## Purpose
 
@@ -12,7 +12,7 @@ This file is intended for internal compliance tracking and launch preparation. I
 
 RENDEREXPO AI STUDIO uses and/or may use selected third-party AI models for architectural visualization, sketch-to-render generation, material transfer, moodboard workflows, inpainting, object insertion, and interior staging.
 
-The project’s compliance principles are:
+The projectâ€™s compliance principles are:
 
 - Use official model repositories only.
 - Avoid random mirrors, unknown checkpoint reuploads, and unverified model sources.
@@ -197,7 +197,7 @@ Current/approved service lanes include:
 - SD3.5 Large should remain the default engine/version for RENDEREXPO AI STUDIO unless intentionally changed.
 - Keep SD3.5 workflows separate from SDXL/MistoLine sketch workflows.
 - Track annual revenue threshold compliance.
-- Do not use SD3.5 Large beyond the license’s restricted-use conditions.
+- Do not use SD3.5 Large beyond the licenseâ€™s restricted-use conditions.
 - If business revenue or product scope changes, re-review the license before further commercial rollout.
 
 ---
@@ -324,7 +324,7 @@ RENDEREXPO AI STUDIO separates generation paths by service lane.
 ## D. Sketch-to-redesign
 
 - Engine: SDXL Base 1.0 + MistoLine-based redesign workflow
-- Purpose: Reinterpret sketch façade/material/style while preserving the sketch-driven base structure within the intended redesign rules
+- Purpose: Reinterpret sketch faÃ§ade/material/style while preserving the sketch-driven base structure within the intended redesign rules
 
 ## E. Moodboard workflows
 
@@ -382,7 +382,7 @@ Recommended public website wording:
 >
 > Certain object insertion, inpainting, and interior staging workflows may use PowerPaint / PowerPaint-v2-1, an open-source image inpainting model. PowerPaint and its authors are not affiliated with, endorsed by, or responsible for RENDEREXPO AI STUDIO.
 >
-> All outputs remain subject to RENDEREXPO AI STUDIO’s terms of use, user input rights, and applicable law.
+> All outputs remain subject to RENDEREXPO AI STUDIOâ€™s terms of use, user input rights, and applicable law.
 
 ## Footer placement recommendation
 
