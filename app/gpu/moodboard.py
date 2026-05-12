@@ -2233,7 +2233,7 @@ def run_sd35_apply_moodboard_to_render(job: Any, payload: Dict[str, Any]) -> Dic
     )
     exec_payload["type"] = "img2img"
     exec_payload["pipeline_key"] = "sd35::apply_moodboard_to_render"
-    exec_payload.setdefault("strength", float(meta.get("strength", 0.45)))
+    exec_payload.setdefault("strength", float(meta.get("strength", 0.55)))
     exec_payload.setdefault("preserve_input_aspect_ratio", True)
     exec_payload.setdefault("explicit_dimensions", False)
     exec_payload["moodboard_analysis"] = {
