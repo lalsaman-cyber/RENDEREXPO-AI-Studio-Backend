@@ -459,3 +459,4 @@ When a third-party model is downloaded or integrated, add:
 - Attribution requirement
 - Any restricted-use notes
 - Whether the model is integrated, candidate-only, deprecated, or removed
+
