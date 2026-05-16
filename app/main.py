@@ -43,6 +43,21 @@ SKETCH PIPELINE NOTE:
     job_type     = "sdxl_mistoline_sketch_redesign"
     pipeline_key = "sdxl::mistoline_sketch_redesign"
 - DO NOT route sketch through the removed SD3.5 redesign path.
+
+POWERPAINT B+C NOTE:
+- PowerPaint routing is planner-side only.
+- Real PowerPaint execution happens on the GPU worker through dedicated dispatch.
+- Locked service family:
+    AI Interior Cleanup & Small Decor Enhancement
+- Included services:
+    AI Object Removal
+    AI Small Decor Enhancement / Micro-Staging
+- Job types:
+    powerpaint_object_removal
+    powerpaint_small_decor_insert
+- DO NOT route furniture/product staging through this PowerPaint service.
+- Option A remains excluded for now and belongs to future reference-guided staging:
+    IP-Adapter + SDXL 1.0
 """
 
 from __future__ import annotations
@@ -69,6 +84,7 @@ from app.routers import (
     moodboard,
     pipeline,
     plan,
+    powerpaint,
     product,
     product_insert,
     sketch,
@@ -337,6 +353,10 @@ app.include_router(floorplan.router)
 app.include_router(sketch.router)
 app.include_router(sketch_redesign.router)
 app.include_router(pipeline.router)
+
+# PowerPaint B+C services:
+# AI Interior Cleanup & Small Decor Enhancement
+app.include_router(powerpaint.router)
 
 # Real generation routes that dispatch to GPU worker
 app.include_router(cad.router)

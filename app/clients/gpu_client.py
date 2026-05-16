@@ -38,6 +38,24 @@ MOODBOARD JOB TYPES:
 - space_to_moodboard
 - sd35_moodboard_to_space
 - sd35_apply_moodboard_to_render
+
+POWERPAINT B+C RULE:
+- PowerPaint is a separate isolated lane.
+- This file only resolves and forwards PowerPaint job types.
+- It does NOT implement PowerPaint generation.
+- It does NOT change other services.
+
+POWERPAINT JOB TYPES:
+- powerpaint_object_removal
+- powerpaint_small_decor_insert
+
+LOCKED SERVICE FAMILY:
+- AI Interior Cleanup & Small Decor Enhancement
+
+NOT INCLUDED:
+- furniture staging
+- product staging
+- reference-guided IP-Adapter workflows
 """
 
 from __future__ import annotations
@@ -182,6 +200,13 @@ def _resolve_job_type(meta: Dict[str, Any]) -> str:
         if t == "sd35_apply_moodboard_to_render":
             return "sd35_apply_moodboard_to_render"
 
+        # PowerPaint B+C planner types.
+        if t == "powerpaint_object_removal":
+            return "powerpaint_object_removal"
+
+        if t == "powerpaint_small_decor_insert":
+            return "powerpaint_small_decor_insert"
+
     pipeline_key = str(meta.get("pipeline_key") or "").strip().lower()
 
     if pipeline_key == "sd35::text2img":
@@ -201,6 +226,12 @@ def _resolve_job_type(meta: Dict[str, Any]) -> str:
 
     if pipeline_key == "sd35::apply_moodboard_to_render":
         return "sd35_apply_moodboard_to_render"
+
+    if pipeline_key == "powerpaint::object_removal":
+        return "powerpaint_object_removal"
+
+    if pipeline_key == "powerpaint::small_decor_insert":
+        return "powerpaint_small_decor_insert"
 
     if pipeline_key == "upscale::2x":
         return "upscale_2x"
@@ -249,7 +280,7 @@ def _dispatch(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, An
 
     CRITICAL:
     - meta must be forwarded as-is
-    - do NOT strip or rewrite img2img/sketch/moodboard geometry/aspect keys here
+    - do NOT strip or rewrite img2img/sketch/moodboard/PowerPaint geometry/aspect keys here
     """
     job_folder_abs = _normalize_job_folder(job_folder)
     url = f"{GPU_BASE_URL}/api/gpu/dispatch"
@@ -396,7 +427,40 @@ def dispatch_sd35_space_to_render(job_folder: str, meta: Dict[str, Any]) -> Tupl
 
 
 # -------------------------------------------------------------------
+# PowerPaint B+C
+# Locked service family:
+#   AI Interior Cleanup & Small Decor Enhancement
+#
+# These are planner-side dispatch functions only.
+# They do not implement PowerPaint generation.
+#
+# NOT INCLUDED:
+#   furniture staging
+#   product staging
+#   reference-guided IP-Adapter workflows
+# -------------------------------------------------------------------
+
+def dispatch_powerpaint_object_removal(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    meta = dict(meta)
+    meta.setdefault("job_type", "powerpaint_object_removal")
+    meta.setdefault("pipeline_key", "powerpaint::object_removal")
+    return _dispatch(job_folder, meta)
+
+
+def dispatch_powerpaint_small_decor_insert(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    meta = dict(meta)
+    meta.setdefault("job_type", "powerpaint_small_decor_insert")
+    meta.setdefault("pipeline_key", "powerpaint::small_decor_insert")
+    return _dispatch(job_folder, meta)
+
+
+# -------------------------------------------------------------------
 # Object / product insertion
+# Existing routes preserved.
+#
+# IMPORTANT:
+# These are NOT the new PowerPaint B+C services.
+# Do not use these for the locked PowerPaint cleanup/micro-staging services.
 # -------------------------------------------------------------------
 
 def dispatch_insert_object(job_folder: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:

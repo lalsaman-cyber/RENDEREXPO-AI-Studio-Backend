@@ -11,21 +11,42 @@ PURPOSE
 - Keep the working Sketch to Redesign path untouched:
       job_type     = "sdxl_mistoline_sketch_redesign"
       pipeline_key = "sdxl::mistoline_sketch_redesign"
-- Keep the new isolated Moodboard lane:
+- Keep the isolated Moodboard lane:
       job_type     = "space_to_moodboard"
       job_type     = "sd35_moodboard_to_space"
       job_type     = "sd35_apply_moodboard_to_render"
+- Add the isolated PowerPaint B+C lane:
+      job_type     = "powerpaint_object_removal"
+      pipeline_key = "powerpaint::object_removal"
+
+      job_type     = "powerpaint_small_decor_insert"
+      pipeline_key = "powerpaint::small_decor_insert"
 - Do NOT disturb text2img, img2img, upscale, sketch, redesign, video, CAD, mesh, or VR.
 
 IMPORTANT SAFETY RULE
 ---------------------
-Moodboard is added as a separate lane.
+Moodboard is a separate lane.
+PowerPaint B+C is a separate lane.
 Existing branches are preserved.
+
+LOCKED POWERPAINT SERVICE FAMILY
+--------------------------------
+AI Interior Cleanup & Small Decor Enhancement
+
+Included:
+- AI Object Removal
+- AI Small Decor Enhancement / Micro-Staging
+
+Not included:
+- furniture staging
+- product staging
+- reference-guided IP-Adapter workflows
+- Option A
 
 STARTUP SAFETY
 --------------
 Heavy service imports are intentionally lazy.
-Do NOT import CAD, mesh, video, SD3.5, SDXL, Comfy, or other heavy runners
+Do NOT import CAD, mesh, video, SD3.5, SDXL, Comfy, PowerPaint, or other heavy runners
 at module startup. Import them only inside the branch that needs them.
 
 This prevents GPU worker port 8002 from hanging during startup when an unrelated
@@ -60,6 +81,8 @@ JobType = Literal[
     "sd35_moodboard_to_space",
     "apply_moodboard_to_render",
     "sd35_apply_moodboard_to_render",
+    "powerpaint_object_removal",
+    "powerpaint_small_decor_insert",
     "upscale_2x",
     "vr_reconstruct",
     "video_from_image",
@@ -200,6 +223,10 @@ def _route_key(job_type: str, vr_mode: Optional[str], pipeline_key: Optional[str
         return "sd35::moodboard_to_space"
     if job_type in ("apply_moodboard_to_render", "sd35_apply_moodboard_to_render"):
         return "sd35::apply_moodboard_to_render"
+    if job_type == "powerpaint_object_removal":
+        return "powerpaint::object_removal"
+    if job_type == "powerpaint_small_decor_insert":
+        return "powerpaint::small_decor_insert"
     if job_type == "upscale_2x":
         return "upscale::2x"
     return f"job::{job_type}"
@@ -547,6 +574,66 @@ def _run_job_in_thread(run_id: str, req: Dict[str, Any]) -> None:
                 "engine_family": "sd35",
                 "pipeline_key": "sd35::apply_moodboard_to_render",
                 "conditioning_mode": result_obj.get("conditioning_mode"),
+            }
+
+        elif job_type == "powerpaint_object_removal":
+            from app.gpu.powerpaint import run_powerpaint_object_removal
+
+            result_obj = run_powerpaint_object_removal(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload={**meta, "job_folder": job_folder},
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("PowerPaint Object Removal runner must return a dict.")
+
+            _assert_artifact_exists(result_obj.get("output_png"), "PowerPaint Object Removal output")
+
+            result = {
+                "output_png": result_obj.get("output_png"),
+                "input_image": result_obj.get("input_image"),
+                "mask_image": result_obj.get("mask_image"),
+                "mode": "powerpaint_object_removal",
+                "service_family": "AI Interior Cleanup & Small Decor Enhancement",
+                "service_name": "AI Object Removal",
+                "engine_family": "powerpaint",
+                "engine": "PowerPaint-v2-1",
+                "pipeline_key": "powerpaint::object_removal",
+                "task": result_obj.get("task"),
+                "seed": result_obj.get("seed"),
+                "steps": result_obj.get("steps"),
+                "guidance_scale": result_obj.get("guidance_scale"),
+                "fitting_degree": result_obj.get("fitting_degree"),
+            }
+
+        elif job_type == "powerpaint_small_decor_insert":
+            from app.gpu.powerpaint import run_powerpaint_small_decor_insert
+
+            result_obj = run_powerpaint_small_decor_insert(
+                job={"date": meta.get("date"), "job_id": meta.get("job_id")},
+                payload={**meta, "job_folder": job_folder},
+            )
+
+            if not isinstance(result_obj, dict):
+                raise RuntimeError("PowerPaint Small Decor runner must return a dict.")
+
+            _assert_artifact_exists(result_obj.get("output_png"), "PowerPaint Small Decor output")
+
+            result = {
+                "output_png": result_obj.get("output_png"),
+                "input_image": result_obj.get("input_image"),
+                "mask_image": result_obj.get("mask_image"),
+                "mode": "powerpaint_small_decor_insert",
+                "service_family": "AI Interior Cleanup & Small Decor Enhancement",
+                "service_name": "AI Small Decor Enhancement / Micro-Staging",
+                "engine_family": "powerpaint",
+                "engine": "PowerPaint-v2-1",
+                "pipeline_key": "powerpaint::small_decor_insert",
+                "task": result_obj.get("task"),
+                "seed": result_obj.get("seed"),
+                "steps": result_obj.get("steps"),
+                "guidance_scale": result_obj.get("guidance_scale"),
+                "fitting_degree": result_obj.get("fitting_degree"),
             }
 
         elif job_type == "upscale_2x":
