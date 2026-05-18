@@ -33,6 +33,12 @@ class ReferenceStagingControls:
     relative_y: float = 0.730
     relative_width: float = 0.105
 
+    # Furniture/product staging should be placed by floor-contact anchor,
+    # not by top-left image-box placement.
+    use_floor_anchor: bool = True
+    anchor_x: Optional[float] = None
+    anchor_y: Optional[float] = None
+
     rotation_degrees: float = 0.0
     horizontal_scale: float = 1.0
     vertical_scale: float = 1.0
@@ -72,6 +78,11 @@ def _validate_controls(c: ReferenceStagingControls) -> ReferenceStagingControls:
     c.relative_x = _clamp(c.relative_x, 0.0, 1.0)
     c.relative_y = _clamp(c.relative_y, 0.0, 1.0)
     c.relative_width = _clamp(c.relative_width, 0.02, 0.60)
+
+    if c.anchor_x is not None:
+        c.anchor_x = _clamp(c.anchor_x, 0.0, 1.0)
+    if c.anchor_y is not None:
+        c.anchor_y = _clamp(c.anchor_y, 0.0, 1.0)
 
     c.horizontal_scale = _clamp(c.horizontal_scale, 0.50, 1.80)
     c.vertical_scale = _clamp(c.vertical_scale, 0.50, 1.80)
@@ -374,8 +385,25 @@ def stage_reference_object(
         controls,
     )
 
-    paste_x = int(sw * controls.relative_x)
-    paste_y = int(sh * controls.relative_y)
+    if controls.use_floor_anchor:
+        anchor_x_rel = controls.anchor_x if controls.anchor_x is not None else controls.relative_x
+        anchor_y_rel = controls.anchor_y if controls.anchor_y is not None else controls.relative_y
+
+        anchor_x_px = int(sw * anchor_x_rel)
+        anchor_y_px = int(sh * anchor_y_rel)
+
+        # Floor-anchor placement:
+        # bottom-center of the object lands on the anchor point.
+        paste_x = int(anchor_x_px - target_w / 2)
+        paste_y = int(anchor_y_px - target_h)
+    else:
+        anchor_x_px = None
+        anchor_y_px = None
+
+        # Legacy placement:
+        # relative_x / relative_y represent top-left placement.
+        paste_x = int(sw * controls.relative_x)
+        paste_y = int(sh * controls.relative_y)
 
     cutout = apply_room_light_match(
         cutout,
@@ -438,6 +466,8 @@ def stage_reference_object(
             "target_h": target_h,
             "paste_x": paste_x,
             "paste_y": paste_y,
+            "anchor_x_px": anchor_x_px,
+            "anchor_y_px": anchor_y_px,
             "scale_factor": scale,
         },
         "processing": {
@@ -469,19 +499,22 @@ def run_direct_test() -> Dict[str, Any]:
 
     controls = ReferenceStagingControls(
         mode="add_object",
-        relative_x=0.375,
-        relative_y=0.730,
-        relative_width=0.105,
-        perspective_compress_y=0.96,
-        saturation_factor=0.76,
-        brightness_factor=0.84,
-        contrast_factor=0.90,
+        relative_x=0.405,
+        relative_y=0.792,
+        relative_width=0.118,
+        use_floor_anchor=True,
+        anchor_x=0.405,
+        anchor_y=0.792,
+        perspective_compress_y=0.90,
+        saturation_factor=0.72,
+        brightness_factor=0.80,
+        contrast_factor=0.88,
         use_local_light_sampling=True,
-        local_light_strength=0.35,
-        contact_shadow_opacity=92,
-        soft_shadow_opacity=40,
+        local_light_strength=0.48,
+        contact_shadow_opacity=112,
+        soft_shadow_opacity=50,
         reflection_enabled=True,
-        reflection_opacity_top=0.26,
+        reflection_opacity_top=0.18,
     )
 
     return stage_reference_object(scene, cutout, job_dir, controls)
